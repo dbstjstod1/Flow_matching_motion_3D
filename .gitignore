@@ -1,0 +1,4 @@
+data/gates/
+__pycache__/
+*.pyc
+logs/
