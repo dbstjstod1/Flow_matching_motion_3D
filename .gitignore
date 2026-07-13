@@ -1,4 +1,4 @@
-data/gates/
+data/
 __pycache__/
 *.pyc
 logs/
