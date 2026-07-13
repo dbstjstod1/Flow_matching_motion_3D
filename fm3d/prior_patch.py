@@ -12,7 +12,30 @@ Everything stays in IMAGE/VOXEL space (NET normalization of the geometry bridge)
 so the blended x1_hat plugs straight into the PnP-TV posterior loop's predict step
 — no decode, no latent (the stated reason for patches over a latent prior).
 
-FM parameterization is the project's clean endpoint: x1_hat = x_t + (1-t) * v.
+`x1_hat = x_t + (1-t) * v` IS NOT A CLEAN ENDPOINT IN THIS PROJECT, and the name is
+inherited from Flowmatching-4DCT, where it is one (4DCT regresses the endpoint:
+L = ||x_t + (1-t)v - x_clean||^2, so its v points AT x_clean by construction). Here
+`train_fm3d.py` regresses v on the TRUE TANGENT of the geometry bridge, dx_t/dt of a
+FDK path that is curved — so x_t + (1-t)v is a first-order EXTRAPOLATION along it,
+not the endpoint.
+
+That does not make the blend wrong, and the reason is worth writing down because it
+looks wrong. v -> x1 is affine with a CONSTANT coefficient, and the blend is a weighted
+average whose weights are normalized to 1, so the map passes straight through it:
+
+    blend(x1)_j = sum_i w_ij (x_t|_i + (1-t) v_i)_j / sum_i w_ij
+                = x_t,j + (1-t) * blend(v)_j        <- every tile's ch-0 crop is the
+                                                       SAME x_t at voxel j
+    => (blend(x1) - x_t) / (1-t) = blend(v)         EXACTLY
+
+so the (1-t) cancels, x1 is a scratch variable that is never consumed as an endpoint,
+and what actually gets blended is v — which is the only thing the net emits. MEASURED
+against blending v directly: agreement to 6e-6 relative at worst (t = 29/30). Do not
+"fix" this. Do NOT, however, start using x1_hat as if it were a clean image (to score
+it, to feed it to a denoiser, to show it in a montage): for a tangent-trained v it is
+not one. The one real cost of the round-trip is conditioning — the cancellation error
+grows as 1/(1-t), 8e-7 at t=0 to 6e-6 at t=29/30, which is free in fp32 and would not
+be under AMP.
 
 GLOBAL CONTEXT (Local Patches Meet Global Context, arXiv:2512.18161): a patch
 alone cannot know where it sits in the head nor what the rest of the volume looks
@@ -23,7 +46,7 @@ architecture change:
            (recomputed from the evolving x_t at every ODE step, so train == infer)
   ch 2..4  the patch voxels' absolute position in the volume, per axis,
            normalized to (-1, 1)  (voxel centre convention: 2*(i+.5)/N - 1)
-The prediction target is unchanged: x1_hat = x_t_patch + (1-t) * v uses ch 0 only.
+The prediction target is unchanged, and the x1_hat expression uses ch 0 only.
 """
 
 from __future__ import annotations

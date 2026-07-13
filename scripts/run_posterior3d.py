@@ -71,8 +71,13 @@ def fm_predict(model, gen, x_mu, t, dt, patch, context="auto", n_offsets=1, gene
     downsampled CURRENT x_t and their absolute position, so the global-context channel is rebuilt
     from the evolving volume at EVERY ODE step -- exactly as the bridge built it in training.
 
-    `predict_x1_patched` returns the clean ENDPOINT x1_hat, so the velocity is recovered as
-    (x1_hat - x_t)/(1-t) -- the same relation the training target defines.
+    `predict_x1_patched` blends in "x1 space" and we divide back out to a velocity. Read that as
+    bookkeeping, NOT as a round trip through a clean image: this project trains v on the TRUE
+    TANGENT of the (curved) geometry bridge, so x_t + (1-t)v is a first-order extrapolation, not
+    an endpoint -- the name is inherited from Flowmatching-4DCT, which does regress the endpoint.
+    It is nevertheless EXACT: v -> x1 is affine with a constant coefficient and the blend weights
+    normalize to 1, so the (1-t) cancels and what is blended is v itself, to 6e-6 relative at the
+    worst t. See fm3d/prior_patch.py. The one thing never to do is treat x1_hat as a clean image.
     """
     x_net = gen.to_net(x_mu)[None, None]
     x1 = predict_x1_patched(model, x_net, t, patch=patch, stride=patch // 2,
