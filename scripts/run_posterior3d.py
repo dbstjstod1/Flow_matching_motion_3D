@@ -198,7 +198,7 @@ def main():
         print(f"step {k:3d} t={t:.2f} | fit {loss:.5f} | FBP aligned "
               f"{m['psnr_aligned']:5.2f} dB / SSIM {m['ssim_aligned']:.3f} "
               f"(raw {m['psnr_raw']:5.2f}) | theta rot {me['rot_rmse_deg']:.2f} deg, "
-              f"trans(gauge-free) {me['trans_rmse_mm_gauge_free']:.2f} mm", flush=True)
+              f"trans(gauge-fit) {me['trans_rmse_mm']:.2f} mm", flush=True)
         montage(os.path.join(args.out, f"step{k:03d}.png"), gt3, x_fdk, x, k, t,
                 f"aligned {m['psnr_aligned']:.2f} dB / SSIM {m['ssim_aligned']:.3f}")
 

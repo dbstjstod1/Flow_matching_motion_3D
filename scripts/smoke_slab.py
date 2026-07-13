@@ -128,10 +128,11 @@ def main():
     # sounder reason -- V*6 unconstrained DoF against V projections -- but this table does not
     # show that.) Give it views_per_iter=None to compare it honestly.
     #
-    # `trans` is reported GAUGE-FREE (mean-subtracted). The raw translation error is dominated by
-    # the unobservable global pose, so it measures the gauge, not the estimator.
+    # `trans` has the SE(3) GAUGE FITTED OUT (`rigid_motion.motion_error`), not merely
+    # mean-subtracted: blind motion correction cannot observe a global rigid pose, so the raw
+    # translation error measures that pose and not the estimator.
     print(f"    {'estimator':>10s} {'loss':>6s} | {'fit':>9s} | {'rot RMSE':>9s} "
-          f"{'trans (gauge-free)':>19s} | {'time':>6s}")
+          f"{'trans (gauge-fit)':>18s} | {'time':>6s}")
     results = {}
     for est_name, loss in [("net", "l2si"), ("net", "lncc"), ("basis", "l2si"), ("direct", "l2si")]:
         t1 = time.time()
@@ -144,10 +145,10 @@ def main():
         me = motion_error(th, theta_true)
         results[f"{est_name}/{loss}"] = (th, me)
         print(f"    {est_name:>10s} {loss:>6s} | {fit:9.5f} | {me['rot_rmse_deg']:6.2f} deg "
-              f"{me['trans_rmse_mm_gauge_free']:13.2f} mm | {time.time() - t1:5.0f}s", flush=True)
+              f"{me['trans_rmse_mm']:13.2f} mm | {time.time() - t1:5.0f}s", flush=True)
 
     # ---- S3: the ceiling a blind loop is chasing
-    best = min(results, key=lambda k: results[k][1]["trans_rmse_mm_gauge_free"])
+    best = min(results, key=lambda k: results[k][1]["trans_rmse_mm"])
     th = results[best][0]
     with torch.no_grad():
         x_est = gen.fdk(y, params_to_Pmot(th, gen.P_nom)[None])[0]
