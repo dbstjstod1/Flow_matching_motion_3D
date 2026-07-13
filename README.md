@@ -64,17 +64,14 @@ eye.
 
 ### Two things milestone 1 turned up
 
-**The Triton projector has no adjoint w.r.t. `P`.** `_RayMarch.backward` returns
-`gvol, None, None, …`: it is the exact adjoint in the *volume* and it drops the gradient in the
+**The Triton projector had no adjoint w.r.t. `P`** — *fixed, see below.* `_RayMarch.backward`
+returned `gvol, None, None, …`: the exact adjoint in the *volume*, dropping the gradient in the
 ray constants, which is exactly where `Pmat` enters. 4DCT never noticed, because it put motion in
 a DVF that warps the volume and kept `P` fixed. Here `d(loss)/dP` *is* the motion estimator.
 
-This fails silently — autograd reads a `None` as a zero, so a graph that also differentiates the
+It failed silently — autograd reads a `None` as a zero, so a graph that also differentiates the
 volume returns a healthy volume gradient beside a silently-zero `d(loss)/d(theta)`, and the
-estimator never moves. `_use_triton` now refuses the Triton path whenever `Pmat.requires_grad`
-and falls back to `grid_sample` (loudly, once). Teaching the Triton kernel to carry `dA`/`dBk`
-would put the estimator's inner loop back on the fast path; until then motion estimation runs on
-`grid_sample`.
+estimator never moves, converged-looking and with nothing in the log.
 
 **Finite differences on a sharp phantom are a bad gradient test.** Trilinear interpolation makes
 the projection only C0 in the sample coordinates, so on sharp edges the analytic gradient (exact,
@@ -141,15 +138,55 @@ converges faster. Which is the answer AI_Geocal already had.
 subsampling (24 of 360 views per iteration) starves free per-view parameters, which are updated
 ~1/15 as often as shared ones. It says `direct` is starved, not that it is hopeless.
 
+**Milestone 3 (the Triton adjoint w.r.t. `P`) — done.**
+
+```
+python scripts/gate_triton_adjoint.py          # ~1 min
+```
+
+`_bwd_kernel` now carries the gradient in the ray constants as well as in the volume. It comes
+from the trilinear interpolant's spatial derivative, which the corner weights hand over for free:
+
+```
+f      = sum_corners  v * wx * wy * wz            wx = fx (cx=1) or 1-fx (cx=0)
+df/dpx = sum_corners  v * (+1 if cx else -1) * wy * wz
+```
+
+and with `p_k = A + B*(k+1/2)`:  `d out/d step = sum_k f`,  `d out/d A = step * sum_k df/dp`,
+`d out/d B = step * sum_k df/dp * (k+1/2)`. Out-of-bounds corners contribute `v = 0` to both sums,
+so `padding_mode='zeros'` is reproduced in the gradient exactly as in the value. `NEED_VOL` /
+`NEED_RAY` are compile-time flags — the ray half has to *load* the eight corner values (the volume
+half only scatters into them), and the training path, which differentiates the volume with `P`
+fixed, must not pay for it.
+
+Gated against `grid_sample`, which autograd differentiates correctly by construction:
+
+| | grid_sample | Triton |
+|---|---|---|
+| `d(loss)/d(theta)` | reference | **cos = 1.000000**, rel 7e-6 (trans) / 7e-5 (rot) |
+| `d(loss)/d(volume)` | reference | cos = 1.000000, rel 2e-5 |
+| fwd+bwd through theta | 177 ms, **10.02 GiB** | **58 ms**, **0.62 GiB** |
+
+End-to-end motion estimation: **58 s → 13 s (4.3×)**, and the same-seed accuracy is unchanged
+(0.57° / 0.99 mm vs 0.57° / 0.96 mm).
+
+**The 16× memory saving is the bigger prize, and not for the reason you would guess.** Spending it
+on more views per iteration buys almost nothing — 360 views × 150 iters costs 15× the time of
+24 × 150 and improves rotation from 0.58° to 0.52°, while 24 views × 450 iters is *better*
+(0.48°) at a fifth of that cost. Stochastic view subsampling is simply very efficient; iterate
+more, don't look at more views. The headroom is what will let the real CBCT run at full size
+(512³ volume, 1024×768 panel), which `grid_sample` cannot fit at all.
+
 ## Next
 
-- Train the prior (running), then the blind posterior loop, and see how far under the 31.74 dB
-  oracle ceiling it lands.
-- **Teach the Triton ray-march its `dA`/`dBk` adjoint.** Motion estimation is the innermost loop
-  and it is currently stuck on `grid_sample` (see above). This is the biggest single speedup
-  available.
+- Train the prior, then run the blind posterior loop and see how far under the ~31.5 dB oracle
+  ceiling it lands. (Deferred: the user is supplying the real data.)
+- **`basis` recovers rotation badly** — 10–12° RMSE on both backends at the same seed, against
+  0.57° for `net`. An earlier 5.94° was an unseeded lucky run. Probably `n_ctrl=20` is too coarse
+  for the `mixed` profile (which contains a step and a jerk), or the lr is wrong for a basis whose
+  columns are not unit-norm. Worth one afternoon.
 - Swap in the real head-and-neck CBCT when it arrives: `dataset_slab.py` is the only file that
-  should need to change, plus the `ConeBeam3DConfig` preset for the real scanner geometry.
+  should need to change, plus a `ConeBeam3DConfig` preset for the real scanner geometry.
 
 ## Environment
 

@@ -82,9 +82,6 @@ def _world_to_grid_norm_3d(pts, *, W, H, D, dx, dy, dz, X0, Y0, Z0,
     return torch.stack([x_norm, y_norm, z_norm], dim=-1)
 
 
-_WARNED_PGRAD = [False]
-
-
 def _use_triton(backend: str, vol: torch.Tensor, align_corners: bool,
                 pmat: torch.Tensor | None = None) -> bool:
     """Triton is used when available, on CUDA, in fp32, align_corners=False.
@@ -92,41 +89,18 @@ def _use_triton(backend: str, vol: torch.Tensor, align_corners: bool,
     The kernel hard-codes the align_corners=False voxel-centre convention (it is the one the
     whole project uses -- see `warp.py`), so align_corners=True falls back to grid_sample.
 
-    IT IS ALSO REFUSED WHENEVER Pmat REQUIRES GRAD, and that refusal is load-bearing here in a
-    way it was not in the 4DCT project this kernel came from. `_RayMarch.backward` returns
-    `gvol, None, None, ...`: it is the exact adjoint with respect to the VOLUME and it drops
-    the gradient with respect to the ray constants (A, Bk) -- which are precisely where Pmat
-    enters. 4DCT never noticed because it put motion in a DVF that WARPS the volume and kept P
-    fixed; this project puts motion in P itself (`rigid_motion.params_to_Pmot`), so d(loss)/dP
-    IS the motion estimator.
-
-    Dropping it does not raise. autograd reads a `None` from a Function as a ZERO gradient, so
-    a graph that also differentiates the volume would return a perfectly healthy volume
-    gradient alongside a silently zero d(loss)/d(theta), and the motion estimator would simply
-    never move -- converged-looking, wrong, and with nothing in the log. Hence: fall back,
-    loudly the first time.
-
-    Making the Triton adjoint carry dA/dBk would put the estimator's inner loop back on the
-    fast kernel; until then, motion estimation runs on grid_sample.
+    `pmat` is accepted for symmetry with the grad-safety check that USED to live here. The
+    Triton kernel inherited from the 4DCT project had no adjoint w.r.t. the ray constants, and
+    since autograd reads a Function's `None` as a ZERO, that silently zeroed d(loss)/d(theta) --
+    a motion estimator that never moves and never complains. `_RayMarch` now carries that adjoint
+    (see triton_raymarch._bwd_kernel), so the fast path is safe for motion estimation too and
+    there is nothing left to refuse. `scripts/gate_triton_adjoint.py` is what holds that claim up.
     """
     import os
     from .triton_raymarch import HAVE_TRITON
     backend = os.environ.get("FDCT_PROJECTOR", backend)
     if backend == "gridsample":
         return False
-
-    if pmat is not None and pmat.requires_grad:
-        if backend == "triton":
-            raise RuntimeError(
-                "backend='triton' cannot differentiate w.r.t. Pmat: _RayMarch.backward returns "
-                "no gradient for the ray constants, so d(loss)/d(theta) would be silently zero. "
-                "Use backend='gridsample' for motion estimation.")
-        if not _WARNED_PGRAD[0] and HAVE_TRITON and vol.is_cuda:
-            _WARNED_PGRAD[0] = True
-            print("[projector_3d] Pmat.requires_grad -> falling back to the grid_sample backend "
-                  "(the Triton kernel has no adjoint w.r.t. the projection matrices).")
-        return False
-
     ok = HAVE_TRITON and vol.is_cuda and vol.dtype == torch.float32 and not align_corners
     if backend == "triton" and not ok:
         raise RuntimeError("backend='triton' needs triton + CUDA + fp32 + align_corners=False")

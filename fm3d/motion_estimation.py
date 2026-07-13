@@ -25,10 +25,10 @@ independent rigid pose on every view:
     net      MotionNet6DoF, the AI_Geocal architecture, with the 2D project's BAND-LIMITED hash
              settings ("hashbl"). This is the deployed default there.
 
-NOTE ON THE PROJECTOR BACKEND. Motion estimation needs d(loss)/dP, and the Triton ray-march has
-no adjoint for it (it returns None for the ray constants, which autograd reads as zero). The
-projector refuses Triton whenever Pmat requires grad, so everything here runs on grid_sample.
-That makes `n_samples` and `view_chunk` the memory knobs that matter.
+NOTE ON THE PROJECTOR BACKEND. Motion estimation needs d(loss)/dP. The Triton ray-march now
+carries that adjoint (it used to drop it, which autograd reads as a silent ZERO), so this runs on
+the fast kernel: 4.3x faster and 16x less memory than grid_sample, with an identical gradient
+(cos = 1.000000). See scripts/gate_triton_adjoint.py.
 """
 
 from __future__ import annotations

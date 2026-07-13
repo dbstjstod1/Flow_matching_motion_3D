@@ -101,9 +101,36 @@ if HAVE_TRITON:
         tl.store(out_ptr + r, acc * s, mask=mask)
 
     @triton.jit
-    def _bwd_kernel(gvol_ptr, Ax, Ay, Az, Bx, By, Bz, stp, gout_ptr,
+    def _bwd_kernel(vol_ptr, gvol_ptr, Ax, Ay, Az, Bx, By, Bz, stp, gout_ptr,
+                    gAx, gAy, gAz, gBx, gBy, gBz, gstp,
                     R, rays_per_batch, W, H, D,
-                    NS: tl.constexpr, BLOCK: tl.constexpr):
+                    NS: tl.constexpr, BLOCK: tl.constexpr,
+                    NEED_VOL: tl.constexpr, NEED_RAY: tl.constexpr):
+        """Adjoint in the volume AND in the ray constants (A, B, step).
+
+        The ray-constant half is what makes motion estimation possible on this kernel: A, B and
+        step are the only route by which the projection matrices enter, so without their gradient
+        d(loss)/d(theta) is zero (see rigid_motion.py). It needs the SPATIAL derivative of the
+        trilinear interpolant, which the corner weights hand over for free:
+
+            f      = sum_corners  v * wx * wy * wz          wx = fx (cx=1) or 1-fx (cx=0)
+            df/dpx = sum_corners  v * (+1 if cx else -1) * wy * wz
+
+        and then, since p_k = A + B*(k+1/2),
+
+            d out/d step = sum_k f(p_k)                  (the bare line integral)
+            d out/d A    = step * sum_k  df/dp (p_k)
+            d out/d B    = step * sum_k  df/dp (p_k) * (k + 1/2)
+
+        Out-of-bounds corners contribute v = 0 to BOTH sums, so this reproduces
+        `padding_mode='zeros'` in the gradient exactly as the forward does in the value -- no
+        boundary delta term, which is also what grid_sample's own backward omits.
+
+        NEED_VOL / NEED_RAY are compile-time flags. The ray half must LOAD the eight corner
+        values (the volume half only scatters into them), so computing it when nobody asked
+        would double this kernel's memory traffic for nothing -- and the FM training path, which
+        differentiates the volume and holds P fixed, asks for exactly the other half.
+        """
         pid = tl.program_id(0)
         r = pid * BLOCK + tl.arange(0, BLOCK)
         mask = r < R
@@ -115,7 +142,17 @@ if HAVE_TRITON:
         by = tl.load(By + r, mask=mask, other=0.0)
         bz = tl.load(Bz + r, mask=mask, other=0.0)
         s = tl.load(stp + r, mask=mask, other=0.0)
-        g = tl.load(gout_ptr + r, mask=mask, other=0.0) * s
+        go = tl.load(gout_ptr + r, mask=mask, other=0.0)
+        g = go * s
+
+        acc = tl.zeros((BLOCK,), dtype=tl.float32)      # sum_k f          -> d/d step
+        dax = tl.zeros((BLOCK,), dtype=tl.float32)      # sum_k df/dpx     -> d/d A
+        day = tl.zeros((BLOCK,), dtype=tl.float32)
+        daz = tl.zeros((BLOCK,), dtype=tl.float32)
+        dbx = tl.zeros((BLOCK,), dtype=tl.float32)      # sum_k df/dpx * t -> d/d B
+        dby = tl.zeros((BLOCK,), dtype=tl.float32)
+        dbz = tl.zeros((BLOCK,), dtype=tl.float32)
+
         for k in range(NS):
             t = k + 0.5
             px = ax + bx * t
@@ -130,24 +167,64 @@ if HAVE_TRITON:
             ix = x0.to(tl.int32)
             iy = y0.to(tl.int32)
             iz = z0.to(tl.int32)
+            fk = tl.zeros((BLOCK,), dtype=tl.float32)
+            gx = tl.zeros((BLOCK,), dtype=tl.float32)
+            gy = tl.zeros((BLOCK,), dtype=tl.float32)
+            gz = tl.zeros((BLOCK,), dtype=tl.float32)
             for cz in tl.static_range(2):
                 zc = iz + cz
                 wz = fz if cz == 1 else 1.0 - fz
+                sz = 1.0 if cz == 1 else -1.0
                 okz = (zc >= 0) & (zc < D)
                 for cy in tl.static_range(2):
                     yc = iy + cy
                     wy = fy if cy == 1 else 1.0 - fy
+                    sy = 1.0 if cy == 1 else -1.0
                     oky = okz & (yc >= 0) & (yc < H)
                     for cx in tl.static_range(2):
                         xc = ix + cx
                         wx = fx if cx == 1 else 1.0 - fx
+                        sx = 1.0 if cx == 1 else -1.0
                         ok = mask & oky & (xc >= 0) & (xc < W)
                         off = ((b * D + zc) * H + yc) * W + xc
-                        tl.atomic_add(gvol_ptr + off, g * (wx * wy * wz), mask=ok)
+                        if NEED_VOL:
+                            tl.atomic_add(gvol_ptr + off, g * (wx * wy * wz), mask=ok)
+                        if NEED_RAY:
+                            v = tl.load(vol_ptr + off, mask=ok, other=0.0)
+                            fk += v * (wx * wy * wz)
+                            gx += v * (sx * wy * wz)
+                            gy += v * (wx * sy * wz)
+                            gz += v * (wx * wy * sz)
+            if NEED_RAY:
+                acc += fk
+                dax += gx
+                day += gy
+                daz += gz
+                dbx += gx * t
+                dby += gy * t
+                dbz += gz * t
+
+        if NEED_RAY:
+            gs = g                                       # = gout * step
+            tl.store(gstp + r, go * acc, mask=mask)
+            tl.store(gAx + r, gs * dax, mask=mask)
+            tl.store(gAy + r, gs * day, mask=mask)
+            tl.store(gAz + r, gs * daz, mask=mask)
+            tl.store(gBx + r, gs * dbx, mask=mask)
+            tl.store(gBy + r, gs * dby, mask=mask)
+            tl.store(gBz + r, gs * dbz, mask=mask)
 
 
 class _RayMarch(torch.autograd.Function):
-    """out[r] = step[r] * sum_k vol[b(r)] @ (A[r] + B[r]*(k+0.5)).   Adjoint by atomic scatter."""
+    """out[r] = step[r] * sum_k vol[b(r)] @ (A[r] + B[r]*(k+0.5)).
+
+    Differentiable in ALL FOUR tensor inputs. The volume gradient is an atomic scatter (the exact
+    transpose of the forward gather); the A / B / step gradients come from the trilinear
+    interpolant's spatial derivative -- see `_bwd_kernel`. Only the halves that are actually asked
+    for are computed, which matters: the FM training path differentiates the volume with P fixed,
+    while motion estimation differentiates P with the volume fixed, and neither should pay for
+    the other.
+    """
 
     @staticmethod
     def forward(ctx, vol, A, B, step, rays_per_batch, n_samples, block):
@@ -158,20 +235,39 @@ class _RayMarch(torch.autograd.Function):
         grid = (triton.cdiv(R, block),)
         _fwd_kernel[grid](vol, A[0], A[1], A[2], B[0], B[1], B[2], step, out,
                           R, rays_per_batch, W, H, D, NS=n_samples, BLOCK=block)
-        ctx.save_for_backward(A, B, step)
+        ctx.save_for_backward(vol, A, B, step)
         ctx.meta = (Bv, D, H, W, R, rays_per_batch, n_samples, block)
         return out
 
     @staticmethod
     def backward(ctx, gout):
-        A, B, step = ctx.saved_tensors
+        vol, A, B, step = ctx.saved_tensors
         Bv, D, H, W, R, rays_per_batch, n_samples, block = ctx.meta
-        gvol = torch.zeros((Bv, D, H, W), device=gout.device, dtype=torch.float32)
-        grid = (triton.cdiv(R, block),)
-        _bwd_kernel[grid](gvol, A[0], A[1], A[2], B[0], B[1], B[2], step,
-                          gout.contiguous(), R, rays_per_batch, W, H, D,
-                          NS=n_samples, BLOCK=block)
-        return gvol, None, None, None, None, None, None
+        need_vol = ctx.needs_input_grad[0]
+        need_ray = any(ctx.needs_input_grad[1:4])
+
+        dev = gout.device
+        gvol = torch.zeros((Bv, D, H, W), device=dev, dtype=torch.float32) if need_vol else None
+        gA = torch.zeros((3, R), device=dev, dtype=torch.float32) if need_ray else None
+        gB = torch.zeros((3, R), device=dev, dtype=torch.float32) if need_ray else None
+        gs = torch.zeros((R,), device=dev, dtype=torch.float32) if need_ray else None
+
+        if need_vol or need_ray:
+            # Triton needs real pointers even for the half it will not write, so the unused
+            # outputs alias a 1-element scratch buffer rather than being None.
+            z1 = torch.zeros(1, device=dev, dtype=torch.float32)
+            _gvol = gvol if need_vol else z1
+            _gA, _gB, _gs = (gA, gB, gs) if need_ray else (
+                z1.expand(3, 1), z1.expand(3, 1), z1)
+            grid = (triton.cdiv(R, block),)
+            _bwd_kernel[grid](
+                vol, _gvol,
+                A[0], A[1], A[2], B[0], B[1], B[2], step, gout.contiguous(),
+                _gA[0], _gA[1], _gA[2], _gB[0], _gB[1], _gB[2], _gs,
+                R, rays_per_batch, W, H, D,
+                NS=n_samples, BLOCK=block, NEED_VOL=need_vol, NEED_RAY=need_ray)
+
+        return gvol, gA, gB, gs, None, None, None
 
 
 def raymarch(vol, A, B, step, rays_per_batch, n_samples, block=256):

@@ -80,6 +80,10 @@ def main():
 
     dev = "cuda"
     os.makedirs(OUT, exist_ok=True)
+    # Seed everything: the estimators draw random view subsets and the hash encoder is randomly
+    # initialized, so without this the run-to-run spread is comparable to the differences the
+    # table is trying to show.
+    torch.manual_seed(args.seed)
     cfg = ConeBeam3DConfig(det_bin=2, n_views=args.views)
 
     t0 = time.time()
