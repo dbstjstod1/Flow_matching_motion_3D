@@ -170,8 +170,8 @@ def main():
                 be.copy_(bm)
 
         if it % 50 == 0:
-            print(f"it {it:6d} | loss {float(loss):.5f} | {(time.time() - t0) / it:.2f}s/it",
-                  flush=True)
+            print(f"it {it:6d} | loss {float(loss.detach()):.5f} | "
+                  f"{(time.time() - t0) / it:.2f}s/it", flush=True)
         if it % args.save_every == 0 or it == args.iters:
             ck = {"model": model.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
                   "iter": it, "args": vars(args), "fbp_scale": gen.fbp_scale}

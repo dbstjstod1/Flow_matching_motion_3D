@@ -85,20 +85,71 @@ direction itself is fine: refining `n_samples` 384 → 768 moves it by 0.1% (tra
 (rotation). What is unstable is any single *small* component, which is only a warning about how
 to test, not about the code.
 
+**Milestone 2 (everything else) — implemented; smoke test passes on real data.**
+
+```
+python scripts/smoke_slab.py                          # ~5 min, no checkpoint needed
+python scripts/train_fm3d.py --iters 20000 --amp      # ~4 h on one A6000
+python scripts/run_posterior3d.py --ckpt logs/fm3d_a/ckpt_last.pth
+```
+
+| module | what it is |
+|---|---|
+| `fm3d/dataset_slab.py` | virtual slab volumes from the AAPM slice archive (see below) |
+| `fm3d/motion_estimation.py` | the three estimators behind one contract, and the projection-domain data terms (`l2si`, **`lncc`**, `ncc`, `ramp`, `l1`) |
+| `fm3d/motion_net.py` | `MotionNet6DoF` — AI_Geocal's architecture at the 2D project's **band-limited** hash settings |
+| `fm3d/reg_metric.py` | rigid-align-then-score. The headline metric; see the SE(3) gauge below |
+| `scripts/train_fm3d.py` | geometry-bridge training, 64³ patches, rolling bridge cache |
+| `scripts/run_posterior3d.py` | PnP-TV predictor-corrector |
+
+### The data, for now
+
+The real head-and-neck CBCT is not here yet, so the 2D project's AAPM archive (1626 loose
+512×512 HU slices) is stacked back into volumes. Adjacent slices in it *are* adjacent anatomy —
+but two things had to be measured before that was true:
+
+- **The archive interleaves slices from other levels.** img1367 is near the vertex, img1368 is
+  the skull base, img1369 is back at the vertex. Stacking by index puts a skull-base slice inside
+  the brain and the coronal reslice comes out streaked. 123 of 1626 are found by the property
+  that *deleting* them reconnects their neighbours, and dropped. Without this step no threshold
+  works at all: a low one shatters the archive into 5-slice fragments, a high one admits the
+  interlopers.
+- **What remains is many patients concatenated.** Splitting on consecutive-slice RMS leaves
+  **10 runs of ~100 slices** (262 slabs), which reslice cleanly in coronal and sagittal.
+
+The head measures 358 px across, so the pixel size is **~0.5 mm** — not the 1.0 mm the 2D project
+assumed, which would make the head 358 mm wide and unable to fit any real CBCT's 26 cm FOV. We
+2×-downsample to an isotropic 1 mm grid, **256×256×64**. `dz = 1.0 mm` is an **assumption** (the
+archive carries no slice thickness); it changes only how much cone angle a slab subtends.
+
+### Smoke results (oracle: the estimator is handed the true image)
+
+| | aligned PSNR | aligned SSIM |
+|---|---|---|
+| static FDK (no motion) | 32.59 | 0.713 |
+| uncorrected | 22.84 | 0.556 |
+| true `theta` | 32.74 | 0.645 |
+| **FDK(`theta_hat`), best estimator** | **31.74** | **0.639** |
+
+The estimator reaches **0.56° / 0.91 mm** (gauge-free) and its reconstruction is visually
+indistinguishable from the true-`theta` one. That is the ceiling the blind loop is chasing.
+
+**LNCC edges out `l2si`** — 0.91 vs 1.00 mm at 150 iters, and 1.90 vs 3.71 mm at 60, so it also
+converges faster. Which is the answer AI_Geocal already had.
+
+`direct` scores terribly in that table and **the comparison is confounded**: stochastic view
+subsampling (24 of 360 views per iteration) starves free per-view parameters, which are updated
+~1/15 as often as shared ones. It says `direct` is starved, not that it is hopeless.
+
 ## Next
 
-2. **6-DoF motion estimation.** Port the estimator contract (`refine_global` / `current_params` /
-   `render_sinogram`) and the band-limited parameterizations (B-spline basis, `hashbl`) that the
-   2D project converged on; add projection-domain **LNCC** (AI_Geocal's objective, MONAI-free —
-   the 2D repo already has a self-contained `lncc`) beside `l2si`.
-3. **Geometry-bridge training** of a 3D prior (patch-based, `prior_patch` blending at inference).
-4. **Posterior loop**: PnP-TV predictor-corrector, the configuration the 2D project settled on.
-5. **Gauge-aware evaluation.** Blind motion correction has an exact SE(3) gauge — global pose is
-   unobservable — so raw PSNR is pose-contaminated. Metrics go through rigid-align-then-SSIM.
-
-The real head-and-neck CBCT data is not here yet; the pipeline is being stood up on a synthetic
-head phantom (`fm3d/phantom.py`), which is scaffolding for the gates and **not** a quality
-benchmark.
+- Train the prior (running), then the blind posterior loop, and see how far under the 31.74 dB
+  oracle ceiling it lands.
+- **Teach the Triton ray-march its `dA`/`dBk` adjoint.** Motion estimation is the innermost loop
+  and it is currently stuck on `grid_sample` (see above). This is the biggest single speedup
+  available.
+- Swap in the real head-and-neck CBCT when it arrives: `dataset_slab.py` is the only file that
+  should need to change, plus the `ConeBeam3DConfig` preset for the real scanner geometry.
 
 ## Environment
 
