@@ -36,6 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fm3d.dataset_slab import AAPMSlabGenerator
 from fm3d.geometry_3d import ConeBeam3DConfig, measured_region_mask
+from fm3d.prior_patch import make_tile_inputs, volume_context
 from fm3d.rigid_motion import params_to_Pmot
 from fm3d.unet_3d import UNet3D
 
@@ -86,6 +87,9 @@ def main():
     ap.add_argument("--in_plane", type=int, default=256)
     ap.add_argument("--views", type=int, default=360)
     ap.add_argument("--base", type=int, default=32)
+    ap.add_argument("--context", default="global", choices=["global", "none"],
+                    help="global = the arXiv:2512.18161 conditioning (in_ch=5); "
+                         "none = the bare-patch prior (in_ch=1)")
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--ema", type=float, default=0.999)
     ap.add_argument("--amp", action="store_true")
@@ -119,22 +123,37 @@ def main():
         raise RuntimeError("no patch fits inside the measured region; shrink --patch")
     print(f"valid patch origins: {len(ok)}")
 
-    model = UNet3D(base=args.base).to(dev)
-    ema = UNet3D(base=args.base).to(dev)
+    # GLOBAL CONTEXT (arXiv:2512.18161). A 64^3 patch of a head cannot tell whether it is
+    # orbit or posterior fossa, nor what the rest of the slab looks like, so the bare-patch
+    # prior can only learn LOCAL structure. Four conditioning channels close that: the whole
+    # x_t resampled onto the patch grid, and the patch voxels' absolute (z,y,x) in the volume.
+    # The velocity target is untouched -- the net still predicts one channel, for channel 0.
+    in_ch = 5 if args.context == "global" else 1
+    model = UNet3D(in_ch=in_ch, base=args.base).to(dev)
+    ema = UNet3D(in_ch=in_ch, base=args.base).to(dev)
     ema.load_state_dict(model.state_dict())
     for q in ema.parameters():
         q.requires_grad_(False)
     n_par = sum(q.numel() for q in model.parameters())
-    print(f"UNet3D base={args.base}: {n_par / 1e6:.2f} M params")
+    print(f"UNet3D in_ch={in_ch} (context={args.context}) base={args.base}: "
+          f"{n_par / 1e6:.2f} M params")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95))
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
 
     def draw():
+        """One bridge sample, held whole-volume: (x_t (1,1,D,H,W), dx (D,H,W), t, ctx).
+
+        `ctx` is the global-context channel -- x_t on the patch grid -- and it is a property
+        of the DRAW, not of the patch, so it is computed once here and shared by every patch
+        cropped from this volume. At inference `predict_x1_patched` rebuilds it the same way
+        from the evolving x_t, so train and infer see the same channel."""
         y, th, vol = gen.sample_motion(1, trans_mm=args.trans_mm, rot_deg=args.rot_deg)
         t = sample_t(1, dev)[0]
         x_t, dx = bridge_pair(gen, t, y, th[0])
-        return x_t, dx, t
+        x_t = x_t[None, None]                                        # (1,1,D,H,W)
+        ctx = volume_context(x_t, (p, p, p)) if in_ch == 5 else None
+        return x_t, dx, t, ctx
 
     cache = [draw() for _ in range(args.cache)]
     print(f"bridge cache warm ({args.cache} draws)")
@@ -146,13 +165,13 @@ def main():
 
         xs, ds, ts = [], [], []
         for _ in range(args.batch):
-            x_t, dx, t = cache[torch.randint(len(cache), (1,)).item()]
+            x_t, dx, t, ctx = cache[torch.randint(len(cache), (1,)).item()]
             z, yy, xx = ok[torch.randint(len(ok), (1,)).item()]
-            xs.append(x_t[z:z + p, yy:yy + p, xx:xx + p])
+            xs.append(make_tile_inputs(x_t, [(z, yy, xx)], (p, p, p), ctx))   # (1,C,p,p,p)
             ds.append(dx[z:z + p, yy:yy + p, xx:xx + p])
             ts.append(t)
-        xb = torch.stack(xs)[:, None]
-        db = torch.stack(ds)[:, None]
+        xb = torch.cat(xs, 0)                                   # (B,in_ch,p,p,p)
+        db = torch.stack(ds)[:, None]                           # (B,1,p,p,p) -- target: ch 0 only
         tb = torch.stack(ts)
 
         opt.zero_grad(set_to_none=True)

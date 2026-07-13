@@ -96,6 +96,7 @@ python scripts/run_posterior3d.py --ckpt logs/fm3d_a/ckpt_last.pth
 | `fm3d/motion_estimation.py` | the three estimators behind one contract, and the projection-domain data terms (`l2si`, **`lncc`**, `ncc`, `ramp`, `l1`) |
 | `fm3d/motion_net.py` | `MotionNet6DoF` — AI_Geocal's architecture at the 2D project's **band-limited** hash settings |
 | `fm3d/reg_metric.py` | rigid-align-then-score. The headline metric; see the SE(3) gauge below |
+| `fm3d/prior_patch.py` | patch-wise prior evaluation, Hann blending, and the global-context channels (milestone 4) |
 | `scripts/train_fm3d.py` | geometry-bridge training, 64³ patches, rolling bridge cache |
 | `scripts/run_posterior3d.py` | PnP-TV predictor-corrector |
 
@@ -176,6 +177,43 @@ on more views per iteration buys almost nothing — 360 views × 150 iters costs
 (0.48°) at a fifth of that cost. Stochastic view subsampling is simply very efficient; iterate
 more, don't look at more views. The headroom is what will let the real CBCT run at full size
 (512³ volume, 1024×768 panel), which `grid_sample` cannot fit at all.
+
+**Milestone 4 (global context for the patch prior) — implemented, gated.**
+
+```
+python scripts/gate_context_unet.py            # ~20 s, CPU, no data, no checkpoint
+```
+
+The patch prior had a hole in it. A 64³ patch of a head does not know whether it is orbit or
+posterior fossa, nor what the rest of the slab looks like — so it can only learn *local*
+structure, and Hann blending hides the seams without fixing that.
+[*Local Patches Meet Global Context*](https://arxiv.org/abs/2512.18161) (arXiv:2512.18161) is the
+follow-up to the very DiffusionBlend++ that `prior_patch.py` was built on, and it measures the
+hole: removing the global-context channel takes FID from **40.8 to 112.1**. Their CT numbers,
+LIDC 256³ 8-view: DiffusionBlend 30.43 dB → **33.06 dB**, and **2.75× faster**.
+
+The fix is pure input conditioning — **no architecture change**, only `in_conv` grows:
+
+| ch | content |
+|---|---|
+| 0 | the patch of `x_t` (what we had) |
+| 1 | **the whole `x_t`, resampled onto the patch grid** — the global context |
+| 2–4 | the patch voxels' **absolute** (z, y, x) in the volume, normalized to (−1, 1) |
+
+The velocity output stays single-channel and predicts channel 0, so the FM parameterization,
+the bridge and the loss are all untouched. `--context none` restores the old prior exactly.
+The context channel is rebuilt from the *evolving* `x_t` at every ODE step, which is what makes
+inference see the same channel training did. Ported from Flowmatching-4DCT, which had already
+implemented and gated it.
+
+`--patch_offsets K` additionally blends `K−1` randomly *shifted* tile grids per step — the FM
+analogue of the paper's recurrent noising (K=2 was optimal there). Default 1.
+
+Every failure mode here is bookkeeping — a mis-sliced channel, a coordinate map built from the
+*tile* index instead of the *volume* index, a jittered grid that stops covering the border — so
+the gate is exact-by-construction rather than statistical. The sharp one is [4]: a probe net that
+returns its own coordinate channel must reproduce the analytic coordinate map through the blend,
+which can only happen if overlapping tiles agree exactly wherever they overlap.
 
 ## Next
 

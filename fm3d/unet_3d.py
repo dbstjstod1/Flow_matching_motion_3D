@@ -5,6 +5,11 @@ patch prior — the FM prior cannot hold a full volume, so it is trained and eva
 on patches and blended by `prior_patch.py`). The FM parameterization is unchanged
 (clean endpoint: x1_hat = x_t + (1-t) * v). Default width is slimmer than the 2D
 model (3D activations are heavy); patch size must be divisible by 2^(len(ch_mults)-1).
+
+With `in_ch=5` the patch is conditioned on GLOBAL CONTEXT (arXiv:2512.18161):
+channels are [patch x_t, downsampled full x_t, coord z, coord y, coord x] — built by
+`prior_patch.make_tile_inputs` / `crop_pairs(ctx=...)`. Pure input conditioning: only
+`in_conv` grows, the velocity output stays single-channel and predicts channel 0.
 """
 
 from __future__ import annotations

@@ -57,7 +57,7 @@ DATA = "/home/mirlab/Desktop/Flow_matching_motion/data/AAPM_head_data"
 
 
 @torch.no_grad()
-def fm_predict(model, gen, x_mu, t, dt, patch):
+def fm_predict(model, gen, x_mu, t, dt, patch, context="auto", n_offsets=1, generator=None):
     """One Euler step of the FM ODE. Takes and returns a MU-space volume.
 
     The prior is evaluated PATCH-WISE and Hann-blended (`predict_x1_patched`), never on the whole
@@ -67,11 +67,16 @@ def fm_predict(model, gen, x_mu, t, dt, patch):
     at a spatial size it never saw is a silent train/test mismatch. The blending is identity-exact,
     so tiling costs nothing.
 
+    With a context-conditioned prior (in_ch=5, arXiv:2512.18161) the tiles additionally carry the
+    downsampled CURRENT x_t and their absolute position, so the global-context channel is rebuilt
+    from the evolving volume at EVERY ODE step -- exactly as the bridge built it in training.
+
     `predict_x1_patched` returns the clean ENDPOINT x1_hat, so the velocity is recovered as
     (x1_hat - x_t)/(1-t) -- the same relation the training target defines.
     """
     x_net = gen.to_net(x_mu)[None, None]
-    x1 = predict_x1_patched(model, x_net, t, patch=patch, stride=patch // 2)
+    x1 = predict_x1_patched(model, x_net, t, patch=patch, stride=patch // 2,
+                            context=context, n_offsets=n_offsets, generator=generator)
     v = (x1 - x_net) / max(1.0 - t, 1e-3)
     return gen.from_net(x_net + dt * v)[0, 0]
 
@@ -128,6 +133,11 @@ def main():
     ap.add_argument("--tv_step", type=float, default=0.30)
     ap.add_argument("--pnp_k", type=int, default=1)          # data-prox <-> denoise alternations
     ap.add_argument("--est_n_samples", type=int, default=384)
+    ap.add_argument("--context", default="auto", choices=["auto", "global", "none"],
+                    help="auto reads in_ch off the checkpoint's in_conv weight")
+    ap.add_argument("--patch_offsets", type=int, default=1,
+                    help="tile grids blended per ODE step; >1 adds randomly SHIFTED grids "
+                         "(the FM analogue of the paper's recurrent noising, K=2 optimal there)")
     args = ap.parse_args()
 
     dev = "cuda"
@@ -138,7 +148,20 @@ def main():
     cfg = ConeBeam3DConfig(det_bin=2, n_views=ca["views"])
     gen = AAPMSlabGenerator(args.data, cfg, device=dev, slab=ca["slab"], in_plane=ca["in_plane"])
 
-    model = UNet3D(base=ca["base"]).to(dev)
+    # in_ch comes off the WEIGHTS, not off ca["context"] -- the checkpoint's args are what the
+    # run was launched with, the weights are what it actually trained. A mismatch here is a
+    # silently wrong prior (the net would read the coord channels as image content), so refuse.
+    in_ch_ck = int(ck["ema"]["in_conv.weight"].shape[1])
+    if args.context == "auto":
+        args.context = "global" if in_ch_ck >= 5 else "none"
+    in_ch = 5 if args.context == "global" else 1
+    if in_ch != in_ch_ck:
+        raise SystemExit(f"--context {args.context} wants in_ch={in_ch} but the ckpt was "
+                         f"trained with in_ch={in_ch_ck}")
+    print(f"prior: UNet3D in_ch={in_ch} (context={args.context}), "
+          f"{args.patch_offsets} tile grid(s)/step")
+
+    model = UNet3D(in_ch=in_ch, base=ca["base"]).to(dev)
     model.load_state_dict(ck["ema"])
     model.eval()
     for q in model.parameters():
@@ -167,13 +190,15 @@ def main():
           aligned_metrics(x, gt3, spacing, mask=meas, iters=200).items()}))
 
     hist = []
+    gtile = torch.Generator(device=dev).manual_seed(args.seed)   # reproducible tile jitter
     N = args.n_steps
     for k in range(N):
         t = k / N
         dt = 1.0 / N
 
         # 1. PREDICT -- the prior moves first (patch-blended; see fm_predict)
-        x_prior = fm_predict(model, gen, x, t, dt, patch)
+        x_prior = fm_predict(model, gen, x, t, dt, patch, context=args.context,
+                             n_offsets=args.patch_offsets, generator=gtile)
 
         # 2. ESTIMATE on the improved image (Gauss-Seidel, not simultaneous)
         loss = est.refine_global(x_prior, y[0], iters=args.per)
