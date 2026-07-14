@@ -69,7 +69,8 @@ def main():
     ap.add_argument("--patients", type=int, default=3)
     ap.add_argument("--shape", type=int, nargs=3, default=(256, 256, 256))
     ap.add_argument("--views", type=int, default=360)
-    ap.add_argument("--motion_kind", default="mixed")
+    ap.add_argument("--motion_kind", default="akima")     # the literature's model (Thies et al.)
+    ap.add_argument("--anchor", default="static", choices=["static", "gt", "none"])
     ap.add_argument("--trans_mm", type=float, default=5.0)     # Thies / JRM-ADM eval amplitude
     ap.add_argument("--rot_deg", type=float, default=5.0)
     ap.add_argument("--seed", type=int, default=0)
@@ -102,9 +103,18 @@ def main():
             y0 = gen.project(gt, gen.P_nom[None])
             static = gen.fdk(y0, gen.P_nom[None])[0]
 
+            # THE ANCHOR (see train_fm3d.bridge_pair): the bare geometry bridge's endpoint is
+            # NOT the clean image -- FDK handed the TRUE theta still sits 1-3 dB under a static
+            # scan, because it is an inverse derived for a circular EQUIANGULAR orbit. The anchor
+            # detrends the path so t=1 lands on the static reconstruction BY CONSTRUCTION, while
+            # t=0 stays exactly the cold start.
+            x1_geo = gen.fdk(y, params_to_Pmot(theta, gen.P_nom)[None])[0]
+            dlt = ((static if args.anchor == "static" else gt[0, 0]) - x1_geo
+                   if args.anchor != "none" else 0.0)
+
             xs, ps = [], []
             for t in TS:
-                x = gen.fdk(y, params_to_Pmot(t * theta, gen.P_nom)[None])[0]
+                x = gen.fdk(y, params_to_Pmot(t * theta, gen.P_nom)[None])[0] + t * dlt
                 xs.append(x)
                 ps.append(psnr(x, gt[0, 0], meas))
                 print(f"  patient {pid:3d}  t={t:.2f}  {ps[-1]:6.2f} dB", flush=True)
@@ -115,8 +125,9 @@ def main():
               f"bridge {'MONOTONE' if mono else '*** NOT MONOTONE ***'} | "
               f"t=1 is {p_static - ps[-1]:+.2f} dB from the static ceiling", flush=True)
         montage(os.path.join(args.out, f"bridge_p{pid:03d}.png"), gt[0, 0], xs, TS, ps,
-                f"CQ500 patient {pid} | geometry bridge | motion {args.trans_mm} mm / "
-                f"{args.rot_deg} deg ({args.motion_kind}) | static FDK {p_static:.2f} dB")
+                f"CQ500 patient {pid} | geometry bridge (anchor={args.anchor}) | motion "
+                f"{args.trans_mm} mm / {args.rot_deg} deg ({args.motion_kind}) | "
+                f"static FDK {p_static:.2f} dB")
 
 
 if __name__ == "__main__":

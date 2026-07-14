@@ -56,8 +56,35 @@ def sample_t(n: int, device) -> torch.Tensor:
 
 
 @torch.no_grad()
-def bridge_pair(gen: AAPMSlabGenerator, t: torch.Tensor, y, theta, delta: float = 0.02):
+def bridge_pair(gen, t: torch.Tensor, y, theta, dlt, delta: float = 0.02):
     """(x_t, dx_t) in NET space, for one volume. t: scalar tensor.
+
+    THE ANCHORED GEOMETRY BRIDGE:
+
+        x_t = FDK(y, P_nom @ T(t*theta))  +  t * Delta,
+        Delta = x_anchor - FDK(y, P_nom @ T(theta))                  [computed once, in `draw`]
+
+    WHY THE ANCHOR EXISTS. The bare geometry bridge's endpoint is NOT a clean image. Handing FDK
+    the TRUE theta does not reproduce a static scan: FDK is an analytic inverse derived for a
+    CIRCULAR, EQUIANGULAR orbit, and per-view motion breaks that. Measured on CQ500 with the
+    literature's own motion model (Akima, 10 nodes, 5 mm / 5 deg), FDK(y, P(theta_true)) sits
+    **1-3 dB below the static scan** even after `view_angular_weights` recovers the gantry-axis
+    part. So a prior trained on the bare bridge learns FDK's residual motion artefact AS ITS
+    TARGET -- it would faithfully reproduce, at t=1, an image that is not clean.
+
+    The anchor is a first-order detrend that costs nothing and fixes the endpoint EXACTLY:
+      * at t=0 the Delta term vanishes -> x_0 = FDK(y, P_nom), the inference cold start, to the bit
+      * at t=1 -> x_1 = x_anchor, the clean image, BY CONSTRUCTION
+      * in between the geometry term still dominates, so the path stays the manifold of
+        partially-corrected reconstructions -- which is what the inference loop actually walks as
+        theta_hat converges. (The alternative -- attenuating the motion in the DATA,
+        y_t = A(x; P((1-t)theta)) -- also lands clean, but its intermediate images are those of a
+        patient who moved LESS, which inference never sees.)
+      * Delta is constant in t, so the velocity target is just  d/dt FDK(y,P(t*theta)) + Delta.
+        No extra reconstructions.
+
+    This is the image-domain twin of Flowmatching-4DCT's `t1_anchor` detrend (which pins its
+    sinogram bridge to a REAL static scan). `dlt=None` restores the bare bridge.
 
     dx_t is a central difference through the FDK -- three reconstructions per sample. An exact
     forward-mode derivative w.r.t. Pmat is possible but ~3x the cost, and the 2D project measured
@@ -71,6 +98,9 @@ def bridge_pair(gen: AAPMSlabGenerator, t: torch.Tensor, y, theta, delta: float 
     sp, sm = min(tv + delta, 1.0), max(tv - delta, 0.0)
     x_t = fdk_at(tv)
     dx = (fdk_at(sp) - fdk_at(sm)) / (sp - sm)
+    if dlt is not None:
+        x_t = x_t + tv * dlt
+        dx = dx + dlt
     return x_t, dx
 
 
@@ -94,7 +124,12 @@ def main():
     ap.add_argument("--ema", type=float, default=0.999)
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--trans_mm", type=float, default=5.0)
-    ap.add_argument("--rot_deg", type=float, default=3.0)
+    ap.add_argument("--rot_deg", type=float, default=5.0)   # the literature's amplitude
+    ap.add_argument("--anchor", default="static", choices=["static", "gt", "none"],
+                    help="what the bridge's t=1 endpoint IS. static = the motion-free FDK (the "
+                         "default; what the data can support, and where both sibling projects "
+                         "anchor). gt = the ground-truth volume. none = the bare geometry bridge, "
+                         "whose endpoint is NOT clean -- see bridge_pair")
     ap.add_argument("--save_every", type=int, default=2000)
     args = ap.parse_args()
 
@@ -147,10 +182,23 @@ def main():
         `ctx` is the global-context channel -- x_t on the patch grid -- and it is a property
         of the DRAW, not of the patch, so it is computed once here and shared by every patch
         cropped from this volume. At inference `predict_x1_patched` rebuilds it the same way
-        from the evolving x_t, so train and infer see the same channel."""
+        from the evolving x_t, so train and infer see the same channel.
+
+        The ANCHOR (see `bridge_pair`) is also a property of the draw: one extra static forward
+        projection and two extra FDKs, PER DRAW rather than per t, and the cache refreshes a draw
+        only every `--refresh` steps."""
         y, th, vol = gen.sample_motion(1, trans_mm=args.trans_mm, rot_deg=args.rot_deg)
+        dlt = None
+        if args.anchor != "none":
+            if args.anchor == "static":       # the motion-free RECONSTRUCTION: what the data can
+                y0 = gen.project(vol, gen.P_nom[None])   # actually support, and where both sibling
+                x_anchor = gen.to_net(gen.fdk(y0, gen.P_nom[None])[0])          # projects anchor
+            else:                             # "gt": the volume itself. A cleaner prior, but it
+                x_anchor = gen.to_net(vol[0, 0])         # asks the net to undo FDK's own artefacts
+            x1_geo = gen.to_net(gen.fdk(y, params_to_Pmot(th[0], gen.P_nom)[None])[0])
+            dlt = x_anchor - x1_geo
         t = sample_t(1, dev)[0]
-        x_t, dx = bridge_pair(gen, t, y, th[0])
+        x_t, dx = bridge_pair(gen, t, y, th[0], dlt)
         x_t = x_t[None, None]                                        # (1,1,D,H,W)
         ctx = volume_context(x_t, (p, p, p)) if in_ch == 5 else None
         return x_t, dx, t, ctx

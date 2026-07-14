@@ -196,10 +196,16 @@ def make_motion(
     z (SI) gets a smaller translation and the LARGEST rotation on purpose: nodding/shaking a
     head pivots about the SI axis far more than it slides along it.
 
-    `kind` is one of sinusoid | linear | jerk | step, or "mixed" to draw a different profile
-    per DoF. Non-sinusoidal kinds exist to keep us honest: a Fourier-basis estimator scores
-    beautifully on a sinusoid because it has been handed the answer.
+    `kind` is **"akima" (THE STANDARD -- the literature's model, see `akima_motion`)**, or one of
+    sinusoid | linear | jerk | step, or "mixed" to draw a different profile per DoF. The
+    non-akima kinds are OURS, not the field's; they exist to keep us honest (a Fourier-basis
+    estimator scores beautifully on a sinusoid because it has been handed the answer), but a
+    headline number should be reported on "akima" so it is comparable to Thies et al.
     """
+    if kind == "akima":
+        return akima_motion(n_views, trans_mm=max(trans_mm), rot_deg=max(rot_deg),
+                            device=device, dtype=dtype, seed=seed)
+
     g = torch.Generator(device="cpu")
     if seed is not None:
         g.manual_seed(seed)
@@ -218,22 +224,94 @@ def make_motion(
     return theta.to(device=device, dtype=dtype)
 
 
+def akima_motion(
+    n_views: int,
+    *,
+    n_nodes: int = 10,
+    trans_mm: float = 5.0,
+    rot_deg: float = 5.0,
+    zero_centre: bool = True,
+    device="cpu",
+    dtype=torch.float32,
+    seed: int | None = None,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """**THE FIELD'S STANDARD head-motion model** (Thies et al., IEEE TMI 2025, arXiv:2401.09283).
+
+        "the rigid motion state of each projection is unrelated to that of the neighboring
+         views. In a typical CBCT scan, however, multiple projection images are acquired per
+         second. Hence, we impose an additional temporal smoothness constraint on the motion
+         patterns by fitting an Akima spline to each of the six motion parameters separately."
+
+    An independent **Akima spline** per DoF through `n_nodes` evenly spaced nodes, one at each end
+    of the scan. Thies use **10 nodes to SIMULATE** motion and 30 to ESTIMATE it; the evaluation
+    amplitude is **5 mm / 5 deg** (they train their quality metric on a wider 10 mm / 15 deg).
+    Splines are ZERO-CENTRED, which is their handling of the unobservable global pose -- see
+    `motion_error`, which fits the SE(3) gauge properly rather than assuming it is the mean.
+
+    Physically: head motion is "slow oscillations as well as uniformly increasing deviations from
+    an initial position" (Wagner et al., Invest Radiol 2003), and at ~5 ms exposure per projection
+    it is INTER-frame only, never intra-frame.
+
+    THIS MOVES FASTER THAN OUR OWN `sinusoid` PROFILE, and that matters. 10 nodes over 360 views
+    is one node per 40 views, so adjacent nodes can swing 10 deg in 40 views: **0.22-0.37 deg per
+    view of rotation**, against 0.13 for a 1.5-cycle sinusoid at the same 5 deg amplitude. The
+    faster the rotation about the gantry axis, the more unevenly the effective view angles are
+    spaced -- which is exactly what `geometry_3d.view_angular_weights` exists to correct (worth
+    +1.21 dB on average over five draws of THIS profile).
+
+    Needs scipy (`Akima1DInterpolator`); scipy is already a hard dependency of the repo.
+    """
+    import numpy as np
+    from scipy.interpolate import Akima1DInterpolator
+
+    if seed is not None:
+        rng = np.random.default_rng(seed)
+    elif generator is not None:
+        rng = np.random.default_rng(int(torch.randint(0, 2 ** 31 - 1, (1,),
+                                                      generator=generator).item()))
+    else:
+        rng = np.random.default_rng()
+
+    tn = np.linspace(0.0, n_views - 1, n_nodes)
+    v = np.arange(n_views, dtype=np.float64)
+    cols = []
+    for d in range(6):
+        amp = trans_mm if d < 3 else math.radians(rot_deg)
+        s = Akima1DInterpolator(tn, rng.uniform(-amp, amp, n_nodes))(v)
+        cols.append(s - s.mean() if zero_centre else s)
+    return torch.tensor(np.stack(cols, -1), device=device, dtype=dtype)
+
+
 def random_motion(
     n_views: int,
     *,
     trans_mm: float = 5.0,
     rot_deg: float = 3.0,
     cycles: tuple[float, float] = (0.5, 3.0),
+    kind: str = "akima",
+    n_nodes: int = 10,
     device="cpu",
     dtype=torch.float32,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """Random smooth per-view motion for TRAINING the flow-matching prior, (V, 6) [mm | rad].
+    """Random per-view motion for TRAINING the flow-matching prior, (V, 6) [mm | rad].
 
-    Per-DoF random-amplitude / random-frequency / random-phase sinusoid, the 3D twin of the 2D
-    `RandomMotionConfig`. Deliberately BROADER than `make_motion`'s test amplitudes: the prior
-    must have seen worse corruption at t=0 than it will meet at inference.
+    `kind="akima"` (the DEFAULT) is the literature's model -- see `akima_motion`. Train the prior
+    on the same motion family the field evaluates on, or the bridge it learns is not the bridge
+    inference walks.
+
+    `kind="sinusoid"` is the old per-DoF random-amplitude / random-frequency / random-phase
+    sinusoid, the 3D twin of the 2D `RandomMotionConfig`. Kept for the ablation only: it is
+    SMOOTHER than real head motion (0.13 vs 0.22-0.37 deg/view of rotation at 5 deg amplitude),
+    so a prior trained on it has never seen how fast a head can actually turn.
     """
+    if kind == "akima":
+        return akima_motion(n_views, n_nodes=n_nodes, trans_mm=trans_mm, rot_deg=rot_deg,
+                            device=device, dtype=dtype, generator=generator)
+    if kind != "sinusoid":
+        raise ValueError(f"kind must be akima|sinusoid, got {kind!r}")
+
     def U(lo, hi, n):
         return lo + (hi - lo) * torch.rand(n, generator=generator)
 
