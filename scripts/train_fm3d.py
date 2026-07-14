@@ -34,6 +34,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from fm3d.dataset_cq500 import CQ500Generator
 from fm3d.dataset_slab import AAPMSlabGenerator
 from fm3d.geometry_3d import ConeBeam3DConfig, measured_region_mask
 from fm3d.prior_patch import make_tile_inputs, volume_context
@@ -106,15 +107,21 @@ def bridge_pair(gen, t: torch.Tensor, y, theta, dlt, delta: float = 0.02):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", default=DATA)
+    ap.add_argument("--dataset", default="cq500", choices=["cq500", "aapm"],
+                    help="cq500 = the literature's dataset in the literature's geometry "
+                         "(SID 785 / SDD 1200); aapm = the old stacked-slice stand-in")
+    ap.add_argument("--root", default="data/CQ500")
+    ap.add_argument("--split", default="train")
+    ap.add_argument("--shape", type=int, nargs=3, default=(256, 256, 256))   # cq500, @ 1 mm
+    ap.add_argument("--data", default=DATA)                                  # aapm only
     ap.add_argument("--out", default="logs/fm3d_a")
     ap.add_argument("--iters", type=int, default=20000)
     ap.add_argument("--batch", type=int, default=8)          # patches per step
     ap.add_argument("--patch", type=int, default=64)
     ap.add_argument("--cache", type=int, default=6)          # bridge draws held at once
     ap.add_argument("--refresh", type=int, default=12)       # steps between refreshing one draw
-    ap.add_argument("--slab", type=int, default=64)
-    ap.add_argument("--in_plane", type=int, default=256)
+    ap.add_argument("--slab", type=int, default=64)          # aapm only
+    ap.add_argument("--in_plane", type=int, default=256)     # aapm only
     ap.add_argument("--views", type=int, default=360)
     ap.add_argument("--base", type=int, default=32)
     ap.add_argument("--context", default="global", choices=["global", "none"],
@@ -125,24 +132,35 @@ def main():
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--trans_mm", type=float, default=5.0)
     ap.add_argument("--rot_deg", type=float, default=5.0)   # the literature's amplitude
-    ap.add_argument("--anchor", default="gt", choices=["gt", "static", "none"],
-                    help="what the bridge's t=1 endpoint IS. gt (DEFAULT) = the ground-truth "
-                         "volume: the only endpoint with no reconstruction artefact in it. "
-                         "static = the motion-free FDK, which still carries FDK's CONE-BEAM "
-                         "artefact (34.3 dB from the GT, and 44.3 dB at the midplane -- it is "
-                         "entirely a cone effect, not sampling: 1440 views buy +0.1 dB). "
-                         "none = the bare geometry bridge, whose endpoint is not clean at all")
+    ap.add_argument("--anchor", default="static", choices=["static", "gt", "none"],
+                    help="what the bridge's t=1 endpoint IS. static (DEFAULT) = the MOTION-FREE "
+                         "FDK -- the same reconstruction operator, the same scan, no motion. It "
+                         "is what this scanner can actually produce of a still patient, and it is "
+                         "where BOTH sibling projects anchor. Without it the endpoint is FDK(y, "
+                         "P(theta_true)), which still sits 1-3 dB below a static scan, so the "
+                         "prior would learn FDK's residual MOTION artefact as its target. "
+                         "gt = the volume itself (also removes FDK's cone-beam floor, but asks "
+                         "the net to invert the operator's own defect). none = the bare bridge.")
     ap.add_argument("--save_every", type=int, default=2000)
     args = ap.parse_args()
 
     dev = "cuda"
     os.makedirs(args.out, exist_ok=True)
 
-    cfg = ConeBeam3DConfig(det_bin=2, n_views=args.views)
-    gen = AAPMSlabGenerator(args.data, cfg, device=dev, slab=args.slab, in_plane=args.in_plane)
-    print(f"slabs: {gen.n_slabs} from {len(gen.runs)} runs | grid {gen.shape} @ "
-          f"({gen.dz}, {gen.dy}, {gen.dx}) mm | fdk_scale {gen.fbp_scale:.5g}")
-    print(f"detector {cfg.nv}x{cfg.nu} @ {cfg.du:.3f} mm | FOV {cfg.fov_diameter_mm():.0f} mm")
+    if args.dataset == "cq500":
+        cfg = ConeBeam3DConfig.thies(n_views=args.views)
+        gen = CQ500Generator(args.root, cfg, device=dev, split=args.split,
+                             shape=tuple(args.shape), voxel_mm=1.0)
+        print(f"CQ500 '{args.split}': {gen.n_slabs} patients | grid {gen.shape} @ 1 mm | "
+              f"fdk_scale {gen.fbp_scale:.5g}")
+    else:
+        cfg = ConeBeam3DConfig(det_bin=2, n_views=args.views)
+        gen = AAPMSlabGenerator(args.data, cfg, device=dev, slab=args.slab,
+                                in_plane=args.in_plane)
+        print(f"slabs: {gen.n_slabs} from {len(gen.runs)} runs | grid {gen.shape} @ "
+              f"({gen.dz}, {gen.dy}, {gen.dx}) mm | fdk_scale {gen.fbp_scale:.5g}")
+    print(f"detector {cfg.nv}x{cfg.nu} @ {cfg.du:.3f} mm | FOV {cfg.fov_diameter_mm():.0f} mm | "
+          f"{cfg.n_views} views")
 
     # Patches are drawn only from the MEASURED REGION (a barrel, not a cylinder -- it narrows
     # with radius). Training the prior on never-measured voxels teaches it to hallucinate exactly

@@ -70,7 +70,7 @@ def main():
     ap.add_argument("--shape", type=int, nargs=3, default=(256, 256, 256))
     ap.add_argument("--views", type=int, default=360)
     ap.add_argument("--motion_kind", default="akima")     # the literature's model (Thies et al.)
-    ap.add_argument("--anchor", default="gt", choices=["gt", "static", "none"])
+    ap.add_argument("--anchor", default="static", choices=["static", "gt", "none"])
     ap.add_argument("--trans_mm", type=float, default=5.0)     # Thies / JRM-ADM eval amplitude
     ap.add_argument("--rot_deg", type=float, default=5.0)
     ap.add_argument("--seed", type=int, default=0)
