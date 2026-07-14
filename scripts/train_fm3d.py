@@ -125,11 +125,13 @@ def main():
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--trans_mm", type=float, default=5.0)
     ap.add_argument("--rot_deg", type=float, default=5.0)   # the literature's amplitude
-    ap.add_argument("--anchor", default="static", choices=["static", "gt", "none"],
-                    help="what the bridge's t=1 endpoint IS. static = the motion-free FDK (the "
-                         "default; what the data can support, and where both sibling projects "
-                         "anchor). gt = the ground-truth volume. none = the bare geometry bridge, "
-                         "whose endpoint is NOT clean -- see bridge_pair")
+    ap.add_argument("--anchor", default="gt", choices=["gt", "static", "none"],
+                    help="what the bridge's t=1 endpoint IS. gt (DEFAULT) = the ground-truth "
+                         "volume: the only endpoint with no reconstruction artefact in it. "
+                         "static = the motion-free FDK, which still carries FDK's CONE-BEAM "
+                         "artefact (34.3 dB from the GT, and 44.3 dB at the midplane -- it is "
+                         "entirely a cone effect, not sampling: 1440 views buy +0.1 dB). "
+                         "none = the bare geometry bridge, whose endpoint is not clean at all")
     ap.add_argument("--save_every", type=int, default=2000)
     args = ap.parse_args()
 
@@ -190,11 +192,18 @@ def main():
         y, th, vol = gen.sample_motion(1, trans_mm=args.trans_mm, rot_deg=args.rot_deg)
         dlt = None
         if args.anchor != "none":
-            if args.anchor == "static":       # the motion-free RECONSTRUCTION: what the data can
-                y0 = gen.project(vol, gen.P_nom[None])   # actually support, and where both sibling
-                x_anchor = gen.to_net(gen.fdk(y0, gen.P_nom[None])[0])          # projects anchor
-            else:                             # "gt": the volume itself. A cleaner prior, but it
-                x_anchor = gen.to_net(vol[0, 0])         # asks the net to undo FDK's own artefacts
+            if args.anchor == "gt":
+                # THE VOLUME ITSELF. A motion-free FDK is NOT clean -- it still carries the
+                # cone-beam artefact of a circular orbit (34.3 dB from the GT here; 44.3 dB if you
+                # look only at the midplane, so it IS the cone and not sampling -- quadrupling the
+                # views buys 0.1 dB). That artefact is a defect of the INVERSE, not a property of
+                # the data: y is the projection of the true volume, so the image the data supports
+                # is the GT. Anchoring at the static FDK would teach the prior to PAINT IN cone
+                # artefacts it is supposed to remove.
+                x_anchor = gen.to_net(vol[0, 0])
+            else:                             # "static": the motion-free reconstruction
+                y0 = gen.project(vol, gen.P_nom[None])
+                x_anchor = gen.to_net(gen.fdk(y0, gen.P_nom[None])[0])
             x1_geo = gen.to_net(gen.fdk(y, params_to_Pmot(th[0], gen.P_nom)[None])[0])
             dlt = x_anchor - x1_geo
         t = sample_t(1, dev)[0]

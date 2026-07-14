@@ -108,10 +108,19 @@ def main():
     with torch.no_grad():
         x1, _ = bridge_pair(g, T(1.0), y, th, dlt)
     e = float((x1 - static).abs().max())
-    check(2, "t=1 == the CLEAN static reconstruction", e < 1e-5, f"max|d| {e:.1e}")
+    check(2, "anchor=static: t=1 == the motion-free reconstruction", e < 1e-5, f"max|d| {e:.1e}")
     e_bare = float((x1_geo - static).abs().max())
     check(2, "... which the BARE bridge does NOT reach", e_bare > 20 * max(e, 1e-9),
           f"bare max|d| {e_bare:.1e}  vs anchored {e:.1e}")
+
+    # and the DEFAULT anchor: the ground truth itself. A motion-free FDK is not clean either --
+    # it carries the cone-beam artefact of a circular orbit, which is a defect of the INVERSE and
+    # not of the data, so the prior must not learn to reproduce it.
+    with torch.no_grad():
+        gt_net = g.to_net(g.vol[0, 0])
+        x1g, _ = bridge_pair(g, T(1.0), y, th, gt_net - x1_geo)
+    e = float((x1g - gt_net).abs().max())
+    check(2, "anchor=gt (DEFAULT): t=1 == the GROUND TRUTH", e < 1e-5, f"max|d| {e:.1e}")
 
     # ---- [3] the velocity is the tangent of the ANCHORED path ---------------------------
     # The anchor adds a CONSTANT to the path, so it must add exactly that constant to the
@@ -153,8 +162,31 @@ def main():
     check(5, "the BARE endpoint really is below the static scan", p_st - p_geo > 0.5,
           f"static {p_st:.2f} dB  vs  FDK(y, P(theta_true)) {p_geo:.2f} dB "
           f"({p_geo - p_st:+.2f}) -- with the Voronoi weight ALREADY on")
-    check(5, "the ANCHORED endpoint is the static scan", abs(psnr(x1) - p_st) < 0.01,
+    check(5, "the STATIC anchor is the static scan", abs(psnr(x1) - p_st) < 0.01,
           f"{psnr(x1):.2f} dB")
+
+    # AND the static scan is not clean either: the motion-free FDK sits well below the GT, and
+    # the deficit is a CONE effect -- it nearly vanishes at the midplane. This is why the default
+    # anchor is the GT and not the static reconstruction.
+    D = g.shape[0]
+    mid = torch.zeros_like(g.meas)
+    mid[D // 2 - 8:D // 2 + 8] = True
+    mid &= g.meas
+    b = g.to_net(g.vol[0, 0])
+    e_all = (static - b)[g.meas]
+    e_mid = (static - b)[mid]
+    rng = float(b[g.meas].max() - b[g.meas].min())
+    p_mid = float(20 * np.log10(rng / (e_mid.pow(2).mean().sqrt().item() + 1e-12)))
+    check(5, "the STATIC scan is NOT the GT either (cone-beam floor)", p_st < 45.0,
+          f"static {p_st:.2f} dB vs GT")
+    # The threshold is loose because THIS PHANTOM UNDERSTATES THE EFFECT: it is smooth ellipsoids
+    # over 144 mm of z, so its cone artefact is mild. On a real CQ500 head over 256 mm the gap is
+    # +9.9 dB (midplane 44.26 vs whole-volume 34.34), and quadrupling the views buys 0.1 dB --
+    # i.e. it is the cone, not angular sampling. The gate only has to see the SIGN.
+    check(5, "... and that floor is a CONE effect (midplane is better)", p_mid - p_st > 0.5,
+          f"midplane-only {p_mid:.2f} dB  vs  whole volume {p_st:.2f} dB "
+          f"(+{p_mid - p_st:.2f}; on a real head this gap is +9.9)")
+    check(5, "the GT anchor reaches the GT", psnr(x1g) > 100.0, f"{psnr(x1g):.0f} dB")
 
     n = len(FAIL)
     print(f"\n{'ALL PASS' if n == 0 else f'{n} FAILURE(S): ' + ', '.join(FAIL)}")
