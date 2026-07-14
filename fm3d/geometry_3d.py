@@ -26,6 +26,7 @@ Geometry convention (documented once, used by projector/FDK/warp/estimator)
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -443,6 +444,78 @@ def build_conebeam_orbit(
 
     P = torch.cat([A, b[:, :, None]], dim=-1)                         # (V, 3, 4)
     return P
+
+
+def source_positions(Pmat: torch.Tensor) -> torch.Tensor:
+    """(..., V, 3) source positions, read straight out of the projection matrices.
+
+    P maps a world point to a homogeneous detector coordinate, and the ONE world point that
+    projects to the degenerate [0,0,0] is the source. So the source is the right null vector of
+    P: take the last right-singular vector and dehomogenize.
+
+    Divide by the homogeneous component AS IT IS. Clamping it is a trap: the sign of a singular
+    vector is arbitrary and flips from view to view, so `clamp(min=eps)` maps a perfectly good
+    negative w to +1e-12 and throws that view's source to ~1e12 mm with the wrong sign. (It did.
+    The translation-only cases read -32 dB until this was fixed.)
+    """
+    _, _, Vh = torch.linalg.svd(Pmat.double())          # (..., V, 3, 4) -> Vh (..., V, 4, 4)
+    n = Vh[..., -1, :]                                  # (..., V, 4)
+    if bool((n[..., 3].abs() < 1e-9).any()):
+        raise RuntimeError("a projection matrix puts its source at infinity (parallel beam?)")
+    return (n[..., :3] / n[..., 3:4]).to(Pmat.dtype)
+
+
+def view_angular_weights(Pmat: torch.Tensor) -> torch.Tensor:
+    """(..., V) the angular share d_beta of each view, from the ACTUAL source trajectory in P.
+
+    WHY THIS EXISTS. FDK ends with a single `angle_span / V` -- one weight for every view, i.e.
+    "the views are equiangular". Rigid patient motion about the GANTRY AXIS breaks exactly that
+    and nothing else: rotating the object about z maps the source circle onto ITSELF, so the
+    trajectory stays a circle and the ramp stays along u -- the views merely stop being evenly
+    spaced. That one wrong weight is worth **-2.01 dB** on a 5 deg rotation, against 0.00 dB for
+    any translation (`scripts/diag_oracle_fdk.py`). Feeding these weights back gives **+1.14 dB**
+    on the bridge's own motion, and it is an EXACT NO-OP on the nominal orbit (the weights come
+    back uniform to 1 part in 1e5), so nothing static can regress.
+
+    It does NOT close the whole gap: once the views really are unevenly spaced, that is a
+    SAMPLING deficit, and no reweighting invents the missing angles. The rest of FDK's motion
+    loss (the ramp is still filtered along u, which a tilt of the orbit plane by rx/ry
+    invalidates) stays. Only an iterative reconstruction recovers that.
+
+    THE WEIGHT IS A VORONOI PARTITION OF THE CIRCLE, NOT A DIFFERENCE ALONG THE VIEW INDEX, and
+    that distinction is load-bearing. A central difference `|beta[v+1] - beta[v-1]| / 2` assumes
+    the effective angle advances MONOTONICALLY with the view index. Real head motion contains
+    steps: in the `mixed` profile one view rotates the patient 5 deg while the gantry advances
+    1 deg, so the effective view angle jumps BACKWARDS by 9 deg. The central difference then
+    hands that single view a 4x weight, and the reconstruction gets WORSE, not better (measured:
+    -0.87 dB on the patient whose motion has the step, while the two smooth ones gained +1.1).
+
+    So: sort the views by their effective angle, give each one half the gap to each of its
+    neighbours ON THE CIRCLE, and scatter that back. Every weight is then non-negative by
+    construction, the weights sum to exactly 2*pi whatever the motion does, and views that pile
+    up at the same angle correctly split one share between them instead of each claiming a full
+    one. On the nominal orbit the sort is the identity and every gap is angle_span/V -- an exact
+    no-op.
+
+    Full 360 deg orbits only: the circular closure assumes the trajectory wraps. A short scan
+    needs Parker weighting, which is not implemented.
+    """
+    S = source_positions(Pmat)                          # (..., V, 3)
+    beta = torch.atan2(S[..., 1], S[..., 0])            # (..., V) in (-pi, pi]
+    V = beta.shape[-1]
+    two_pi = 2.0 * math.pi
+
+    order = torch.argsort(beta, dim=-1)                 # views, ordered around the circle
+    bs = torch.gather(beta, -1, order)
+
+    gap = torch.empty_like(bs)                          # gap[i] = bs[i+1] - bs[i], closed circularly
+    gap[..., :-1] = bs[..., 1:] - bs[..., :-1]
+    gap[..., -1] = bs[..., 0] + two_pi - bs[..., -1]
+
+    share = 0.5 * (gap + torch.roll(gap, 1, dims=-1))   # half the gap on either side
+    w = torch.empty_like(share)
+    w.scatter_(-1, order, share)                        # back to view order
+    return w
 
 
 def detector_coords_3d(

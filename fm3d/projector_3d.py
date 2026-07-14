@@ -404,6 +404,7 @@ def fdk_conebeam_3d_batched(
     disp: torch.Tensor | None = None,
     trunc_pad: int | None = None,
     trunc_thresh: float = 0.02,
+    view_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Batched FDK (Feldkamp) cone-beam reconstruction. Returns (B, D, H, W).
 
@@ -435,11 +436,32 @@ def fdk_conebeam_3d_batched(
 
     `disp=None` (or all-zero) reduces EXACTLY to the uncorrected static FDK: the moved coords
     are the voxel centers bit-for-bit.
+
+    `view_weight` (V,) or (B,V) REPLACES the uniform `angle_span / V` angular weight with a
+    per-view one, in radians. Use `geometry_3d.view_angular_weights(Pmat)` to get the angular
+    share each view actually covers -- under rigid motion about the gantry axis the views stop
+    being equiangular and the uniform weight is simply the wrong Riemann sum (worth -2.01 dB at
+    5 deg; see that function). It is applied by PRE-SCALING the sinogram, which is exact: every
+    step between here and the backprojection sum (cosine, Wang, Ohnesorge pad, ramp) is linear
+    and acts view-by-view, so scaling view v by c multiplies its backprojected contribution by
+    c. `None` keeps the old behaviour bit-for-bit, and on the nominal orbit the weights come
+    back uniform, so passing them there is a no-op too.
     """
     device = sino.device
     dtype = torch.float32
     sino = sino.to(device=device, dtype=dtype)
     Pmat = Pmat.to(device=device, dtype=dtype)
+
+    if view_weight is not None:
+        w = view_weight.to(device=device, dtype=dtype)
+        if w.ndim == 1:
+            w = w[None]
+        if w.shape[-1] != sino.shape[1]:
+            raise ValueError(f"view_weight has {w.shape[-1]} views, sinogram has "
+                             f"{sino.shape[1]}")
+        # net weight per view = view_weight; the uniform factor below then cancels the divisor.
+        uni = float(cfg.angle_span) / float(sino.shape[1])
+        sino = sino * (w / uni)[..., None, None]
     u_coords = u_coords.to(device=device, dtype=dtype)
     v_coords = v_coords.to(device=device, dtype=dtype)
     B, V, nv, nu = sino.shape

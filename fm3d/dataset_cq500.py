@@ -53,7 +53,8 @@ import numpy as np
 import torch
 
 from .filters import calibrate_scale
-from .geometry_3d import ConeBeam3DConfig, build_conebeam_orbit, detector_coords_3d
+from .geometry_3d import (ConeBeam3DConfig, build_conebeam_orbit, detector_coords_3d,
+                          view_angular_weights)
 from .projector_3d import fdk_conebeam_3d_batched, forward_project_3d_batched
 from .rigid_motion import params_to_Pmot, random_motion
 
@@ -177,9 +178,14 @@ class CQ500Generator:
                  hu_norm=(-1000.0, 2000.0), clip: bool = True, mu_water: float = MU_WATER,
                  thin_mm: float = 0.7, count_tol: float = 0.5,
                  split_counts=(150, 50, 120), n_samples_fwd: int = 512,
+                 angle_weight: bool = True,
                  cache_dir: str | None = None, verbose: bool = True):
         self.device = torch.device(device)
         self.root = root
+        # Per-view angular weights read out of Pmat instead of FDK's uniform angle_span/V.
+        # Under rigid motion the views stop being equiangular and the uniform weight is the wrong
+        # Riemann sum (-2.01 dB at 5 deg about the gantry axis). Exact no-op on the nominal orbit.
+        self.angle_weight = bool(angle_weight)
         self.shape_dhw = tuple(int(s) for s in shape)
         self.dx = self.dy = self.dz = float(voxel_mm)
         self.mu_water = mu_water
@@ -275,13 +281,19 @@ class CQ500Generator:
             n_samples=kw.pop("n_samples", self.n_samples_fwd),
             view_chunk=kw.pop("view_chunk", 4), row_chunk=kw.pop("row_chunk", 64), **kw)
 
-    def fdk(self, sino: torch.Tensor, Pmat: torch.Tensor, *, scale=None, **kw) -> torch.Tensor:
+    def fdk(self, sino: torch.Tensor, Pmat: torch.Tensor, *, scale=None,
+            angle_weight: bool | None = None, **kw) -> torch.Tensor:
         D, H, W = self.shape_dhw
+        aw = self.angle_weight if angle_weight is None else bool(angle_weight)
+        # an explicitly-passed view_weight wins (and must not collide with the one we derive)
+        vw = kw.pop("view_weight", None)
+        if vw is None and aw:
+            vw = view_angular_weights(Pmat)                        # (B,V), from the ACTUAL orbit
         return fdk_conebeam_3d_batched(
             sino, Pmat, self.u_coords, self.v_coords, self.cfg,
             D=D, H=H, W=W, dx=self.dx, dy=self.dy, dz=self.dz,
             scale=self.fbp_scale if scale is None else scale,
-            view_chunk=kw.pop("view_chunk", 8), **kw)
+            view_chunk=kw.pop("view_chunk", 8), view_weight=vw, **kw)
 
     def _calibrate(self) -> float:
         from .geometry_3d import measured_region_mask
