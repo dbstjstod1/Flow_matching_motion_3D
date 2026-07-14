@@ -176,11 +176,59 @@ class ConeBeam3DConfig:
                    angular_range_deg=360.0, angle_start=-1.5707963267948966, clockwise=True)
 
     @classmethod
+    def thies(cls, det_pixel_mm: float = 0.64, n_views: int = 360,
+              det_bin: int = 1) -> "ConeBeam3DConfig":
+        """**The head-motion-compensation literature's de-facto standard simulation geometry.**
+
+            SID 785 (source-to-ISOCENTRE = our SOD), SDD 1200 (M = 1.529)
+            500 x 700 panel @ 0.64 mm | 360 views over a full 2*pi
+
+        Shared by Thies et al. (TMI 2025, arXiv:2401.09283; arXiv:2405.19079; MICCAI 2024) and by
+        JRM-ADM (arXiv:2504.14033), all of which forward-project CQ500 head CT volumes through it.
+        Matching it is what makes our numbers comparable to theirs. JRM-ADM differs on two knobs
+        (0.5 mm pitch, 120 views) -- hence the arguments; see `ConeBeam3DConfig.jrm_adm()`.
+
+        Derived (gated in `scripts/gate_cq500.py`):
+            FOV diameter    288.4 mm       axial coverage  209.3 mm on-axis
+            iso pitch       0.419 mm       cone half-angle 7.6 deg
+
+        **"500 x 700" does not say which axis is which, and the papers never do.** It MUST be
+        nu (lateral) = 700: that is the 288 mm FOV above, and a head fits. The other assignment
+        gives a 207 mm FOV, which truncates a head at every view. Derived, not quoted -- gated.
+
+        "SID" is source-to-ISOCENTRE here (Thies' text says so explicitly). Elsewhere in the
+        literature SID often means source-to-IMAGE, i.e. the detector -- reading it that way would
+        silently shrink the geometry by 415 mm.
+
+        Note the axial shortfall: a 256 mm (256^3 @ 1 mm) reconstruction box, which is what Thies
+        evaluates on, is TALLER than the 209 mm the panel sees on-axis (and the measured region is
+        a barrel that narrows further with radius). The ends of the box are not measured. This is
+        physical -- keep `measured_region_mask` in every metric and in FM patch sampling.
+        """
+        return cls(SOD=785.0, SDD=1200.0, det_nu=700, det_nv=500, det_pixel_mm=det_pixel_mm,
+                   det_bin=det_bin, n_views=n_views, angular_range_deg=360.0)
+
+    @classmethod
+    def jrm_adm(cls, n_views: int = 120, det_bin: int = 1) -> "ConeBeam3DConfig":
+        """JRM-ADM's variant of the standard geometry: same SID/SDD/panel, 0.5 mm pitch, and only
+        120 full-scan views (they then SUBSAMPLE to 20/40/60 for the sparse-view experiments).
+        Derived: FOV 225.9 mm, axial coverage 163.5 mm -- both notably tighter than Thies', and
+        225.9 mm is only just wider than a head."""
+        return cls.thies(det_pixel_mm=0.5, n_views=n_views, det_bin=det_bin)
+
+    @classmethod
     def preset(cls, name: str, *, det_bin: int | None = None, n_views: int = 660,
                scan_duration_sec: float = 60.0) -> "ConeBeam3DConfig":
-        """`"halcyon"` (half-fan, contains a whole DIR-Lab thorax), `"obi"` (full-fan Varian OBI,
-        which contains neither case and therefore truncates), or `"spare_mc"` (the real inference
+        """`"thies"` (**the CQ500 head-motion standard**), `"jrm_adm"` (its sparse-view variant),
+        `"halcyon"` (half-fan, contains a whole DIR-Lab thorax), `"obi"` (full-fan Varian OBI,
+        which contains neither case and therefore truncates), or `"spare_mc"` (the 4DCT inference
         target). One switch for every script."""
+        if name in ("thies", "cq500"):
+            return cls.thies(det_bin=1 if det_bin is None else det_bin,
+                             n_views=360 if n_views == 660 else n_views)
+        if name == "jrm_adm":
+            return cls.jrm_adm(det_bin=1 if det_bin is None else det_bin,
+                               n_views=120 if n_views == 660 else n_views)
         if name == "halcyon":
             return cls.halcyon(det_bin=2 if det_bin is None else det_bin, n_views=n_views,
                                scan_duration_sec=scan_duration_sec)
@@ -191,7 +239,8 @@ class ConeBeam3DConfig:
             return cls.spare_mc(det_bin=1 if det_bin is None else det_bin,
                                 n_views=680 if n_views == 660 else n_views,
                                 scan_duration_sec=scan_duration_sec)
-        raise ValueError(f"unknown geometry preset {name!r} (halcyon|obi|spare_mc)")
+        raise ValueError(f"unknown geometry preset {name!r} "
+                         f"(thies|jrm_adm|halcyon|obi|spare_mc)")
 
     # ---- derived (kept as properties so the old .nu/.du/.angle_span call sites work)
     @property

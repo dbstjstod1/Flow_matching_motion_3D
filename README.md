@@ -215,6 +215,43 @@ the gate is exact-by-construction rather than statistical. The sharp one is [4]:
 returns its own coordinate channel must reproduce the analytic coordinate map through the blend,
 which can only happen if overlapping tiles agree exactly wherever they overlap.
 
+**Milestone 5 (CQ500 + the field's standard geometry) — implemented and gated; the data itself is not downloaded yet.**
+
+```
+python scripts/gate_cq500.py           # ~1 min, no data, no checkpoint
+```
+
+The head-motion-compensation literature has standardized on **CQ500** (Qure.ai / CARING: 491
+non-contrast head CT scans, DICOM, CC BY-NC-SA 4.0) and on one simulation geometry. CQ500 is
+diagnostic *MDCT*, not CBCT: everyone takes its volumes as the clean ground truth and
+forward-projects them into a cone beam, which is exactly what we were already doing with AAPM
+slabs. `fm3d/dataset_cq500.py` retires three of `dataset_slab.py`'s debts at once — `dz` stops
+being a guess (DICOM carries the spacing), the interloper-slice and patient-boundary heuristics
+are gone, and we get whole heads instead of 64-slice slabs.
+
+`ConeBeam3DConfig.thies()` — **SID 785 / SDD 1200 / 500×700 panel @ 0.64 mm / 360 views**, shared
+by [Thies et al.](https://arxiv.org/abs/2401.09283) (IEEE TMI 2025, and two companions) and
+[JRM-ADM](https://arxiv.org/abs/2504.14033). Derived: FOV 288.1 mm, axial coverage 209.3 mm,
+M = 1.529. `ConeBeam3DConfig.jrm_adm()` is the same scanner at 0.5 mm pitch and 120 views.
+
+**Which axis of "500 × 700" is lateral is never stated in any of those papers**, and it is not a
+detail: `nu = 700` gives a 288 mm FOV that contains a head, `nu = 500` gives 207 mm and truncates
+one at every view. Gate [1] pins it. Note also that Thies' own 256³ @ 1 mm evaluation box is
+*taller* than the 209 mm the panel sees — 47 mm of it is never measured, which is physical, and
+why `measured_region_mask` stays in every metric.
+
+Selection follows Thies Sec. III: thin-slice filter → slice-count outlier cut → **sequential,
+patient-level** 150 / 50 / rest split, no RNG. Their two unstated thresholds ("considerably fewer
+or more slices"; which of a patient's several thin series to take) are ours and are marked as such
+in the module docstring.
+
+The gate does not wait for the download: it **synthesizes a CQ500-shaped DICOM tree** (real DICOM
+through SimpleITK, with thick series and slice-count outliers deliberately planted) and runs the
+actual indexing, selection, split and projector code over it. It caught a real bug on its first
+run — in itself, not the library: its head phantom was larger than the volume it was written into,
+so the "head" was pure brain with no skull and no implant, and the HU-clipping check passed on
+nothing.
+
 ## Next
 
 - Train the prior, then run the blind posterior loop and see how far under the ~31.5 dB oracle
