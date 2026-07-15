@@ -129,9 +129,13 @@ def main():
     ap.add_argument("--context", default="global", choices=["global", "none"],
                     help="global = the arXiv:2512.18161 conditioning (in_ch=5); "
                          "none = the bare-patch prior (in_ch=1)")
-    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--lr", type=float, default=1e-4)          # the 2D sibling's vanilla-FM lr
     ap.add_argument("--ema", type=float, default=0.999)
-    ap.add_argument("--amp", action="store_true")
+    ap.add_argument("--amp", action="store_true", default=True,
+                    help="fp16 AMP, like the 2D sibling. --no-amp for fp32.")
+    ap.add_argument("--no-amp", dest="amp", action="store_false")
+    ap.add_argument("--amp_dtype", default="float16", choices=["float16", "bfloat16"],
+                    help="float16 matches the 2D sibling; bfloat16 is safer but not what it used")
     ap.add_argument("--trans_mm", type=float, default=5.0)
     ap.add_argument("--rot_deg", type=float, default=5.0)   # the literature's amplitude
     ap.add_argument("--anchor", default="static", choices=["static", "gt", "none"],
@@ -256,6 +260,7 @@ def main():
 
     t0 = time.time()
     loss_log = []                          # (iter, loss) per step, saved into every checkpoint
+    n_nonfinite = 0
     for it in range(1, args.iters + 1):
         if it % args.refresh == 0:
             cache[torch.randint(len(cache), (1,)).item()] = draw()
@@ -272,8 +277,16 @@ def main():
         tb = torch.stack(ts)
 
         opt.zero_grad(set_to_none=True)
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp):
+        with torch.autocast("cuda", dtype=getattr(torch, args.amp_dtype), enabled=args.amp):
             loss = ((model(xb, tb) - db) ** 2).mean()
+        # fp16 can overflow to inf/nan (this loop has never run in fp16 before). GradScaler skips
+        # a non-finite step on its own, but a persistently non-finite LOSS means the run is dead
+        # and should say so, not spin silently.
+        if not torch.isfinite(loss):
+            n_nonfinite = n_nonfinite + 1 if it > 1 else 1
+            if n_nonfinite % 20 == 0:
+                print(f"it {it:6d} | WARN non-finite loss x{n_nonfinite} (fp16 overflow?)",
+                      flush=True)
         scaler.scale(loss).backward()
         scaler.step(opt)
         scaler.update()
