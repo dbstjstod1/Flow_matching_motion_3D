@@ -199,6 +199,33 @@ def predict_x1_patched(model, x_t: torch.Tensor, t: float, *, patch: int = 64,
 
 
 @torch.no_grad()
+def prior_ode(model, x0: torch.Tensor, *, n_steps: int = 50, patch: int = 64,
+              stride: int | None = None, context: str = "auto", n_offsets: int = 1,
+              generator=None) -> torch.Tensor:
+    """Prior-ONLY Euler integration of the FM ODE, t: 0 -> 1. No data consistency, no TV --
+    "what does the prior ALONE make of the cold start". This is the validation metric, the same
+    one the sibling 4DCT project renders every `val_every` steps.
+
+    x0 : (1,1,D,H,W) NET-space cold start (the uncorrected FDK, in practice)   -> x1_hat, NET
+
+    The velocity is recovered from the clean-endpoint predictor the training target defines:
+    `predict_x1_patched` blends x1_hat = x_t + (1-t)*v, so v = (x1_hat - x_t)/(1-t), and the Euler
+    step is x <- x + dt * v. The (1-t) never actually divides here -- we step
+    x <- x + (dt/(1-t)) * (x1_hat - x_t) -- so the t -> 1 endpoint is well behaved. On an affine
+    path an oracle net emitting the true constant velocity gives x_N = x_1 for any N; on this
+    project's CURVED geometry bridge more steps genuinely help, hence the default 50 (the deploy
+    loop's own count), against 4DCT's cheaper 10."""
+    x = x0
+    dt = 1.0 / n_steps
+    for k in range(n_steps):
+        t = k / n_steps
+        x1 = predict_x1_patched(model, x, t, patch=patch, stride=stride, context=context,
+                                n_offsets=n_offsets, generator=generator)
+        x = x + (dt / max(1.0 - t, 1e-3)) * (x1 - x)          # == x + dt * v
+    return x
+
+
+@torch.no_grad()
 def sample_patch_coords(shape_dhw, patch: int, n: int, generator=None, device="cpu"):
     """n random aligned crop origins (z,y,x) for training patch extraction."""
     D, H, W = shape_dhw
