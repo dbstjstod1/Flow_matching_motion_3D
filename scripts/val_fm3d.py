@@ -63,6 +63,64 @@ def montage(path, panels, title):
     plt.close(fig)
 
 
+def run_validation(model, gen, meas, out_dir, *, it=0, patients=3, patch=64, ode_steps=50,
+                   anchor="static", trans_mm=5.0, rot_deg=5.0, writer=None, dev="cuda"):
+    """Prior-ONLY ODE from the cold start, on `patients` fixed val cases. Returns the per-patient
+    metrics AND the montage paths, and (if given) logs scalars + images to a tensorboard writer.
+
+    Shared by the standalone `evaluate` and by train_fm3d's inline validation, so both walk the
+    same code -- the number the training loop prints is exactly the number this script reproduces.
+    The fixed seed (1000 + i) means the SAME motion is scored at every checkpoint, so the curve
+    tracks the prior improving and not the luck of the draw."""
+    spacing = (gen.dz, gen.dy, gen.dx)
+    rows, paths = [], []
+    for i in range(patients):
+        # the forward operator and the prior ODE need no grad; the metric's rigid_align DOES
+        # (it optimizes the alignment by backprop), so only THIS block is under no_grad.
+        with torch.no_grad():
+            gt = gen.volume(i)
+            theta = make_motion("akima", gen.cfg.n_views, device=dev, seed=1000 + i,
+                                trans_mm=(trans_mm,) * 3, rot_deg=(rot_deg,) * 3)
+            y = gen.project(gt, params_to_Pmot(theta, gen.P_nom)[None])
+            x0_mu = gen.fdk(y, gen.P_nom[None])[0]                      # cold start, MU
+            static_mu = gen.fdk(gen.project(gt, gen.P_nom[None]), gen.P_nom[None])[0]
+            x1_mu = gen.from_net(prior_ode(model, gen.to_net(x0_mu)[None, None], n_steps=ode_steps,
+                                           patch=patch, stride=patch // 2, context="auto")[0, 0])
+        ref_mu = static_mu if anchor == "static" else gt[0, 0]
+        # GAUGE-AWARE: rigidly align to the target before scoring. Raw PSNR penalises the
+        # unobservable global pose the prior is free to shift; the aligned number is the honest
+        # one (see fm3d/reg_metric.py, and the SE(3) gauge in memory).
+        m0 = aligned_metrics(x0_mu, ref_mu, spacing, mask=meas, iters=200)
+        m1 = aligned_metrics(x1_mu, ref_mu, spacing, mask=meas, iters=200)
+        pid = gen.records[i]["patient"]
+        rows.append({"patient": pid, **{f"cold_{k}": v for k, v in m0.items()},
+                     **{f"ode_{k}": v for k, v in m1.items()}})
+        print(f"    val it {it:6d} p{pid:3d}: cold {m0['psnr_aligned']:5.2f} -> ODE "
+              f"{m1['psnr_aligned']:5.2f} dB / SSIM {m0['ssim_aligned']:.3f} -> "
+              f"{m1['ssim_aligned']:.3f}  (raw {m0['psnr_raw']:.2f} -> {m1['psnr_raw']:.2f})",
+              flush=True)
+        p = os.path.join(out_dir, f"val_it{it:06d}_p{i}.png")
+        montage(p, [(x0_mu, f"x_t=0 cold FDK\n{m0['psnr_aligned']:.2f} dB"),
+                    (x1_mu, f"prior ODE {ode_steps} -> t=1\n{m1['psnr_aligned']:.2f} dB"),
+                    (ref_mu, f"target ({anchor})")],
+                f"fm3d it {it} | CQ500 patient {pid} | prior-only ODE (aligned) | "
+                f"cold {m0['psnr_aligned']:.2f} -> {m1['psnr_aligned']:.2f} dB")
+        paths.append(p)
+        if writer is not None:
+            writer.add_scalar(f"val_psnr_aligned/p{pid}", m1["psnr_aligned"], it)
+            writer.add_scalar(f"val_ssim_aligned/p{pid}", m1["ssim_aligned"], it)
+    mean = float(np.mean([r["ode_psnr_aligned"] for r in rows]))
+    print(f"    val it {it:6d}  MEAN aligned ODE PSNR {mean:.2f} dB  -> {out_dir}/", flush=True)
+    if writer is not None:
+        writer.add_scalar("val_psnr_aligned/mean", mean, it)
+        # the montages as an image grid, so the ODE progress is watchable in tensorboard itself
+        import matplotlib.image as mpimg
+        for i, p in enumerate(paths):
+            img = mpimg.imread(p)                                   # (H,W,4) float
+            writer.add_image(f"val/p{i}", torch.from_numpy(img[..., :3]).permute(2, 0, 1), it)
+    return it, mean, rows
+
+
 def evaluate(ckpt, gen, meas, args, dev):
     ck = torch.load(ckpt, map_location=dev, weights_only=False)
     ca = ck["args"]
@@ -72,41 +130,9 @@ def evaluate(ckpt, gen, meas, args, dev):
     model.load_state_dict(ck["ema"])
     for q in model.parameters():
         q.requires_grad_(False)
-    patch = ca["patch"]
-
-    spacing = (gen.dz, gen.dy, gen.dx)
-    rows = []
-    for i in range(args.patients):
-        gt = gen.volume(i)
-        theta = make_motion("akima", gen.cfg.n_views, device=dev, seed=1000 + i,
-                            trans_mm=(args.trans_mm,) * 3, rot_deg=(args.rot_deg,) * 3)
-        with torch.no_grad():
-            y = gen.project(gt, params_to_Pmot(theta, gen.P_nom)[None])
-            x0_mu = gen.fdk(y, gen.P_nom[None])[0]                          # cold start, MU
-            static_mu = gen.fdk(gen.project(gt, gen.P_nom[None]), gen.P_nom[None])[0]
-            x1_mu = gen.from_net(prior_ode(model, gen.to_net(x0_mu)[None, None],
-                                           n_steps=args.ode_steps, patch=patch,
-                                           stride=patch // 2, context="auto")[0, 0])
-        ref_mu = static_mu if args.anchor == "static" else gt[0, 0]
-        # GAUGE-AWARE: rigidly align to the target before scoring. Raw PSNR penalises the
-        # unobservable global pose the prior is free to shift; the aligned number is the honest
-        # one (see fm3d/reg_metric.py, and the SE(3) gauge in memory).
-        m0 = aligned_metrics(x0_mu, ref_mu, spacing, mask=meas, iters=200)
-        m1 = aligned_metrics(x1_mu, ref_mu, spacing, mask=meas, iters=200)
-        rows.append((i, m1["psnr_aligned"], m1["ssim_aligned"]))
-        print(f"  it {it:6d} patient {gen.records[i]['patient']:3d}: cold {m0['psnr_aligned']:5.2f} "
-              f"-> prior-ODE {m1['psnr_aligned']:5.2f} dB / SSIM {m0['ssim_aligned']:.3f} -> "
-              f"{m1['ssim_aligned']:.3f}  (raw {m0['psnr_raw']:.2f} -> {m1['psnr_raw']:.2f})",
-              flush=True)
-        montage(os.path.join(args.out, f"val_it{it:06d}_p{i}.png"),
-                [(x0_mu, f"x_t=0 cold FDK\n{m0['psnr_aligned']:.2f} dB"),
-                 (x1_mu, f"prior ODE {args.ode_steps} -> t=1\n{m1['psnr_aligned']:.2f} dB"),
-                 (ref_mu, f"target ({args.anchor})")],
-                f"fm3d it {it} | CQ500 patient {gen.records[i]['patient']} | prior-only ODE "
-                f"(aligned) | cold {m0['psnr_aligned']:.2f} -> {m1['psnr_aligned']:.2f} dB")
-    mean = float(np.mean([r[1] for r in rows]))
-    print(f"  it {it:6d}  MEAN aligned prior-ODE PSNR {mean:.2f} dB  -> {args.out}/", flush=True)
-    return it, mean
+    return run_validation(model, gen, meas, args.out, it=it, patients=args.patients,
+                          patch=ca["patch"], ode_steps=args.ode_steps, anchor=args.anchor,
+                          trans_mm=args.trans_mm, rot_deg=args.rot_deg, dev=dev)[:2]
 
 
 def main():

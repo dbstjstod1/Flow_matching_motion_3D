@@ -33,6 +33,7 @@ import time
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))          # for val_fm3d
 
 from fm3d.dataset_cq500 import CQ500Generator
 from fm3d.dataset_slab import AAPMSlabGenerator
@@ -40,6 +41,7 @@ from fm3d.geometry_3d import ConeBeam3DConfig, measured_region_mask
 from fm3d.prior_patch import make_tile_inputs, volume_context
 from fm3d.rigid_motion import params_to_Pmot
 from fm3d.unet_3d import UNet3D
+from val_fm3d import run_validation
 
 DATA = "/home/mirlab/Desktop/Flow_matching_motion/data/AAPM_head_data"
 
@@ -142,6 +144,10 @@ def main():
                          "gt = the volume itself (also removes FDK's cone-beam floor, but asks "
                          "the net to invert the operator's own defect). none = the bare bridge.")
     ap.add_argument("--save_every", type=int, default=2000)
+    ap.add_argument("--val_every", type=int, default=5000)
+    ap.add_argument("--val_patients", type=int, default=3)
+    ap.add_argument("--val_ode_steps", type=int, default=50)   # the deploy loop's count
+    ap.add_argument("--no_tb", action="store_true", help="disable the tensorboard writer")
     args = ap.parse_args()
 
     dev = "cuda"
@@ -233,7 +239,23 @@ def main():
     cache = [draw() for _ in range(args.cache)]
     print(f"bridge cache warm ({args.cache} draws)")
 
+    # ---- validation: a held-out VAL generator + a tensorboard writer -----------------------
+    # Same geometry, the VAL split (never trained on), evaluated inline every `val_every` steps.
+    # Standalone `val_fm3d.py` runs the identical `run_validation`; the montages land in out/val.
+    val_gen = None
+    if args.dataset == "cq500" and args.val_every > 0:
+        val_gen = CQ500Generator(args.root, cfg, device=dev, split="val",
+                                 shape=tuple(args.shape), voxel_mm=1.0, verbose=False)
+    val_dir = os.path.join(args.out, "val")
+    os.makedirs(val_dir, exist_ok=True)
+    writer = None
+    if not args.no_tb:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(os.path.join(args.out, "tb"))
+        print(f"tensorboard: tensorboard --logdir {os.path.join(args.out, 'tb')}")
+
     t0 = time.time()
+    loss_log = []                          # (iter, loss) per step, saved into every checkpoint
     for it in range(1, args.iters + 1):
         if it % args.refresh == 0:
             cache[torch.randint(len(cache), (1,)).item()] = draw()
@@ -263,15 +285,37 @@ def main():
             for be, bm in zip(ema.buffers(), model.buffers()):
                 be.copy_(bm)
 
+        loss_log.append((it, float(loss.detach())))
         if it % 50 == 0:
-            print(f"it {it:6d} | loss {float(loss.detach()):.5f} | "
+            recent = [l for _, l in loss_log[-50:]]
+            ma = sum(recent) / len(recent)
+            print(f"it {it:6d} | loss {float(loss.detach()):.5f} | ma50 {ma:.5f} | "
                   f"{(time.time() - t0) / it:.2f}s/it", flush=True)
+            if writer is not None:
+                writer.add_scalar("train/fm_loss", float(loss.detach()), it)
+                writer.add_scalar("train/fm_loss_ma50", ma, it)
+
+        if val_gen is not None and it % args.val_every == 0:
+            # PRIOR-ONLY ODE from the cold start on the val split -- what the loss cannot tell us.
+            # EMA weights, eval mode, then straight back to training.
+            ema.eval()
+            run_validation(ema, val_gen, meas, val_dir, it=it, patients=args.val_patients,
+                           patch=args.patch, ode_steps=args.val_ode_steps, anchor=args.anchor,
+                           trans_mm=args.trans_mm, rot_deg=args.rot_deg, writer=writer, dev=dev)
+            ema.train()
+
         if it % args.save_every == 0 or it == args.iters:
+            # loss_log rides along in the checkpoint, so the convergence curve survives even if
+            # the text log is rotated or lost -- the whole per-step history, (iter, loss) pairs.
             ck = {"model": model.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
-                  "iter": it, "args": vars(args), "fbp_scale": gen.fbp_scale}
+                  "iter": it, "args": vars(args), "fbp_scale": gen.fbp_scale,
+                  "loss_log": loss_log}
             torch.save(ck, os.path.join(args.out, f"ckpt_iter{it:06d}.pth"))
             torch.save(ck, os.path.join(args.out, "ckpt_last.pth"))
             print(f"saved ckpt_iter{it:06d}.pth")
+
+    if writer is not None:
+        writer.close()
 
 
 if __name__ == "__main__":
