@@ -128,16 +128,24 @@ def make_tile_inputs(x_t: torch.Tensor, coords, psize: tuple[int, int, int],
     return torch.cat([tiles, ctx.expand(n, -1, -1, -1, -1), cc], dim=1)
 
 
-def _grid_offsets(psize, stride, n_offsets: int, generator=None):
-    """Tile-grid phases: (0,0,0) first (deterministic), then random in [1, stride)."""
+def _grid_offsets(psize, stride, n_offsets: int, generator=None, full_random=False):
+    """Tile-grid phases. (0,0,0) first (deterministic), then random.
+
+    `full_random=False` (family A, overlapping): the extra phases jitter within [1, stride) -- a
+    small shift of an OVERLAPPING grid, which the Hann blend then averages to kill any fixed-grid
+    seam. `full_random=True` (family B, non-overlapping): the phases are drawn from the FULL
+    [0, patch) range, because with stride == patch a jitter smaller than the patch would leave the
+    same tile boundaries in almost the same place -- the whole point of the paper's scheme is that
+    each of the K passes lays its non-overlapping seams somewhere DIFFERENT, and only the full
+    range does that."""
     dev = generator.device if generator is not None else "cpu"
     offs = [(0, 0, 0)]
     for _ in range(n_offsets - 1):
         o = []
         for p in psize:
-            s = min(stride, p)
-            o.append(int(torch.randint(1, s, (1,), generator=generator,
-                                       device=dev).item()) if s > 1 else 0)
+            hi = p if full_random else min(stride, p)
+            o.append(int(torch.randint(1, hi, (1,), generator=generator,
+                                       device=dev).item()) if hi > 1 else 0)
         offs.append(tuple(o))
     return offs
 
@@ -146,43 +154,57 @@ def _grid_offsets(psize, stride, n_offsets: int, generator=None):
 def predict_x1_patched(model, x_t: torch.Tensor, t: float, *, patch: int = 64,
                        stride: int | None = None, batch: int = 8,
                        context: str = "auto", n_offsets: int = 1,
-                       generator=None) -> torch.Tensor:
+                       blend: str = "hann", generator=None) -> torch.Tensor:
     """Blended clean-endpoint prediction of the 3D-patch FM prior over a volume.
 
     model : UNet3D velocity net (NET space)   x_t : (1,1,D,H,W) NET
     t     : FM ODE time in [0,1)              ->    x1_hat (1,1,D,H,W) NET
 
-    Splits the volume into overlapping `patch`^3 tiles (default stride = patch/2),
-    computes x1_hat = x_t + (1-t)*v per tile, and overlap-blends with a Hann
-    window normalized by the accumulated weight (== 1 everywhere).
+    TWO PATCH->VOLUME SCHEMES, both standard in the 3D-CT-diffusion literature (see the memory):
 
-    context   : "global" appends the downsampled-volume + coordinate channels
-                (nets trained with in_ch=5); "none" is the bare-patch path;
-                "auto" reads the net's in_conv width and picks accordingly.
-    n_offsets : >1 additionally blends tiles from (n_offsets-1) randomly SHIFTED
-                tile grids (the FM analogue of the paper's recurrent noising,
-                K=2 optimal there) — kills any fixed-grid artifact. Offset 0 is
-                always the deterministic flush grid; pass `generator` to make
-                the extra offsets reproducible."""
+    blend="hann" (FAMILY A, DEFAULT -- ours): OVERLAPPING `patch`^3 tiles at `stride` (default
+        patch/2), each x1_hat = x_t + (1-t)*v, combined with a raised-Hann window normalized to 1
+        everywhere. The window kills the seam directly; this is the 2.5D-medical-recon lineage and
+        the one reviews prefer for boundary artefacts. `n_offsets>1` averages extra SMALL-jitter
+        overlapping grids on top.
+
+    blend="uniform" (FAMILY B -- DiffusionBlend / arXiv:2512.18161): NON-OVERLAPPING tiles
+        (stride forced to `patch`) at `n_offsets` FULLY RANDOM phases, averaged with a box window
+        (equal weight). This is their "random partition + score blending": no window, the average
+        over K random tilings is the implicit blend. Cheaper (fewer tiles), but can leave boundary
+        artefacts at K=1, so n_offsets>=2 is the point (their K, K=2 optimal). Offset 0 is still the
+        deterministic flush grid, so K=1 here is a single non-overlapping pass.
+
+    context   : "global" appends the downsampled-volume + coordinate channels (in_ch=5 nets);
+                "none" the bare-patch path; "auto" reads the net's in_conv width.
+    n_offsets : number of tile GRIDS blended. Offset 0 deterministic (flush); pass `generator` to
+                make the random ones reproducible. Family B is meaningless at n_offsets=1 with no
+                overlap, so pass >=2 there."""
     assert x_t.ndim == 5 and x_t.shape[:2] == (1, 1)
     if context == "auto":
         context = "global" if model_in_channels(model) >= 5 else "none"
     if context not in ("global", "none"):
         raise ValueError(f"context must be auto|global|none, got {context!r}")
+    if blend not in ("hann", "uniform"):
+        raise ValueError(f"blend must be hann|uniform, got {blend!r}")
     device = x_t.device
     _, _, D, H, W = x_t.shape
     pd = min(patch, D)
     ph = min(patch, H)
     pw = min(patch, W)
-    stride = stride or max(1, patch // 2)
+    family_b = blend == "uniform"
+    stride = (max(pd, ph, pw) if family_b else (stride or max(1, patch // 2)))
     ctx = volume_context(x_t, (pd, ph, pw)) if context == "global" else None
 
-    win = _hann_window_3d((pd, ph, pw), device)                 # (1,1,pd,ph,pw)
+    # family A: Hann window (overlap-aware). family B: box window (uniform average of K tilings).
+    win = (torch.ones((1, 1, pd, ph, pw), device=device) if family_b
+           else _hann_window_3d((pd, ph, pw), device))
     acc = torch.zeros_like(x_t)
     wacc = torch.zeros_like(x_t)
     t_t = torch.full((1,), float(t), device=device)
 
-    for (oz, oy, ox) in _grid_offsets((pd, ph, pw), stride, n_offsets, generator):
+    for (oz, oy, ox) in _grid_offsets((pd, ph, pw), stride, n_offsets, generator,
+                                      full_random=family_b):
         pos = [(z, y, x)
                for z in _positions(D, pd, min(stride, pd), oz)
                for y in _positions(H, ph, min(stride, ph), oy)
@@ -201,7 +223,7 @@ def predict_x1_patched(model, x_t: torch.Tensor, t: float, *, patch: int = 64,
 @torch.no_grad()
 def prior_ode(model, x0: torch.Tensor, *, n_steps: int = 50, patch: int = 64,
               stride: int | None = None, context: str = "auto", n_offsets: int = 1,
-              generator=None) -> torch.Tensor:
+              blend: str = "hann", generator=None) -> torch.Tensor:
     """Prior-ONLY Euler integration of the FM ODE, t: 0 -> 1. No data consistency, no TV --
     "what does the prior ALONE make of the cold start". This is the validation metric, the same
     one the sibling 4DCT project renders every `val_every` steps.
@@ -220,7 +242,7 @@ def prior_ode(model, x0: torch.Tensor, *, n_steps: int = 50, patch: int = 64,
     for k in range(n_steps):
         t = k / n_steps
         x1 = predict_x1_patched(model, x, t, patch=patch, stride=stride, context=context,
-                                n_offsets=n_offsets, generator=generator)
+                                n_offsets=n_offsets, blend=blend, generator=generator)
         x = x + (dt / max(1.0 - t, 1e-3)) * (x1 - x)          # == x + dt * v
     return x
 

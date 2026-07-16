@@ -64,7 +64,8 @@ def montage(path, panels, title):
 
 
 def run_validation(model, gen, meas, out_dir, *, it=0, patients=3, patch=64, ode_steps=50,
-                   anchor="static", trans_mm=5.0, rot_deg=5.0, writer=None, dev="cuda"):
+                   anchor="static", trans_mm=5.0, rot_deg=5.0, blend="hann", n_offsets=1,
+                   writer=None, dev="cuda"):
     """Prior-ONLY ODE from the cold start, on `patients` fixed val cases. Returns the per-patient
     metrics AND the montage paths, and (if given) logs scalars + images to a tensorboard writer.
 
@@ -84,8 +85,11 @@ def run_validation(model, gen, meas, out_dir, *, it=0, patients=3, patch=64, ode
             y = gen.project(gt, params_to_Pmot(theta, gen.P_nom)[None])
             x0_mu = gen.fdk(y, gen.P_nom[None])[0]                      # cold start, MU
             static_mu = gen.fdk(gen.project(gt, gen.P_nom[None]), gen.P_nom[None])[0]
+            gtor = torch.Generator(device=dev).manual_seed(1000 + i) if n_offsets > 1 else None
             x1_mu = gen.from_net(prior_ode(model, gen.to_net(x0_mu)[None, None], n_steps=ode_steps,
-                                           patch=patch, stride=patch // 2, context="auto")[0, 0])
+                                           patch=patch, stride=patch // 2, context="auto",
+                                           blend=blend, n_offsets=n_offsets,
+                                           generator=gtor)[0, 0])
         ref_mu = static_mu if anchor == "static" else gt[0, 0]
         # GAUGE-AWARE: rigidly align to the target before scoring. Raw PSNR penalises the
         # unobservable global pose the prior is free to shift; the aligned number is the honest
@@ -132,7 +136,8 @@ def evaluate(ckpt, gen, meas, args, dev):
         q.requires_grad_(False)
     return run_validation(model, gen, meas, args.out, it=it, patients=args.patients,
                           patch=ca["patch"], ode_steps=args.ode_steps, anchor=args.anchor,
-                          trans_mm=args.trans_mm, rot_deg=args.rot_deg, dev=dev)[:2]
+                          trans_mm=args.trans_mm, rot_deg=args.rot_deg,
+                          blend=args.blend, n_offsets=args.n_offsets, dev=dev)[:2]
 
 
 def main():
@@ -148,6 +153,12 @@ def main():
                     help="which target to SCORE against -- must match how the ckpt was trained")
     ap.add_argument("--trans_mm", type=float, default=5.0)
     ap.add_argument("--rot_deg", type=float, default=5.0)
+    ap.add_argument("--blend", default="hann", choices=["hann", "uniform"],
+                    help="hann = overlapping Hann-window blend (family A, ours); uniform = "
+                         "non-overlapping random tilings averaged (family B, arXiv:2512.18161 -- "
+                         "pass --n_offsets>=2)")
+    ap.add_argument("--n_offsets", type=int, default=1,
+                    help="tile grids blended per ODE step (family B's K; K=2 optimal there)")
     ap.add_argument("--watch", action="store_true",
                     help="re-evaluate ckpt_last.pth whenever its iter advances")
     ap.add_argument("--poll", type=int, default=600)

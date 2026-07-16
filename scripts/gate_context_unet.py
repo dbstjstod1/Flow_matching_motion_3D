@@ -162,6 +162,39 @@ def main():
     check(6, "same seed -> bit-identical jittered prediction",
           float((oa - ob).abs().max()) == 0.0)
 
+    # ---- [7] FAMILY B: non-overlapping random tiling + uniform average (arXiv:2512.18161) ---
+    # blend="uniform" must (a) be identity-exact for a zero-velocity net, on a non-cubic volume
+    # and at any K, and (b) actually lay NON-overlapping seams -- i.e. K passes must average K
+    # tilings, which a coord-probe reproduces exactly only if every voxel is covered exactly once
+    # per pass. Same probes as [1]/[4], now down the family-B path.
+    out = predict_x1_patched(ZeroVel(5), x, 0.3, patch=32, context="auto",
+                             blend="uniform", n_offsets=1)
+    e = float((out - x).abs().max())
+    check(7, "family B, K=1: zero-velocity == identity (single flush tiling)", e < 1e-5,
+          f"max|d|={e:.1e}")
+    out = predict_x1_patched(ZeroVel(5), x, 0.3, patch=32, context="auto",
+                             blend="uniform", n_offsets=4, generator=g)
+    e = float((out - x).abs().max())
+    check(7, "family B, K=4 random tilings: still identity (uniform average)", e < 1e-5,
+          f"max|d|={e:.1e}")
+    # coordinate probe through family B: the box-window average of full tilings must reproduce the
+    # analytic coordinate map, which needs every voxel covered exactly once per tiling.
+    D, H, W = x.shape[-3:]
+    gx = (2.0 * (torch.arange(W) + 0.5) / W - 1.0)[None, None, :].expand(D, H, W)
+    want = x + gx[None, None]
+    got = predict_x1_patched(CoordProbe(2), x, 0.0, patch=32, context="global",
+                             blend="uniform", n_offsets=4, generator=g)
+    e = float((got - want).abs().max())
+    check(7, "family B: coord-x probe == x_t + analytic map (exact tiling coverage)", e < 1e-5,
+          f"max|d|={e:.1e}")
+    # and it must genuinely differ from family A (Hann) on a real net -- not silently the same path
+    ha = predict_x1_patched(net5, x, 0.2, patch=32, stride=16, blend="hann")
+    ub = predict_x1_patched(net5, x, 0.2, patch=32, blend="uniform", n_offsets=2,
+                            generator=torch.Generator().manual_seed(1))
+    check(7, "family A and family B give DIFFERENT reconstructions (distinct schemes)",
+          float((ha - ub).abs().max()) > 1e-4,
+          f"max|A-B|={float((ha - ub).abs().max()):.1e}")
+
     n = len(FAIL)
     print(f"\n{'ALL PASS' if n == 0 else f'{n} FAILURE(S): ' + ', '.join(FAIL)}")
     sys.exit(1 if n else 0)
