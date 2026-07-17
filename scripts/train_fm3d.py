@@ -147,6 +147,9 @@ def main():
                          "prior would learn FDK's residual MOTION artefact as its target. "
                          "gt = the volume itself (also removes FDK's cone-beam floor, but asks "
                          "the net to invert the operator's own defect). none = the bare bridge.")
+    ap.add_argument("--resume", default=None,
+                    help="a ckpt .pth or a run dir (uses ckpt_last.pth): restore model+EMA+"
+                         "optimizer+loss history and continue to --iters")
     ap.add_argument("--save_every", type=int, default=2000)
     ap.add_argument("--val_every", type=int, default=5000)
     ap.add_argument("--val_patients", type=int, default=3)
@@ -206,6 +209,37 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95))
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
 
+    # ---- RESUME ---------------------------------------------------------------------------
+    # Continue a finished/killed run: restore model + EMA + OPTIMIZER STATE + the loss history,
+    # and carry on from the saved iter. The optimizer state is the part that matters -- AdamW's
+    # moment estimates take thousands of steps to rebuild, and dropping them makes a "resumed"
+    # run behave like a fresh one with a warm init (a silent, and silently worse, restart).
+    start_it = 0
+    if args.resume:
+        ck_path = (os.path.join(args.resume, "ckpt_last.pth")
+                   if os.path.isdir(args.resume) else args.resume)
+        ck = torch.load(ck_path, map_location=dev, weights_only=False)
+        prev = ck.get("args", {})
+        # A resumed run MUST keep the architecture and the bridge it was trained under; anything
+        # else silently changes what the weights mean.
+        for k in ("base", "patch", "context", "anchor", "shape", "views", "dataset"):
+            if k in prev and k in vars(args) and prev[k] != vars(args)[k]:
+                raise SystemExit(f"--resume mismatch on '{k}': checkpoint has {prev[k]!r}, "
+                                 f"this run asks for {vars(args)[k]!r}")
+        model.load_state_dict(ck["model"])
+        ema.load_state_dict(ck["ema"])
+        opt.load_state_dict(ck["opt"])
+        if ck.get("scaler") is not None:
+            scaler.load_state_dict(ck["scaler"])
+        loss_log_prev = ck.get("loss_log", [])
+        start_it = int(ck.get("iter", 0))
+        print(f"resumed {ck_path} at iter {start_it} "
+              f"({len(loss_log_prev)} loss points carried over) -> training to {args.iters}")
+        if start_it >= args.iters:
+            raise SystemExit(f"--iters {args.iters} is not beyond the checkpoint's {start_it}")
+    else:
+        loss_log_prev = []
+
     def draw():
         """One bridge sample, held whole-volume: (x_t (1,1,D,H,W), dx (D,H,W), t, ctx).
 
@@ -259,9 +293,9 @@ def main():
         print(f"tensorboard: tensorboard --logdir {os.path.join(args.out, 'tb')}")
 
     t0 = time.time()
-    loss_log = []                          # (iter, loss) per step, saved into every checkpoint
+    loss_log = list(loss_log_prev)          # (iter, loss) per step, saved into every checkpoint
     n_nonfinite = 0
-    for it in range(1, args.iters + 1):
+    for it in range(start_it + 1, args.iters + 1):
         if it % args.refresh == 0:
             cache[torch.randint(len(cache), (1,)).item()] = draw()
 
@@ -302,8 +336,10 @@ def main():
         if it % 50 == 0:
             recent = [l for _, l in loss_log[-50:]]
             ma = sum(recent) / len(recent)
+            # rate over THIS process's steps, not `it` -- after a resume `it` starts high and
+            # dividing by it would report a nonsense s/it
             print(f"it {it:6d} | loss {float(loss.detach()):.5f} | ma50 {ma:.5f} | "
-                  f"{(time.time() - t0) / it:.2f}s/it", flush=True)
+                  f"{(time.time() - t0) / max(it - start_it, 1):.2f}s/it", flush=True)
             if writer is not None:
                 writer.add_scalar("train/fm_loss", float(loss.detach()), it)
                 writer.add_scalar("train/fm_loss_ma50", ma, it)
@@ -321,6 +357,7 @@ def main():
             # loss_log rides along in the checkpoint, so the convergence curve survives even if
             # the text log is rotated or lost -- the whole per-step history, (iter, loss) pairs.
             ck = {"model": model.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
+                  "scaler": scaler.state_dict() if args.amp else None,
                   "iter": it, "args": vars(args), "fbp_scale": gen.fbp_scale,
                   "loss_log": loss_log}
             torch.save(ck, os.path.join(args.out, f"ckpt_iter{it:06d}.pth"))
