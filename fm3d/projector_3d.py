@@ -32,12 +32,14 @@ import math
 import torch
 import torch.nn.functional as F
 
+from . import triton_backproject
 from .geometry_3d import ConeBeam3DConfig
 from .filters import ramp_filter, calibrate_scale  # 1D-along-u filter + scalar fit; see filters.py
 
 __all__ = [
     "forward_project_3d_batched",
     "fdk_conebeam_3d_batched",
+    "fdk_conebeam_3d_tangent",
     "wang_weight",
     "calibrate_scale",
 ]
@@ -95,10 +97,17 @@ def _use_triton(backend: str, vol: torch.Tensor, align_corners: bool,
     a motion estimator that never moves and never complains. `_RayMarch` now carries that adjoint
     (see triton_raymarch._bwd_kernel), so the fast path is safe for motion estimation too and
     there is nothing left to refuse. `scripts/gate_triton_adjoint.py` is what holds that claim up.
+
+    ENV SWITCHES (this project has TWO independent Triton kill switches; they do not alias):
+      * FM3D_PROJECTOR=gridsample|triton|auto  -- THIS one, the forward projector's backend
+        (FDCT_PROJECTOR, the name inherited from the 4DCT sibling, is honoured as a
+        deprecated alias when FM3D_PROJECTOR is unset);
+      * FM3D_FDK_TRITON=0                      -- the FDK backprojector's (triton_backproject.py).
     """
     import os
     from .triton_raymarch import HAVE_TRITON
-    backend = os.environ.get("FDCT_PROJECTOR", backend)
+    backend = os.environ.get("FM3D_PROJECTOR",
+                             os.environ.get("FDCT_PROJECTOR", backend))
     if backend == "gridsample":
         return False
     ok = HAVE_TRITON and vol.is_cuda and vol.dtype == torch.float32 and not align_corners
@@ -166,8 +175,9 @@ def forward_project_3d_batched(
     "gridsample". The Triton path generates every sample coordinate in-register (no
     (rays, n_samples, 3) tensor at all), so autograd retains 2.4 MB of per-ray constants
     instead of a 432 MiB coordinate grid per block, and its backward is the exact matched
-    adjoint. See `fdct/triton_raymarch.py`. Set FDCT_PROJECTOR=gridsample to force the
-    reference path.
+    adjoint. See `fm3d/triton_raymarch.py`. Set FM3D_PROJECTOR=gridsample to force the
+    reference path (FDCT_PROJECTOR is a deprecated alias; the FDK backprojection's separate
+    switch is FM3D_FDK_TRITON=0).
 
     3D twin of `forward_project_2d_batched`: vectorized over the batch and over
     chunks of views (one big 5D grid_sample per chunk). Differentiable in
@@ -236,7 +246,12 @@ def forward_project_3d_batched(
         for r0 in range(0, nv, rc):
             r1 = min(r0 + rc, nv)
             nr = r1 - r0
-            dirs = torch.einsum("bvij,mnj->bvmni", A_inv, uh[r0:r1])  # (B,vc,nr,nu,3)
+            # Ray directions must stay fp32 even under an enclosing torch.autocast: einsum is
+            # on autocast's fp16 cast list (linalg.inv is not), and fp16 directions cost ~1e-3
+            # relative = up to ~0.25 voxel of sample position over a head-sized path, silently.
+            # `enabled=False` is an exact no-op when no autocast is active.
+            with torch.autocast(device_type=device.type, enabled=False):
+                dirs = torch.einsum("bvij,mnj->bvmni", A_inv, uh[r0:r1])  # (B,vc,nr,nu,3)
             dirs = dirs / (dirs.norm(dim=-1, keepdim=True) + 1e-12)
 
             o = src[:, :, None, None, :].expand(B, vc, nr, nu, 3)
@@ -403,8 +418,8 @@ def fdk_conebeam_3d_batched(
     eps: float = 1e-8,
     disp: torch.Tensor | None = None,
     trunc_pad: int | None = None,
-    trunc_thresh: float = 0.02,
     view_weight: torch.Tensor | None = None,
+    _return_filtered: bool = False,
 ) -> torch.Tensor:
     """Batched FDK (Feldkamp) cone-beam reconstruction. Returns (B, D, H, W).
 
@@ -575,6 +590,49 @@ def fdk_conebeam_3d_batched(
         out[:, v0:v1] = blk[..., pad_l:pad_l + nu]      # pad_l, NOT npad: the sides are separate
     g = out
 
+    if _return_filtered:
+        # `fdk_conebeam_3d_tangent`'s single-source front-end: the fully filtered sinogram in
+        # the FINAL element coordinate system (half-fan may have widened nu and zeroed u0).
+        return g, u0
+
+    # detector extent, in the SHIFTED element coordinate system (u0 = panel offset)
+    half_u = 0.5 * nu * du
+    half_v = 0.5 * nv * dv
+    Npix = D * H * W
+
+    # 3) distance-weighted backprojection.
+    needs_grad = torch.is_grad_enabled() and (g.requires_grad or Pmat.requires_grad)
+    if disp is None and not needs_grad and triton_backproject.enabled() and g.is_cuda:
+        # Fused Triton kernel (triton_backproject.py, ported from Flowmatching-4DCT: 24x
+        # measured there). Covers every rigid-motion FDK -- our motion enters through Pmat,
+        # never `disp`. NOT bit-identical to the torch loop (float reassociation only:
+        # per-voxel sequential view sum, and no grid_sample [-1,1] round-trip); agreement
+        # is gated by scripts/gate_fdk_fast.py. FM3D_FDK_TRITON=0 forces the torch path.
+        recon = triton_backproject.backproject_static(
+            g, Pmat, D, H, W, dx=dx, dy=dy, dz=dz, du=du, dv=dv,
+            u0=u0, v_off=v_off, half_u=half_u, half_v=half_v, eps=eps).view(B, Npix)
+    else:
+        recon = _backproject_static_torch(
+            g, Pmat, disp, D=D, H=H, W=W, dx=dx, dy=dy, dz=dz, du=du, dv=dv,
+            u0=u0, v_off=v_off, half_u=half_u, half_v=half_v, eps=eps,
+            view_chunk=view_chunk, vox_chunk=vox_chunk)
+
+    recon = recon * (float(cfg.angle_span) / float(V))
+    recon = recon.view(B, D, H, W)
+    if scale is not None:
+        recon = recon * scale
+    return recon
+
+
+def _backproject_static_torch(g, Pmat, disp, *, D, H, W, dx, dy, dz, du, dv,
+                              u0, v_off, half_u, half_v, eps, view_chunk, vox_chunk):
+    """The original torch backprojection loop, chunked over views AND voxels. (B, Npix).
+
+    Kept verbatim as (a) the `disp` MC path, which the Triton kernel does not cover, and
+    (b) the FM3D_FDK_TRITON=0 fallback / gate reference."""
+    device, dtype = g.device, g.dtype
+    B, V, nv, nu = g.shape
+
     # Voxel homogeneous world coords (centered at origin, matching projector).
     xs = (torch.arange(W, device=device, dtype=dtype) - (W - 1) / 2.0) * dx
     ys = (torch.arange(H, device=device, dtype=dtype) - (H - 1) / 2.0) * dy
@@ -592,12 +650,7 @@ def fdk_conebeam_3d_batched(
         spac = torch.tensor([dx, dy, dz], device=device, dtype=dtype)[None, None, :, None]
         disp = disp * spac                                           # (B,V,3,Npix) mm
 
-    # detector extent, in the SHIFTED element coordinate system (u0 = panel offset)
-    half_u = 0.5 * nu * du
-    half_v = 0.5 * nv * dv
     recon = torch.zeros((B, Npix), device=device, dtype=dtype)
-
-    # 3) distance-weighted backprojection, chunked over views AND voxels.
     for v0 in range(0, V, view_chunk):
         v1 = min(v0 + view_chunk, V)
         vc = v1 - v0
@@ -633,9 +686,208 @@ def fdk_conebeam_3d_batched(
             mask = (w > 0) & ((u - u0).abs() <= half_u) & ((v - v_off).abs() <= half_v)
             contrib = torch.where(mask, val / (w_safe ** 2), torch.zeros_like(val))
             recon[:, p0:p1] += contrib.sum(dim=1)
-
-    recon = recon * (float(cfg.angle_span) / float(V))
-    recon = recon.view(B, D, H, W)
-    if scale is not None:
-        recon = recon * scale
     return recon
+
+
+def _backproject_tangent_torch(g, Pmat, Pdot, wgt, dwgt, *, D, H, W, dx, dy, dz, du, dv,
+                               u0, v_off, half_u, half_v, eps,
+                               view_chunk=8, vox_chunk=2_000_000):
+    """Torch reference for `triton_backproject.backproject_tangent`, dtype-generic.
+
+    Same math as the fused kernel, in whatever dtype `g` carries -- float64 is the point:
+    scripts/gate_fdk_tangent.py uses this at float64 both to certify the tangent MATH against
+    a float64 central difference of `_backproject_static_torch` (isolating the a.e.-Jacobian
+    claim from fp32 noise) and as the reference the fp32 Triton kernel is compared to. Also
+    the FM3D_FDK_TRITON=0 / no-triton fallback for `fdk_conebeam_3d_tangent`.
+
+    Manual bilinear taps (no grid_sample): the tangent needs the interpolant's own ju/jv
+    derivative, and grid_sampler ships no forward-AD rule -- the same reason the 2D sibling's
+    `fbp_fanbeam_2d` JVP variant hand-rolls its detector interpolation."""
+    device, dtype = g.device, g.dtype
+    B, V, nv, nu = g.shape
+    Pmat = Pmat.to(device=device, dtype=dtype)
+    Pdot = Pdot.to(device=device, dtype=dtype)
+    wgt = wgt.to(device=device, dtype=dtype).reshape(B, V)
+    dwgt = dwgt.to(device=device, dtype=dtype).reshape(B, V)
+
+    xs = (torch.arange(W, device=device, dtype=dtype) - (W - 1) / 2.0) * dx
+    ys = (torch.arange(H, device=device, dtype=dtype) - (H - 1) / 2.0) * dy
+    zs = (torch.arange(D, device=device, dtype=dtype) - (D - 1) / 2.0) * dz
+    zz, yy, xx = torch.meshgrid(zs, ys, xs, indexing="ij")
+    Xh = torch.stack(
+        [xx.reshape(-1), yy.reshape(-1), zz.reshape(-1),
+         torch.ones(D * H * W, device=device, dtype=dtype)], dim=0)  # (4, Npix)
+    Npix = D * H * W
+
+    out = torch.zeros((B, Npix), device=device, dtype=dtype)
+    dout = torch.zeros((B, Npix), device=device, dtype=dtype)
+    for v0 in range(0, V, view_chunk):
+        v1 = min(v0 + view_chunk, V)
+        vc = v1 - v0
+        P = Pmat[:, v0:v1]
+        dP = Pdot[:, v0:v1]
+        src = g[:, v0:v1].reshape(B * vc, nv * nu)
+        wg = wgt[:, v0:v1, None]                                     # (B, vc, 1)
+        dwg = dwgt[:, v0:v1, None]
+        for p0 in range(0, Npix, vox_chunk):
+            p1 = min(p0 + vox_chunk, Npix)
+            uvw = torch.einsum("bvij,jp->bvip", P, Xh[:, p0:p1])     # (B, vc, 3, Np)
+            duvw = torch.einsum("bvij,jp->bvip", dP, Xh[:, p0:p1])
+            u_h, v_h, w = uvw[:, :, 0], uvw[:, :, 1], uvw[:, :, 2]
+            du_h, dv_h, dw = duvw[:, :, 0], duvw[:, :, 1], duvw[:, :, 2]
+            w_safe = torch.where(w.abs() < eps, torch.full_like(w, eps), w)
+            u = u_h / w_safe
+            v = v_h / w_safe
+            udot = (du_h - u * dw) / w_safe
+            vdot = (dv_h - v * dw) / w_safe
+            ju = (u - u0) / du + (nu - 1) / 2.0
+            jv = (v - v_off) / dv + (nv - 1) / 2.0
+
+            # manual 4-tap bilinear: value + ju/jv derivative (cell frozen, a.e. exact)
+            j0 = torch.floor(ju)
+            i0 = torch.floor(jv)
+            fx = (ju - j0).view(B * vc, -1)
+            fy = (jv - i0).view(B * vc, -1)
+            j0 = j0.long().view(B * vc, -1)
+            i0 = i0.long().view(B * vc, -1)
+            val = torch.zeros_like(fx)
+            gu = torch.zeros_like(fx)
+            gv = torch.zeros_like(fx)
+            for cy in (0, 1):
+                yc = i0 + cy
+                wy = fy if cy == 1 else 1.0 - fy
+                sy = 1.0 if cy == 1 else -1.0
+                oky = (yc >= 0) & (yc < nv)
+                for cx in (0, 1):
+                    xc = j0 + cx
+                    wx = fx if cx == 1 else 1.0 - fx
+                    sx = 1.0 if cx == 1 else -1.0
+                    ok = oky & (xc >= 0) & (xc < nu)
+                    idx = yc.clamp(0, nv - 1) * nu + xc.clamp(0, nu - 1)
+                    tap = torch.gather(src, -1, idx)
+                    tap = torch.where(ok, tap, torch.zeros_like(tap))
+                    val = val + tap * (wx * wy)
+                    gu = gu + tap * (sx * wy)
+                    gv = gv + tap * (wx * sy)
+            val = val.view(B, vc, -1)
+            gu = gu.view(B, vc, -1)
+            gv = gv.view(B, vc, -1)
+
+            mask = (w > 0) & ((u - u0).abs() <= half_u) & ((v - v_off).abs() <= half_v)
+            inv_w2 = 1.0 / (w_safe ** 2)
+            contrib = val * inv_w2
+            dcontrib = (gu * (udot / du) + gv * (vdot / dv)) * inv_w2 \
+                - 2.0 * contrib * (dw / w_safe)
+            zero = torch.zeros_like(contrib)
+            out[:, p0:p1] += torch.where(mask, wg * contrib, zero).sum(dim=1)
+            dout[:, p0:p1] += torch.where(mask, wg * dcontrib + dwg * contrib, zero).sum(dim=1)
+    return out, dout
+
+
+def fdk_conebeam_3d_tangent(
+    sino: torch.Tensor,       # (B, V, nv, nu)
+    Pmat: torch.Tensor,       # (B, V, 3, 4) the s-dependent geometry P(s)
+    Pdot: torch.Tensor,       # (B, V, 3, 4) its derivative dP/ds (rigid_motion.bridge_P_and_dP)
+    u_coords: torch.Tensor,
+    v_coords: torch.Tensor,
+    cfg: ConeBeam3DConfig,
+    *,
+    D: int,
+    H: int,
+    W: int,
+    dx: float = 1.0,
+    dy: float = 1.0,
+    dz: float = 1.0,
+    window: str = "ramlak",
+    cutoff: float = 1.0,
+    scale: float | None = None,
+    view_weight: torch.Tensor | None = None,       # (B,V) or (V,) [rad], w(s)
+    view_weight_dot: torch.Tensor | None = None,   # its s-derivative; required with view_weight
+    view_chunk: int = 8,
+    vox_chunk: int = 2_000_000,
+    eps: float = 1e-8,
+    trunc_pad: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FDK(y, P(s)) AND its exact s-derivative, in ONE reconstruction pass.
+
+    The analytic replacement for `train_fm3d.bridge_pair`'s three-FDK central difference,
+    and this project's answer to Flowmatching-4DCT's analytic FM tangent (theirs
+    differentiates a volume-domain B-spline warp; our bridge's s lives in the projection
+    matrices, so the derivative is a JVP through the BACKPROJECTION).
+
+    WHY ONE PASS IS ENOUGH. The sinogram y is s-independent, and every filtering stage is
+    per-view and commutes with a positive per-view scalar: cosine and Wang are elementwise
+    multiplies, the ramp is linear, and `ohnesorge_pad`'s clamp_min(0) satisfies
+    (c*x).clamp_min(0) = c*x.clamp_min(0) for c > 0 -- so the s-dependent Voronoi view weight
+    w_v(s) (a positive scalar per view) factors THROUGH the filter instead of being folded
+    into the sinogram up front as `fdk_conebeam_3d_batched` does. Filter once, then
+
+        x(s)     = sum_v  w_v(s) * BP_v(P_v(s)) [g_v]
+        dx/ds(s) = sum_v  w_v(s) * d/ds BP_v(P_v(s)) [g_v]  +  wdot_v(s) * BP_v(P_v(s)) [g_v]
+
+    both accumulated by the fused kernel from the same detector taps. The value output
+    therefore matches `fdk_conebeam_3d_batched(sino, Pmat, view_weight=w)` up to float
+    reassociation only -- gated (scripts/gate_fdk_tangent.py) together with the derivative
+    (vs float64 central differences).
+
+    `view_weight=None` means the uniform angle_span/V weight (then its derivative is 0 and
+    `view_weight_dot` must be None too). `scale` multiplies BOTH outputs. `disp` is not
+    supported here -- the bridge's motion is rigid and enters through Pmat.
+    Returns (x, dx/ds), each (B, D, H, W), fp32.
+    """
+    device = sino.device
+    dtype = torch.float32
+    sino = sino.to(device=device, dtype=dtype)
+    Pmat = Pmat.to(device=device, dtype=dtype)
+    Pdot = Pdot.to(device=device, dtype=dtype)
+    B, V, nv, nu_in = sino.shape
+
+    uni = float(cfg.angle_span) / float(V)
+    if view_weight is None:
+        if view_weight_dot is not None:
+            raise ValueError("view_weight_dot without view_weight")
+        wgt = torch.full((B, V), uni, device=device, dtype=dtype)
+        dwgt = torch.zeros((B, V), device=device, dtype=dtype)
+    else:
+        if view_weight_dot is None:
+            raise ValueError("view_weight without view_weight_dot (use "
+                             "geometry_3d.view_angular_weights_dot)")
+        wgt = view_weight.to(device=device, dtype=dtype).expand(B, V).clone()
+        dwgt = view_weight_dot.to(device=device, dtype=dtype).expand(B, V).clone()
+
+    # single-source filtering front-end (UNWEIGHTED -- the weights ride on the BP instead)
+    g, u0 = fdk_conebeam_3d_batched(
+        sino, Pmat, u_coords, v_coords, cfg, D=D, H=H, W=W, dx=dx, dy=dy, dz=dz,
+        window=window, cutoff=cutoff, view_chunk=view_chunk, eps=eps,
+        trunc_pad=trunc_pad, _return_filtered=True)
+    nu = g.shape[-1]                                   # half-fan may have widened the panel
+    du = float(cfg.du)
+    dv = float(cfg.dv)
+    v_off = float(getattr(cfg, "det_offset_v_mm", 0.0))
+    half_u = 0.5 * nu * du
+    half_v = 0.5 * nv * dv
+
+    # Same grad-safety gate as the static path above: `backproject_tangent` is a raw kernel
+    # with no autograd Function, so taking it while a graph is live would return graph-free
+    # tensors and d(loss)/d(theta, sino) would come out silently ZERO -- the exact bug class
+    # `_use_triton`'s docstring memorializes. The torch fallback IS differentiable, so route
+    # there whenever anyone is asking for gradients.
+    needs_grad = torch.is_grad_enabled() and (
+        g.requires_grad or Pmat.requires_grad or Pdot.requires_grad
+        or wgt.requires_grad or dwgt.requires_grad)
+    if not needs_grad and triton_backproject.enabled() and g.is_cuda:
+        x, dxds = triton_backproject.backproject_tangent(
+            g, Pmat, Pdot, wgt, dwgt, D, H, W, dx=dx, dy=dy, dz=dz, du=du, dv=dv,
+            u0=u0, v_off=v_off, half_u=half_u, half_v=half_v, eps=eps)
+    else:
+        x, dxds = _backproject_tangent_torch(
+            g, Pmat, Pdot, wgt, dwgt, D=D, H=H, W=W, dx=dx, dy=dy, dz=dz, du=du, dv=dv,
+            u0=u0, v_off=v_off, half_u=half_u, half_v=half_v, eps=eps,
+            view_chunk=view_chunk, vox_chunk=vox_chunk)
+        x = x.view(B, D, H, W)
+        dxds = dxds.view(B, D, H, W)
+
+    if scale is not None:
+        x = x * scale
+        dxds = dxds * scale
+    return x, dxds

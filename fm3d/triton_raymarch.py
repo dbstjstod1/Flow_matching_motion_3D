@@ -32,6 +32,11 @@ ADJOINT. The backward kernel scatters `grad_out * step * w_corner` into the volu
 projector pair and avoids the biased fixed point an unmatched pair converges to
 (Zeng & Gullberg, IEEE TMI 19(5):548, 2000). Atomics make it nondeterministic in summation
 ORDER only, not in value beyond float reassociation.
+
+KILL SWITCH. FM3D_PROJECTOR=gridsample forces the torch grid_sample reference path
+(FDCT_PROJECTOR, the 4DCT-era name, is honoured as a deprecated alias) -- see
+`projector_3d._use_triton`. This is INDEPENDENT of the FDK backprojector's switch,
+FM3D_FDK_TRITON=0 (`triton_backproject.py`); neither implies the other.
 """
 
 from __future__ import annotations
@@ -73,7 +78,9 @@ if HAVE_TRITON:
                     xc = ix + cx
                     wx = fx if cx == 1 else 1.0 - fx
                     ok = mask & oky & (xc >= 0) & (xc < W)
-                    off = ((b * D + zc) * H + yc) * W + xc
+                    # int64 before the final *W (the triton_backproject pattern): the full
+                    # linear offset overflows int32 once Bv*D*H*W > 2^31 (Bv >= 128 at 256^3).
+                    off = ((b * D + zc) * H + yc).to(tl.int64) * W + xc
                     v = tl.load(vol_ptr + off, mask=ok, other=0.0)
                     acc += v * (wx * wy * wz)
         return acc
@@ -186,7 +193,8 @@ if HAVE_TRITON:
                         wx = fx if cx == 1 else 1.0 - fx
                         sx = 1.0 if cx == 1 else -1.0
                         ok = mask & oky & (xc >= 0) & (xc < W)
-                        off = ((b * D + zc) * H + yc) * W + xc
+                        # int64 base, int32 inner -- see _trilinear; same overflow bound.
+                        off = ((b * D + zc) * H + yc).to(tl.int64) * W + xc
                         if NEED_VOL:
                             tl.atomic_add(gvol_ptr + off, g * (wx * wy * wz), mask=ok)
                         if NEED_RAY:

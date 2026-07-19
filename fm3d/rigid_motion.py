@@ -157,6 +157,40 @@ def params_to_Pmot(theta: torch.Tensor, P_nom: torch.Tensor) -> torch.Tensor:
     return apply_rigid_motion(P_nom, rigid_motion_matrices(theta))
 
 
+def bridge_P_and_dP(theta: torch.Tensor, P_nom: torch.Tensor,
+                    s: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """P(s) = params_to_Pmot(s*theta, P_nom) and its EXACT derivative dP/ds, in closed form.
+
+    This is what makes the analytic bridge tangent possible: because the bridge scales the
+    AXIS-ANGLE vector (the SO(3) geodesic -- see the module docstring for why that
+    parameterization was chosen), R(s) = exp(s*skew(w)) shares its generator across s, so
+
+        dR/ds = skew(w) @ R(s)          (exact -- same generator, so it commutes)
+        dt/ds = t                       (translation is the straight line s*t)
+
+    and dP/ds = P_nom @ dT/ds with dT/ds = [[skew(w) @ R(s), t], [0, 0]] (bottom row ZERO --
+    dT/ds is a tangent, not a rigid transform). With Euler angles no such closed form exists
+    per component; this identity is the analytic twin of the finite-difference argument in
+    `train_fm3d.bridge_pair`. Gated against a float64 central difference in
+    scripts/gate_fdk_tangent.py.
+    """
+    if theta.shape[-1] != 6:
+        raise ValueError(f"theta must be (..., 6); got {tuple(theta.shape)}")
+    t = theta[..., :3]
+    w = theta[..., 3:]
+    R = so3_exp(float(s) * w)                                # (..., 3, 3)
+    K = skew(w)
+    Vshape = theta.shape[:-1]
+    T = torch.zeros(*Vshape, 4, 4, device=theta.device, dtype=theta.dtype)
+    T[..., :3, :3] = R
+    T[..., :3, 3] = float(s) * t
+    T[..., 3, 3] = 1.0
+    dT = torch.zeros_like(T)
+    dT[..., :3, :3] = K @ R
+    dT[..., :3, 3] = t
+    return torch.matmul(P_nom, T), torch.matmul(P_nom, dT)
+
+
 # --------------------------------------------------------------------------------------
 # ground-truth motion profiles (simulation)
 # --------------------------------------------------------------------------------------
@@ -203,7 +237,12 @@ def make_motion(
     headline number should be reported on "akima" so it is comparable to Thies et al.
     """
     if kind == "akima":
-        return akima_motion(n_views, trans_mm=max(trans_mm), rot_deg=max(rot_deg),
+        # Per-axis amplitudes apply here too (this used to collapse the tuples via max(),
+        # which silently broke the "z gets a smaller translation" contract for the default
+        # kind). Isotropic tuples -- what every current caller passes -- are bit-identical
+        # to the old behaviour: numpy's uniform(low, high, n) consumes the same underlying
+        # stream regardless of the bounds, so only the per-DoF SCALING changes.
+        return akima_motion(n_views, trans_mm=trans_mm, rot_deg=rot_deg,
                             device=device, dtype=dtype, seed=seed)
 
     g = torch.Generator(device="cpu")
@@ -228,8 +267,8 @@ def akima_motion(
     n_views: int,
     *,
     n_nodes: int = 10,
-    trans_mm: float = 5.0,
-    rot_deg: float = 5.0,
+    trans_mm: float | tuple[float, float, float] = 5.0,
+    rot_deg: float | tuple[float, float, float] = 5.0,
     zero_centre: bool = True,
     device="cpu",
     dtype=torch.float32,
@@ -260,6 +299,9 @@ def akima_motion(
     spaced -- which is exactly what `geometry_3d.view_angular_weights` exists to correct (worth
     +1.21 dB on average over five draws of THIS profile).
 
+    `trans_mm` / `rot_deg` accept a scalar (isotropic, the literature's 5 mm / 5 deg) or a
+    per-axis (x, y, z) tuple; the scalar path is bit-identical to the historical behaviour.
+
     Needs scipy (`Akima1DInterpolator`); scipy is already a hard dependency of the repo.
     """
     import numpy as np
@@ -275,9 +317,15 @@ def akima_motion(
 
     tn = np.linspace(0.0, n_views - 1, n_nodes)
     v = np.arange(n_views, dtype=np.float64)
+    # `trans_mm`/`rot_deg` may be a scalar (isotropic -- the training default, bit-identical
+    # to the historical behaviour) or a per-axis 3-tuple. numpy's uniform(low, high, n)
+    # advances the stream identically whatever the bounds, so the scalar path's RNG sequence
+    # is untouched by this generalization.
+    t_amp = trans_mm if isinstance(trans_mm, (tuple, list)) else (trans_mm,) * 3
+    r_amp = rot_deg if isinstance(rot_deg, (tuple, list)) else (rot_deg,) * 3
     cols = []
     for d in range(6):
-        amp = trans_mm if d < 3 else math.radians(rot_deg)
+        amp = float(t_amp[d]) if d < 3 else math.radians(float(r_amp[d - 3]))
         s = Akima1DInterpolator(tn, rng.uniform(-amp, amp, n_nodes))(v)
         cols.append(s - s.mean() if zero_centre else s)
     return torch.tensor(np.stack(cols, -1), device=device, dtype=dtype)

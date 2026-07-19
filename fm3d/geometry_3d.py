@@ -84,7 +84,9 @@ class ConeBeam3DConfig:
     det_nu: int = 1024          # columns (lateral, in the orbit plane)
     det_nv: int = 768           # rows (axial, parallel to +z = SI)
     det_pixel_mm: float = 0.388  # 2x2-binned pitch (native 0.194)
-    det_offset_u_mm: float = 0.0  # lateral panel offset (half-fan); FDK unsupported
+    det_offset_u_mm: float = 0.0  # lateral panel offset (half-fan); FDK supports it via the
+                                  # Wang weight + symmetric enlargement (360 deg orbits only --
+                                  # see class docstring and projector_3d.wang_weight)
     det_offset_v_mm: float = 0.0  # AXIAL panel offset. Small but real: SPARE-MC ships
                                   # ProjectionOffsetY = -2 mm ("calibration for simulation"),
                                   # and ignoring it shifts the whole measured barrel by
@@ -218,27 +220,34 @@ class ConeBeam3DConfig:
         return cls.thies(det_pixel_mm=0.5, n_views=n_views, det_bin=det_bin)
 
     @classmethod
-    def preset(cls, name: str, *, det_bin: int | None = None, n_views: int = 660,
+    def preset(cls, name: str, *, det_bin: int | None = None, n_views: int | None = None,
                scan_duration_sec: float = 60.0) -> "ConeBeam3DConfig":
         """`"thies"` (**the CQ500 head-motion standard**), `"jrm_adm"` (its sparse-view variant),
         `"halcyon"` (half-fan, contains a whole DIR-Lab thorax), `"obi"` (full-fan Varian OBI,
         which contains neither case and therefore truncates), or `"spare_mc"` (the 4DCT inference
-        target). One switch for every script."""
+        target). One switch for every script.
+
+        `n_views=None` (and `det_bin=None`) means "the preset's own default": thies 360,
+        jrm_adm 120, spare_mc 680, halcyon/obi 660. An explicit value is ALWAYS honoured --
+        this used to use 660 as a "not passed" sentinel, so `preset("thies", n_views=660)`
+        silently returned 360 views; it no longer does."""
         if name in ("thies", "cq500"):
             return cls.thies(det_bin=1 if det_bin is None else det_bin,
-                             n_views=360 if n_views == 660 else n_views)
+                             n_views=360 if n_views is None else n_views)
         if name == "jrm_adm":
             return cls.jrm_adm(det_bin=1 if det_bin is None else det_bin,
-                               n_views=120 if n_views == 660 else n_views)
+                               n_views=120 if n_views is None else n_views)
         if name == "halcyon":
-            return cls.halcyon(det_bin=2 if det_bin is None else det_bin, n_views=n_views,
+            return cls.halcyon(det_bin=2 if det_bin is None else det_bin,
+                               n_views=660 if n_views is None else n_views,
                                scan_duration_sec=scan_duration_sec)
         if name == "obi":
-            return cls(det_bin=1 if det_bin is None else det_bin, n_views=n_views,
+            return cls(det_bin=1 if det_bin is None else det_bin,
+                       n_views=660 if n_views is None else n_views,
                        scan_duration_sec=scan_duration_sec)
         if name == "spare_mc":
             return cls.spare_mc(det_bin=1 if det_bin is None else det_bin,
-                                n_views=680 if n_views == 660 else n_views,
+                                n_views=680 if n_views is None else n_views,
                                 scan_duration_sec=scan_duration_sec)
         raise ValueError(f"unknown geometry preset {name!r} "
                          f"(thies|jrm_adm|halcyon|obi|spare_mc)")
@@ -499,8 +508,18 @@ def view_angular_weights(Pmat: torch.Tensor) -> torch.Tensor:
 
     Full 360 deg orbits only: the circular closure assumes the trajectory wraps. A short scan
     needs Parker weighting, which is not implemented.
+
+    The source comes from the closed form S = -M^{-1} p4 (P = [M | p4] full-rank), the same
+    route `view_angular_weights_dot` uses -- NOT from `source_positions`' batched float64 SVD,
+    which computes the identical point (agreement ~1e-12 relative, verified) but costs a
+    cuSOLVER double SVD per view on EVERY weighted FDK call. `source_positions` itself is kept
+    for callers that want the null-vector route.
     """
-    S = source_positions(Pmat)                          # (..., V, 3)
+    M = Pmat[..., :3, :3].double()
+    p4 = Pmat[..., :3, 3:].double()
+    # float64 solve, then round to Pmat.dtype BEFORE atan2 -- exactly what `source_positions`
+    # returned, so the weights this function hands out are unchanged.
+    S = -torch.linalg.solve(M, p4)[..., 0].to(Pmat.dtype)   # (..., V, 3)
     beta = torch.atan2(S[..., 1], S[..., 0])            # (..., V) in (-pi, pi]
     V = beta.shape[-1]
     two_pi = 2.0 * math.pi
@@ -516,6 +535,62 @@ def view_angular_weights(Pmat: torch.Tensor) -> torch.Tensor:
     w = torch.empty_like(share)
     w.scatter_(-1, order, share)                        # back to view order
     return w
+
+
+def view_angular_weights_dot(Pmat: torch.Tensor,
+                             Pdot: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """(w, dw/ds): `view_angular_weights` AND its exact directional derivative along Pdot.
+
+    For the analytic bridge tangent: the FDK the bridge draws weights each view by its Voronoi
+    angular share computed from the ACTUAL orbit P(s) = P_nom @ T(s*theta), so the weight is
+    s-dependent through the gantry-axis part of theta and its derivative belongs in
+    d/ds FDK(y, P(s)).
+
+    Everything is closed-form:
+      * the source is the right null vector of P; for a full-rank P = [M | p4] that is
+        S = -M^{-1} p4 (identical to `source_positions`' SVD route, without the SVD, whose
+        derivative is a mess), so  Sdot = -M^{-1} (Mdot S + p4dot);
+      * beta = atan2(Sy, Sx)  ->  betadot = (Sx Sydot - Sy Sxdot) / (Sx^2 + Sy^2);
+      * the Voronoi share is a fixed linear map of the sorted betas (half the gap to each
+        circular neighbour), so its derivative is the SAME map applied to betadot with the
+        sort permutation FROZEN -- exact a.e.; a reordering/tie is measure-zero in s, the same
+        argument that freezes the interpolation cell in the tangent backprojection kernel.
+
+    Computed in float64 (matching `source_positions`), returned in Pmat.dtype. The value
+    output matches `view_angular_weights(Pmat)` to float64-vs-SVD noise (~1e-12 relative);
+    both outputs are gated in scripts/gate_fdk_tangent.py.
+    """
+    M = Pmat[..., :3, :3].double()
+    p4 = Pmat[..., :3, 3].double()
+    Minv = torch.linalg.inv(M)
+    S = -(Minv @ p4[..., None])[..., 0]                             # (..., V, 3)
+    dM = Pdot[..., :3, :3].double()
+    dp4 = Pdot[..., :3, 3].double()
+    Sdot = -(Minv @ ((dM @ S[..., None]) + dp4[..., None]))[..., 0]
+
+    beta = torch.atan2(S[..., 1], S[..., 0])                        # (..., V)
+    r2 = S[..., 0] ** 2 + S[..., 1] ** 2
+    bdot = (S[..., 0] * Sdot[..., 1] - S[..., 1] * Sdot[..., 0]) / r2
+
+    two_pi = 2.0 * math.pi
+    order = torch.argsort(beta, dim=-1)                             # FROZEN permutation
+    bs = torch.gather(beta, -1, order)
+    bds = torch.gather(bdot, -1, order)
+
+    gap = torch.empty_like(bs)
+    gap[..., :-1] = bs[..., 1:] - bs[..., :-1]
+    gap[..., -1] = bs[..., 0] + two_pi - bs[..., -1]
+    dgap = torch.empty_like(bds)                                    # the +2*pi constant drops
+    dgap[..., :-1] = bds[..., 1:] - bds[..., :-1]
+    dgap[..., -1] = bds[..., 0] - bds[..., -1]
+
+    share = 0.5 * (gap + torch.roll(gap, 1, dims=-1))
+    dshare = 0.5 * (dgap + torch.roll(dgap, 1, dims=-1))
+    w = torch.empty_like(share)
+    w.scatter_(-1, order, share)
+    dw = torch.empty_like(dshare)
+    dw.scatter_(-1, order, dshare)
+    return w.to(Pmat.dtype), dw.to(Pmat.dtype)
 
 
 def detector_coords_3d(
