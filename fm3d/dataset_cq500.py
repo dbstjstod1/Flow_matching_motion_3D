@@ -54,8 +54,9 @@ import torch
 
 from .filters import calibrate_scale
 from .geometry_3d import (ConeBeam3DConfig, build_conebeam_orbit, detector_coords_3d,
-                          view_angular_weights)
-from .projector_3d import fdk_conebeam_3d_batched, forward_project_3d_batched
+                          view_angular_weights, view_angular_weights_dot)
+from .projector_3d import (fdk_conebeam_3d_batched, fdk_conebeam_3d_tangent,
+                           forward_project_3d_batched)
 from .rigid_motion import params_to_Pmot, random_motion
 
 MU_WATER = 0.02
@@ -177,8 +178,9 @@ class CQ500Generator:
                  split: str = "train", shape=(256, 256, 256), voxel_mm: float = 1.0,
                  hu_norm=(-1000.0, 2000.0), clip: bool = True, mu_water: float = MU_WATER,
                  thin_mm: float = 0.7, count_tol: float = 0.5,
-                 split_counts=(150, 50, 120), n_samples_fwd: int = 512,
+                 split_counts=(150, 50, 120), n_samples_fwd: int = 256,
                  angle_weight: bool = True,
+                 fbp_scale: float | None = None,
                  cache_dir: str | None = None, verbose: bool = True):
         self.device = torch.device(device)
         self.root = root
@@ -190,6 +192,12 @@ class CQ500Generator:
         self.dx = self.dy = self.dz = float(voxel_mm)
         self.mu_water = mu_water
         self.clip = clip
+        # 256 ray-march samples, halved from 512 (2026-07-18). Measured on a real CQ500 volume:
+        # 256 vs 512 forward quadrature changes the FDK reconstruction by 9e-4 rel (~59 dB), which
+        # is ~25 dB BELOW the FDK's own cone-beam floor -- absolute recon-vs-GT is identical
+        # (34.37 vs 34.34 dB in the measured region). It halves the forward projection (1.82->0.95 s
+        # at 256^3/360v), the dominant cost of a bridge draw. Below 256 the time saving shrinks
+        # (grid overhead) while the quadrature margin erodes, so 256 is the sweet spot.
         self.n_samples_fwd = n_samples_fwd
         self.cache_dir = cache_dir or os.path.join(root, "_vol_cache")
 
@@ -214,7 +222,13 @@ class CQ500Generator:
         self.cfg = cfg or ConeBeam3DConfig.thies()
         self.P_nom = build_conebeam_orbit(self.cfg, device=self.device)
         self.u_coords, self.v_coords = detector_coords_3d(self.cfg, device=self.device)
-        self.fbp_scale = self._calibrate()
+        # `fbp_scale` can be INJECTED (e.g. a val/deploy generator reusing the constant the TRAIN
+        # generator calibrated, or the one stored in a checkpoint): _calibrate() fits on volume 0
+        # of this generator's own split, so two splits calibrate on different patients and their
+        # NET normalizations drift slightly apart. Injection keeps the operator constant shared
+        # and skips the calibration projection.
+        self.fbp_scale = float(fbp_scale) if fbp_scale is not None else self._calibrate()
+        self._anchor_cache: dict[int, torch.Tensor] = {}   # idx -> NET static FDK, on CPU
 
     # -- volumes ------------------------------------------------------------------------
     def volume(self, idx: int = 0) -> torch.Tensor:
@@ -262,6 +276,10 @@ class CQ500Generator:
     def to_net(self, mu):
         return 2.0 * (mu - self.mu_lo) / (self.mu_hi - self.mu_lo) - 1.0
 
+    def to_net_tangent(self, dmu):
+        """to_net is affine, so a DERIVATIVE maps with the gain only (no -1 shift)."""
+        return 2.0 * dmu / (self.mu_hi - self.mu_lo)
+
     def from_net(self, x):
         return (x + 1.0) * 0.5 * (self.mu_hi - self.mu_lo) + self.mu_lo
 
@@ -295,6 +313,24 @@ class CQ500Generator:
             scale=self.fbp_scale if scale is None else scale,
             view_chunk=kw.pop("view_chunk", 8), view_weight=vw, **kw)
 
+    def fdk_tangent(self, sino: torch.Tensor, Pmat: torch.Tensor, Pdot: torch.Tensor, *,
+                    scale=None, angle_weight: bool | None = None, **kw):
+        """(FDK(sino, Pmat), its exact directional derivative along Pdot) -- one fused pass.
+
+        The tangent twin of `fdk`: same scale, same Voronoi angular weighting (plus the
+        weight's OWN derivative, which is s-dependent through the gantry-axis rotation).
+        Used by `train_fm3d.bridge_pair` with (Pmat, Pdot) = rigid_motion.bridge_P_and_dP."""
+        D, H, W = self.shape_dhw
+        aw = self.angle_weight if angle_weight is None else bool(angle_weight)
+        vw = vwd = None
+        if aw:
+            vw, vwd = view_angular_weights_dot(Pmat, Pdot)
+        return fdk_conebeam_3d_tangent(
+            sino, Pmat, Pdot, self.u_coords, self.v_coords, self.cfg,
+            D=D, H=H, W=W, dx=self.dx, dy=self.dy, dz=self.dz,
+            scale=self.fbp_scale if scale is None else scale,
+            view_weight=vw, view_weight_dot=vwd, **kw)
+
     def _calibrate(self) -> float:
         from .geometry_3d import measured_region_mask
         v = self.volume(0)
@@ -311,6 +347,26 @@ class CQ500Generator:
     def sample_volumes(self, batch: int = 1, generator=None) -> torch.Tensor:
         idx = torch.randint(len(self.records), (batch,), generator=generator)
         return torch.cat([self.volume(int(i)) for i in idx], 0)
+
+    @torch.no_grad()
+    def static_anchor_net(self, idx: int) -> torch.Tensor:
+        """NET-space motion-free FDK of volume `idx` -- x_anchor = to_net(FDK(project(vol,
+        P_nom), P_nom)) -- memoized on CPU (150 vols ~= 10 GB fp32).
+
+        This is the bridge's t=1 anchor (see train_fm3d.bridge_pair). It depends ONLY on the
+        volume: neither the sampled motion nor t enter it, so recomputing it on every draw was
+        pure waste. Caching it removes one full forward projection (~0.9 s) and one FDK (~0.18 s)
+        from every bridge draw of a volume already seen once -- the dominant cost after the
+        forward-projection twin. Numerically identical to the inline compute (same ops, a
+        lossless fp32 CPU round-trip)."""
+        key = int(idx) % len(self.records)
+        a = self._anchor_cache.get(key)
+        if a is None:
+            vol = self.volume(key)
+            y0 = self.project(vol, self.P_nom[None])
+            a = self.to_net(self.fdk(y0, self.P_nom[None])[0]).cpu()
+            self._anchor_cache[key] = a
+        return a.to(self.device)
 
     def sample_motion(self, batch: int = 1, *, trans_mm: float = 5.0, rot_deg: float = 5.0,
                       generator=None):

@@ -222,8 +222,8 @@ def predict_x1_patched(model, x_t: torch.Tensor, t: float, *, patch: int = 64,
 
 @torch.no_grad()
 def prior_ode(model, x0: torch.Tensor, *, n_steps: int = 50, patch: int = 64,
-              stride: int | None = None, context: str = "auto", n_offsets: int = 1,
-              blend: str = "hann", generator=None) -> torch.Tensor:
+              stride: int | None = None, batch: int = 8, context: str = "auto",
+              n_offsets: int = 1, blend: str = "hann", generator=None) -> torch.Tensor:
     """Prior-ONLY Euler integration of the FM ODE, t: 0 -> 1. No data consistency, no TV --
     "what does the prior ALONE make of the cold start". This is the validation metric, the same
     one the sibling 4DCT project renders every `val_every` steps.
@@ -241,8 +241,9 @@ def prior_ode(model, x0: torch.Tensor, *, n_steps: int = 50, patch: int = 64,
     dt = 1.0 / n_steps
     for k in range(n_steps):
         t = k / n_steps
-        x1 = predict_x1_patched(model, x, t, patch=patch, stride=stride, context=context,
-                                n_offsets=n_offsets, blend=blend, generator=generator)
+        x1 = predict_x1_patched(model, x, t, patch=patch, stride=stride, batch=batch,
+                                context=context, n_offsets=n_offsets, blend=blend,
+                                generator=generator)
         x = x + (dt / max(1.0 - t, 1e-3)) * (x1 - x)          # == x + dt * v
     return x
 

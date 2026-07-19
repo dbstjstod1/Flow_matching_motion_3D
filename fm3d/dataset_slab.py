@@ -45,7 +45,8 @@ import torch
 
 from .geometry_3d import ConeBeam3DConfig, build_conebeam_orbit, detector_coords_3d
 from .filters import calibrate_scale
-from .projector_3d import fdk_conebeam_3d_batched, forward_project_3d_batched
+from .projector_3d import (fdk_conebeam_3d_batched, fdk_conebeam_3d_tangent,
+                           forward_project_3d_batched)
 from .rigid_motion import params_to_Pmot, random_motion
 
 MU_WATER = 0.02
@@ -162,6 +163,10 @@ class AAPMSlabGenerator:
     def to_net(self, mu):
         return 2.0 * (mu - self.mu_lo) / (self.mu_hi - self.mu_lo) - 1.0
 
+    def to_net_tangent(self, dmu):
+        """to_net is affine, so a DERIVATIVE maps with the gain only (no -1 shift)."""
+        return 2.0 * dmu / (self.mu_hi - self.mu_lo)
+
     def from_net(self, x):
         return (x + 1.0) * 0.5 * (self.mu_hi - self.mu_lo) + self.mu_lo
 
@@ -184,6 +189,16 @@ class AAPMSlabGenerator:
             D=D, H=H, W=W, dx=self.dx, dy=self.dy, dz=self.dz,
             scale=self.fbp_scale if scale is None else scale,
             view_chunk=kw.pop("view_chunk", 8), **kw)
+
+    def fdk_tangent(self, sino: torch.Tensor, Pmat: torch.Tensor, Pdot: torch.Tensor, *,
+                    scale=None, **kw):
+        """(FDK, its exact directional derivative along Pdot); no angular weighting here
+        (this generator never derives one -- see the cq500 twin for the weighted variant)."""
+        D, H, W = self.shape
+        return fdk_conebeam_3d_tangent(
+            sino, Pmat, Pdot, self.u_coords, self.v_coords, self.cfg,
+            D=D, H=H, W=W, dx=self.dx, dy=self.dy, dz=self.dz,
+            scale=self.fbp_scale if scale is None else scale, **kw)
 
     def _calibrate(self) -> float:
         """One least-squares scalar for the FDK, fit once on run 0. Operator constant."""
