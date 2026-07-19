@@ -63,51 +63,75 @@ def montage(path, panels, title):
     plt.close(fig)
 
 
+# Per-patient constants, shared across validation calls in one process. For the fixed seeds the
+# cold start x0, the reference and the cold-start metrics are IDENTICAL at every checkpoint --
+# recomputing them cost two forward projections, three FDKs and a 200-iter rigid alignment per
+# patient per call. Keyed on everything they depend on; tensors parked on CPU (~128 MB/patient).
+_VAL_CACHE: dict[tuple, dict] = {}
+
+
 def run_validation(model, gen, meas, out_dir, *, it=0, patients=3, patch=64, ode_steps=50,
                    anchor="static", trans_mm=5.0, rot_deg=5.0, blend="hann", n_offsets=1,
-                   writer=None, dev="cuda"):
+                   tile_batch=64, writer=None, dev="cuda"):
     """Prior-ONLY ODE from the cold start, on `patients` fixed val cases. Returns the per-patient
     metrics AND the montage paths, and (if given) logs scalars + images to a tensorboard writer.
 
     Shared by the standalone `evaluate` and by train_fm3d's inline validation, so both walk the
     same code -- the number the training loop prints is exactly the number this script reproduces.
     The fixed seed (1000 + i) means the SAME motion is scored at every checkpoint, so the curve
-    tracks the prior improving and not the luck of the draw."""
+    tracks the prior improving and not the luck of the draw.
+
+    The REFERENCE is the static FDK for anchor in ("static", "none") -- for "none" too, because
+    the scanner-achievable still image is the only honest yardstick a bare-bridge prior has (it
+    was previously scored against the GT, silently) -- and the GT volume only for anchor="gt".
+    `tile_batch` is the patch batch of the blended prior evaluation; 64 (the training batch)
+    rather than prior_patch's tiny default 8, which left the GPU mostly idle."""
     spacing = (gen.dz, gen.dy, gen.dx)
     rows, paths = [], []
     for i in range(patients):
-        # the forward operator and the prior ODE need no grad; the metric's rigid_align DOES
-        # (it optimizes the alignment by backprop), so only THIS block is under no_grad.
+        pid = gen.records[i]["patient"]
+        ref_kind = "gt" if anchor == "gt" else "static"
+        key = (gen.split, pid, 1000 + i, float(trans_mm), float(rot_deg), ref_kind,
+               float(gen.fbp_scale))
+        ent = _VAL_CACHE.get(key)
+        if ent is None:
+            with torch.no_grad():
+                gt = gen.volume(i)
+                theta = make_motion("akima", gen.cfg.n_views, device=dev, seed=1000 + i,
+                                    trans_mm=(trans_mm,) * 3, rot_deg=(rot_deg,) * 3)
+                y = gen.project(gt, params_to_Pmot(theta, gen.P_nom)[None])
+                x0_mu = gen.fdk(y, gen.P_nom[None])[0]                  # cold start, MU
+                static_mu = gen.fdk(gen.project(gt, gen.P_nom[None]), gen.P_nom[None])[0]
+                ref_mu = static_mu if ref_kind == "static" else gt[0, 0]
+            # the metric's rigid_align needs grad (it optimizes the alignment by backprop),
+            # so it sits OUTSIDE the no_grad block
+            m0 = aligned_metrics(x0_mu, ref_mu, spacing, mask=meas, iters=200)
+            ent = {"x0": x0_mu.cpu(), "ref": ref_mu.cpu(), "m0": m0}
+            _VAL_CACHE[key] = ent
+        x0_mu = ent["x0"].to(dev)
+        ref_mu = ent["ref"].to(dev)
+        m0 = ent["m0"]
         with torch.no_grad():
-            gt = gen.volume(i)
-            theta = make_motion("akima", gen.cfg.n_views, device=dev, seed=1000 + i,
-                                trans_mm=(trans_mm,) * 3, rot_deg=(rot_deg,) * 3)
-            y = gen.project(gt, params_to_Pmot(theta, gen.P_nom)[None])
-            x0_mu = gen.fdk(y, gen.P_nom[None])[0]                      # cold start, MU
-            static_mu = gen.fdk(gen.project(gt, gen.P_nom[None]), gen.P_nom[None])[0]
             gtor = torch.Generator(device=dev).manual_seed(1000 + i) if n_offsets > 1 else None
             x1_mu = gen.from_net(prior_ode(model, gen.to_net(x0_mu)[None, None], n_steps=ode_steps,
-                                           patch=patch, stride=patch // 2, context="auto",
-                                           blend=blend, n_offsets=n_offsets,
+                                           patch=patch, stride=patch // 2, batch=tile_batch,
+                                           context="auto", blend=blend, n_offsets=n_offsets,
                                            generator=gtor)[0, 0])
-        ref_mu = static_mu if anchor == "static" else gt[0, 0]
         # GAUGE-AWARE: rigidly align to the target before scoring. Raw PSNR penalises the
         # unobservable global pose the prior is free to shift; the aligned number is the honest
         # one (see fm3d/reg_metric.py, and the SE(3) gauge in memory).
-        m0 = aligned_metrics(x0_mu, ref_mu, spacing, mask=meas, iters=200)
         m1 = aligned_metrics(x1_mu, ref_mu, spacing, mask=meas, iters=200)
-        pid = gen.records[i]["patient"]
         rows.append({"patient": pid, **{f"cold_{k}": v for k, v in m0.items()},
                      **{f"ode_{k}": v for k, v in m1.items()}})
         print(f"    val it {it:6d} p{pid:3d}: cold {m0['psnr_aligned']:5.2f} -> ODE "
               f"{m1['psnr_aligned']:5.2f} dB / SSIM {m0['ssim_aligned']:.3f} -> "
-              f"{m1['ssim_aligned']:.3f}  (raw {m0['psnr_raw']:.2f} -> {m1['psnr_raw']:.2f})",
-              flush=True)
+              f"{m1['ssim_aligned']:.3f}  (raw {m0['psnr_raw']:.2f} -> {m1['psnr_raw']:.2f}) "
+              f"[ref={ref_kind}]", flush=True)
         p = os.path.join(out_dir, f"val_it{it:06d}_p{i}.png")
         montage(p, [(x0_mu, f"x_t=0 cold FDK\n{m0['psnr_aligned']:.2f} dB"),
                     (x1_mu, f"prior ODE {ode_steps} -> t=1\n{m1['psnr_aligned']:.2f} dB"),
-                    (ref_mu, f"target ({anchor})")],
-                f"fm3d it {it} | CQ500 patient {pid} | prior-only ODE (aligned) | "
+                    (ref_mu, f"target (ref={ref_kind})")],
+                f"fm3d it {it} | CQ500 patient {pid} | prior-only ODE (aligned, ref={ref_kind}) | "
                 f"cold {m0['psnr_aligned']:.2f} -> {m1['psnr_aligned']:.2f} dB")
         paths.append(p)
         if writer is not None:
@@ -129,6 +153,13 @@ def evaluate(ckpt, gen, meas, args, dev):
     ck = torch.load(ckpt, map_location=dev, weights_only=False)
     ca = ck["args"]
     it = ck.get("iter", 0)
+    # Score in the SAME NET normalization the checkpoint was trained under: its fbp_scale was
+    # calibrated on TRAIN patient 0, while this generator (val/test split) calibrated on its own
+    # patient 0. Old checkpoints without the key fall back to this generator's calibration.
+    fs = ck.get("fbp_scale")
+    if fs is not None and float(fs) != gen.fbp_scale:
+        print(f"[val] fbp_scale {gen.fbp_scale:.6g} -> {float(fs):.6g} (from the checkpoint)")
+        gen.fbp_scale = float(fs)
     in_ch = int(ck["ema"]["in_conv.weight"].shape[1])
     model = UNet3D(in_ch=in_ch, base=ca["base"]).to(dev).eval()
     model.load_state_dict(ck["ema"])

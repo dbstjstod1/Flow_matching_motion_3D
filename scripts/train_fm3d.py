@@ -4,7 +4,8 @@ THE BRIDGE. Instead of interpolating between a corrupted image and a clean one i
 every intermediate state is a genuine FDK reconstruction under a PARTIALLY CORRECTED geometry:
 
     x_t  = FDK(y, P_nom @ T(t * theta))        t = 0 -> the uncorrected recon; t = 1 -> the clean one
-    dx_t = d/dt x_t                            estimated by a central difference through FDK
+    dx_t = d/dt x_t                            EXACT, fused into the FDK's backprojection pass
+                                               (--tangent fd restores the old central difference)
 
 so the prior is trained on exactly the manifold the inference loop walks: the set of FDK images
 reachable by some geometry. That is the point -- a linear pixel-space bridge passes through images
@@ -14,11 +15,12 @@ that no geometry produces, and the prior then spends its capacity on states infe
 with Euler angles it would not be, and the velocity target would quietly stop pointing where the
 inference ODE travels.
 
-MEMORY. The network only ever sees 64^3 PATCHES; the operator (3 FDKs per sample, under
-`no_grad`) runs on the full slab. That split is the whole design -- it is what lets a 3D prior
+MEMORY. The network only ever sees 64^3 PATCHES; the operator (one fused FDK+tangent pass per
+sample, under `no_grad`) runs on the full slab. That split is the whole design -- it is what lets a 3D prior
 train on a 24 GB card. Bridge draws are expensive, so a rolling cache of volume pairs is refreshed
 every `--refresh` steps and each batch mixes patches from several cached draws (so `t` varies
-within a batch). Both tricks are from the 4DCT project.
+within a batch). Both tricks are from the 4DCT project. `t` itself is sampled UNIFORMLY
+(`sample_t`), matching arXiv:2512.18161 and the bridge-model default.
 
     python scripts/train_fm3d.py --iters 20000 --out logs/fm3d_a
 """
@@ -26,10 +28,12 @@ within a batch). Both tricks are from the 4DCT project.
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import sys
 import time
 
+import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -39,7 +43,7 @@ from fm3d.dataset_cq500 import CQ500Generator
 from fm3d.dataset_slab import AAPMSlabGenerator
 from fm3d.geometry_3d import ConeBeam3DConfig, measured_region_mask
 from fm3d.prior_patch import make_tile_inputs, volume_context
-from fm3d.rigid_motion import params_to_Pmot
+from fm3d.rigid_motion import bridge_P_and_dP, params_to_Pmot, random_motion
 from fm3d.unet_3d import UNet3D
 from val_fm3d import run_validation
 
@@ -47,19 +51,27 @@ DATA = "/home/mirlab/Desktop/Flow_matching_motion/data/AAPM_head_data"
 
 
 def sample_t(n: int, device) -> torch.Tensor:
-    """t ~ U[0,1], but 30% of draws are pulled into [0, 0.15].
+    """t ~ U[0,1], uniform.
 
-    The inference ODE STARTS at t=0 -- the uncorrected FDK, the most corrupted state there is --
-    and that is where a uniform sampler puts the fewest examples per unit of image change. The
-    4DCT project biases the same way.
+    This is the STANDARD for this model family and matches our own references: the UNet
+    paper we follow (arXiv:2512.18161) samples t ~ Uniform with no timestep weighting, and
+    the bridge models this prior belongs to (I2SB; InDI, Delbracio & Milanfar 2023
+    arXiv:2303.11435; Direct Diffusion Bridges) all default to uniform t.
+
+    An earlier version pulled 30% of draws into [0,0.15] to over-sample the cold-start (t=0)
+    endpoint where the inference ODE begins. That endpoint bias is a *validated* restoration
+    trick (InDI reports biasing toward the degraded endpoint beats uniform), and the smooth,
+    citable way to do it would be logit-normal sampling with negative location (SD3 / Esser
+    et al. 2024, arXiv:2403.03206). It was dropped here in favour of the reference-faithful
+    uniform sampler; restore it via a logit-normal draw if the cold-start region needs more
+    capacity.
     """
-    t = torch.rand(n, device=device)
-    lo = torch.rand(n, device=device) < 0.30
-    return torch.where(lo, torch.rand(n, device=device) * 0.15, t)
+    return torch.rand(n, device=device)
 
 
 @torch.no_grad()
-def bridge_pair(gen, t: torch.Tensor, y, theta, dlt, delta: float = 0.02):
+def bridge_pair(gen, t: torch.Tensor, y, theta, dlt, delta: float = 0.02,
+                mode: str = "analytic"):
     """(x_t, dx_t) in NET space, for one volume. t: scalar tensor.
 
     THE ANCHORED GEOMETRY BRIDGE:
@@ -75,9 +87,13 @@ def bridge_pair(gen, t: torch.Tensor, y, theta, dlt, delta: float = 0.02):
     part. So a prior trained on the bare bridge learns FDK's residual motion artefact AS ITS
     TARGET -- it would faithfully reproduce, at t=1, an image that is not clean.
 
-    The anchor is a first-order detrend that costs nothing and fixes the endpoint EXACTLY:
+    The anchor is a first-order detrend that costs nothing and pins the endpoint:
       * at t=0 the Delta term vanishes -> x_0 = FDK(y, P_nom), the inference cold start, to the bit
-      * at t=1 -> x_1 = x_anchor, the clean image, BY CONSTRUCTION
+      * at t=1 -> x_1 = x_anchor, the clean image. NOT bit-exact in the analytic mode: Delta is
+        computed with the batched FDK kernel (`gen.fdk`, in `draw`) while x_t comes from the fused
+        Triton tangent kernel (`gen.fdk_tangent`), so x_1 = x_anchor holds to the two kernels'
+        gated agreement (scripts/gate_fdk_tangent.py), not by construction. mode="fd" restores
+        the single-kernel, exact-cancellation path.
       * in between the geometry term still dominates, so the path stays the manifold of
         partially-corrected reconstructions -- which is what the inference loop actually walks as
         theta_hat converges. (The alternative -- attenuating the motion in the DATA,
@@ -89,18 +105,31 @@ def bridge_pair(gen, t: torch.Tensor, y, theta, dlt, delta: float = 0.02):
     This is the image-domain twin of Flowmatching-4DCT's `t1_anchor` detrend (which pins its
     sinogram bridge to a REAL static scan). `dlt=None` restores the bare bridge.
 
-    dx_t is a central difference through the FDK -- three reconstructions per sample. An exact
-    forward-mode derivative w.r.t. Pmat is possible but ~3x the cost, and the 2D project measured
-    the finite difference to agree with it to ~1e-3.
+    dx_t (mode="analytic", the default) is the EXACT forward-mode derivative w.r.t. Pmat:
+    one fused reconstruction pass (`fdk_conebeam_3d_tangent` -- filter once, then a Triton
+    kernel that accumulates FDK and d/ds FDK from the same detector taps), replacing the old
+    central difference (mode="fd"): three full FDKs per sample that agreed with the exact
+    derivative only to ~1e-3. The old comment here guessed forward-mode would cost ~3x; with
+    the tangent fused into the backprojection it costs ~0.5x. Gated against float64 central
+    differences in scripts/gate_fdk_tangent.py; "fd" is kept as the gate's counterparty and
+    an escape hatch.
     """
-    def fdk_at(s: float):
-        P = params_to_Pmot(s * theta, gen.P_nom)[None]
-        return gen.to_net(gen.fdk(y, P)[0])                          # (D,H,W)
-
     tv = float(t)
-    sp, sm = min(tv + delta, 1.0), max(tv - delta, 0.0)
-    x_t = fdk_at(tv)
-    dx = (fdk_at(sp) - fdk_at(sm)) / (sp - sm)
+    if mode == "analytic":
+        P, Pdot = bridge_P_and_dP(theta, gen.P_nom, tv)
+        x_mu, dx_mu = gen.fdk_tangent(y, P[None], Pdot[None])
+        x_t = gen.to_net(x_mu[0])                                    # (D,H,W)
+        dx = gen.to_net_tangent(dx_mu[0])                            # affine gain, no shift
+    elif mode == "fd":
+        def fdk_at(s: float):
+            P = params_to_Pmot(s * theta, gen.P_nom)[None]
+            return gen.to_net(gen.fdk(y, P)[0])                      # (D,H,W)
+
+        sp, sm = min(tv + delta, 1.0), max(tv - delta, 0.0)
+        x_t = fdk_at(tv)
+        dx = (fdk_at(sp) - fdk_at(sm)) / (sp - sm)
+    else:
+        raise ValueError(f"unknown bridge tangent mode: {mode!r}")
     if dlt is not None:
         x_t = x_t + tv * dlt
         dx = dx + dlt
@@ -147,18 +176,47 @@ def main():
                          "prior would learn FDK's residual MOTION artefact as its target. "
                          "gt = the volume itself (also removes FDK's cone-beam floor, but asks "
                          "the net to invert the operator's own defect). none = the bare bridge.")
+    ap.add_argument("--tangent", default="analytic", choices=["analytic", "fd"],
+                    help="how bridge_pair gets the velocity target dx_t. analytic (DEFAULT) = "
+                         "the exact d/ds FDK(y, P(s*theta)) in one fused pass "
+                         "(fdk_conebeam_3d_tangent); fd = the old central difference, three "
+                         "full FDKs, ~1e-3 off -- kept as an escape hatch and gate counterparty")
     ap.add_argument("--resume", default=None,
                     help="a ckpt .pth or a run dir (uses ckpt_last.pth): restore model+EMA+"
-                         "optimizer+loss history and continue to --iters")
+                         "optimizer+loss history+RNG and continue to --iters")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="seed torch+numpy at startup (default None = unseeded, the historical "
+                         "behavior). Also routes the motion draw through a dedicated seeded "
+                         "generator so the Akima spline nodes become reproducible too.")
     ap.add_argument("--save_every", type=int, default=2000)
+    ap.add_argument("--keep_ckpts", type=int, default=0,
+                    help="keep only the newest N numbered ckpt_iterNNNNNN.pth (0 = keep all, "
+                         "the historical behavior). ckpt_last.pth is never pruned.")
     ap.add_argument("--val_every", type=int, default=5000)
     ap.add_argument("--val_patients", type=int, default=3)
     ap.add_argument("--val_ode_steps", type=int, default=50)   # the deploy loop's count
     ap.add_argument("--no_tb", action="store_true", help="disable the tensorboard writer")
+    ap.add_argument("--compile", action="store_true", default=True,
+                    help="torch.compile the velocity net (~1.30x end-to-end here: 0.54 -> 0.41 "
+                         "s/it; the net fwd+bwd is 76%% of a step and compile fuses its many small "
+                         "3D-conv kernels). Numerically faithful (rel-L2 1.6e-3 vs eager, within "
+                         "fp16). Checkpoints save the UNDERLYING module, so resume/inference stay "
+                         "plain-UNet3D compatible. --no-compile to disable.")
+    ap.add_argument("--no-compile", dest="compile", action="store_false")
     args = ap.parse_args()
 
     dev = "cuda"
     os.makedirs(args.out, exist_ok=True)
+
+    # --seed None keeps the historical unseeded behavior (and the historical RNG call sequence).
+    # `motion_gen` stays None when unseeded, which is exactly what random_motion/sample_motion
+    # received before it existed.
+    motion_gen = None
+    if args.seed is not None:
+        torch.manual_seed(args.seed)                       # seeds CPU + all CUDA generators
+        np.random.seed(args.seed)
+        motion_gen = torch.Generator().manual_seed(args.seed + 1)
+        print(f"seeded torch+numpy with {args.seed} (motion generator: {args.seed + 1})")
 
     if args.dataset == "cq500":
         cfg = ConeBeam3DConfig.thies(n_views=args.views)
@@ -206,6 +264,15 @@ def main():
     print(f"UNet3D in_ch={in_ch} (context={args.context}) base={args.base}: "
           f"{n_par / 1e6:.2f} M params")
 
+    # torch.compile wraps the module but shares its parameters, so `model` stays the canonical
+    # UNet3D for the optimizer, the EMA, and CHECKPOINTS (saving model.state_dict() keeps plain
+    # keys -- no _orig_mod. prefix -- so resume and run_posterior3d/val load unchanged). `net` is
+    # the compiled forward used ONLY in the training step. First few steps pay a one-off compile
+    # warmup, so the printed s/it settles after ~iter 50.
+    net = torch.compile(model) if args.compile else model
+    if args.compile:
+        print("torch.compile: ON (net fwd/bwd only; ~1.30x). --no-compile to disable.")
+
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95))
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
 
@@ -220,10 +287,16 @@ def main():
                    if os.path.isdir(args.resume) else args.resume)
         ck = torch.load(ck_path, map_location=dev, weights_only=False)
         prev = ck.get("args", {})
+
         # A resumed run MUST keep the architecture and the bridge it was trained under; anything
-        # else silently changes what the weights mean.
-        for k in ("base", "patch", "context", "anchor", "shape", "views", "dataset"):
-            if k in prev and k in vars(args) and prev[k] != vars(args)[k]:
+        # else silently changes what the weights mean. `_cmp` normalizes sequences because the
+        # SAME --shape arrives as a tuple when defaulted and a list when typed on the CLI.
+        def _cmp(v):
+            return tuple(v) if isinstance(v, (list, tuple)) else v
+
+        for k in ("base", "patch", "context", "anchor", "shape", "views", "dataset",
+                  "tangent", "trans_mm", "rot_deg"):
+            if k in prev and k in vars(args) and _cmp(prev[k]) != _cmp(vars(args)[k]):
                 raise SystemExit(f"--resume mismatch on '{k}': checkpoint has {prev[k]!r}, "
                                  f"this run asks for {vars(args)[k]!r}")
         model.load_state_dict(ck["model"])
@@ -231,6 +304,21 @@ def main():
         opt.load_state_dict(ck["opt"])
         if ck.get("scaler") is not None:
             scaler.load_state_dict(ck["scaler"])
+        # RNG: restore the sampling streams so a resumed run continues the data sequence the
+        # interrupted one would have drawn. Old checkpoints predate these keys -- note and go on.
+        rng = ck.get("rng")
+        if rng is None:
+            print("resume: checkpoint carries no RNG state (older format) -- continuing "
+                  "with fresh RNG")
+        else:
+            torch.set_rng_state(rng["torch"].cpu())        # map_location may have moved these
+            if rng.get("cuda") is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all([s.cpu() for s in rng["cuda"]])
+            np.random.set_state(rng["numpy"])
+            if rng.get("motion") is not None:
+                if motion_gen is None:
+                    motion_gen = torch.Generator()
+                motion_gen.set_state(rng["motion"].cpu())
         loss_log_prev = ck.get("loss_log", [])
         start_it = int(ck.get("iter", 0))
         print(f"resumed {ck_path} at iter {start_it} "
@@ -248,10 +336,24 @@ def main():
         cropped from this volume. At inference `predict_x1_patched` rebuilds it the same way
         from the evolving x_t, so train and infer see the same channel.
 
-        The ANCHOR (see `bridge_pair`) is also a property of the draw: one extra static forward
-        projection and two extra FDKs, PER DRAW rather than per t, and the cache refreshes a draw
-        only every `--refresh` steps."""
-        y, th, vol = gen.sample_motion(1, trans_mm=args.trans_mm, rot_deg=args.rot_deg)
+        The ANCHOR (see `bridge_pair`) is also a property of the draw. On cq500 its motion-free
+        static FDK is MEMOIZED per volume (`gen.static_anchor_net`), since it depends on neither
+        the motion nor t -- that removes one forward projection (~0.9 s) and one FDK (~0.18 s) from
+        every draw after a volume's first, and the cache refreshes a draw only every `--refresh`
+        steps. To reach the memo we sample the volume INDEX ourselves here (cq500's `volume(idx)`
+        is a clean per-patient lookup); aapm slabs have no such stable key, so they keep the old
+        inline path via `sample_motion`."""
+        idx = None
+        if args.dataset == "cq500":
+            idx = int(torch.randint(gen.n_slabs, (1,)).item())
+            vol = gen.volume(idx)
+            th = random_motion(gen.cfg.n_views, trans_mm=args.trans_mm, rot_deg=args.rot_deg,
+                               device=dev, generator=motion_gen)[None]
+            with torch.no_grad():
+                y = gen.project(vol, params_to_Pmot(th[0], gen.P_nom)[None])
+        else:
+            y, th, vol = gen.sample_motion(1, trans_mm=args.trans_mm, rot_deg=args.rot_deg,
+                                           generator=motion_gen)
         dlt = None
         if args.anchor != "none":
             if args.anchor == "gt":
@@ -263,13 +365,15 @@ def main():
                 # is the GT. Anchoring at the static FDK would teach the prior to PAINT IN cone
                 # artefacts it is supposed to remove.
                 x_anchor = gen.to_net(vol[0, 0])
-            else:                             # "static": the motion-free reconstruction
+            elif idx is not None:             # "static", cq500: the memoized motion-free recon
+                x_anchor = gen.static_anchor_net(idx)
+            else:                             # "static", aapm: compute inline (no stable key)
                 y0 = gen.project(vol, gen.P_nom[None])
                 x_anchor = gen.to_net(gen.fdk(y0, gen.P_nom[None])[0])
             x1_geo = gen.to_net(gen.fdk(y, params_to_Pmot(th[0], gen.P_nom)[None])[0])
             dlt = x_anchor - x1_geo
         t = sample_t(1, dev)[0]
-        x_t, dx = bridge_pair(gen, t, y, th[0], dlt)
+        x_t, dx = bridge_pair(gen, t, y, th[0], dlt, mode=args.tangent)
         x_t = x_t[None, None]                                        # (1,1,D,H,W)
         ctx = volume_context(x_t, (p, p, p)) if in_ch == 5 else None
         return x_t, dx, t, ctx
@@ -282,8 +386,13 @@ def main():
     # Standalone `val_fm3d.py` runs the identical `run_validation`; the montages land in out/val.
     val_gen = None
     if args.dataset == "cq500" and args.val_every > 0:
+        # fbp_scale is INJECTED from the train generator: _calibrate() fits it on volume 0 of the
+        # generator's own split, so letting the val generator recalibrate (on val patient 0) would
+        # hand validation a slightly different NET normalization than training saw. Injecting also
+        # skips the calibration projection at startup.
         val_gen = CQ500Generator(args.root, cfg, device=dev, split="val",
-                                 shape=tuple(args.shape), voxel_mm=1.0, verbose=False)
+                                 shape=tuple(args.shape), voxel_mm=1.0, verbose=False,
+                                 fbp_scale=gen.fbp_scale)
     val_dir = os.path.join(args.out, "val")
     os.makedirs(val_dir, exist_ok=True)
     writer = None
@@ -294,33 +403,57 @@ def main():
 
     t0 = time.time()
     loss_log = list(loss_log_prev)          # (iter, loss) per step, saved into every checkpoint
+    pending: list[tuple[int, torch.Tensor]] = []   # detached GPU losses awaiting ONE host sync
     n_nonfinite = 0
+
+    def flush_losses():
+        """Move pending losses into loss_log with a single device sync for the whole block.
+
+        The old loop called float(loss) AND torch.isfinite(loss) every step -- two host syncs
+        per iteration that serialized the CPU against the GPU. (GradScaler.step keeps its own
+        internal found_inf sync; that one is inherent to fp16 AMP.) fp16 can overflow to
+        inf/nan; GradScaler skips a non-finite step on its own, but a persistently non-finite
+        LOSS means the run is dead and should say so, not spin silently -- the check now runs
+        per flushed block instead of per step."""
+        nonlocal n_nonfinite
+        if not pending:
+            return
+        vals = torch.stack([v for _, v in pending]).cpu()          # the one sync
+        nf = int((~torch.isfinite(vals)).sum())
+        if nf:
+            n_nonfinite += nf
+            print(f"it {pending[-1][0]:6d} | WARN non-finite loss x{nf} in the last "
+                  f"{len(pending)} steps ({n_nonfinite} total; fp16 overflow?)", flush=True)
+        loss_log.extend((i, float(v)) for (i, _), v in zip(pending, vals))
+        pending.clear()
+
     for it in range(start_it + 1, args.iters + 1):
         if it % args.refresh == 0:
             cache[torch.randint(len(cache), (1,)).item()] = draw()
 
+        # Sample ALL (cache entry, origin) pairs first, in the exact per-patch RNG order the
+        # old loop used (one randint over the cache, one over the origins, alternating), THEN
+        # group by entry so make_tile_inputs runs once per distinct entry (<= cache size calls
+        # instead of `batch`). The loss is a mean over the batch, so row order is free.
+        picks = [(int(torch.randint(len(cache), (1,)).item()),
+                  int(torch.randint(len(ok), (1,)).item())) for _ in range(args.batch)]
+        groups: dict[int, list[int]] = {}
+        for ci, oi in picks:
+            groups.setdefault(ci, []).append(oi)
         xs, ds, ts = [], [], []
-        for _ in range(args.batch):
-            x_t, dx, t, ctx = cache[torch.randint(len(cache), (1,)).item()]
-            z, yy, xx = ok[torch.randint(len(ok), (1,)).item()]
-            xs.append(make_tile_inputs(x_t, [(z, yy, xx)], (p, p, p), ctx))   # (1,C,p,p,p)
-            ds.append(dx[z:z + p, yy:yy + p, xx:xx + p])
-            ts.append(t)
+        for ci, ois in groups.items():
+            x_t, dx, t, ctx = cache[ci]
+            coords = [ok[oi] for oi in ois]
+            xs.append(make_tile_inputs(x_t, coords, (p, p, p), ctx))   # (len(ois),C,p,p,p)
+            ds += [dx[z:z + p, yy:yy + p, xx:xx + p] for (z, yy, xx) in coords]
+            ts += [t] * len(ois)
         xb = torch.cat(xs, 0)                                   # (B,in_ch,p,p,p)
         db = torch.stack(ds)[:, None]                           # (B,1,p,p,p) -- target: ch 0 only
         tb = torch.stack(ts)
 
         opt.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=getattr(torch, args.amp_dtype), enabled=args.amp):
-            loss = ((model(xb, tb) - db) ** 2).mean()
-        # fp16 can overflow to inf/nan (this loop has never run in fp16 before). GradScaler skips
-        # a non-finite step on its own, but a persistently non-finite LOSS means the run is dead
-        # and should say so, not spin silently.
-        if not torch.isfinite(loss):
-            n_nonfinite = n_nonfinite + 1 if it > 1 else 1
-            if n_nonfinite % 20 == 0:
-                print(f"it {it:6d} | WARN non-finite loss x{n_nonfinite} (fp16 overflow?)",
-                      flush=True)
+            loss = ((net(xb, tb) - db) ** 2).mean()
         scaler.scale(loss).backward()
         scaler.step(opt)
         scaler.update()
@@ -332,16 +465,17 @@ def main():
             for be, bm in zip(ema.buffers(), model.buffers()):
                 be.copy_(bm)
 
-        loss_log.append((it, float(loss.detach())))
+        pending.append((it, loss.detach()))
         if it % 50 == 0:
+            flush_losses()
             recent = [l for _, l in loss_log[-50:]]
             ma = sum(recent) / len(recent)
             # rate over THIS process's steps, not `it` -- after a resume `it` starts high and
             # dividing by it would report a nonsense s/it
-            print(f"it {it:6d} | loss {float(loss.detach()):.5f} | ma50 {ma:.5f} | "
+            print(f"it {it:6d} | loss {loss_log[-1][1]:.5f} | ma50 {ma:.5f} | "
                   f"{(time.time() - t0) / max(it - start_it, 1):.2f}s/it", flush=True)
             if writer is not None:
-                writer.add_scalar("train/fm_loss", float(loss.detach()), it)
+                writer.add_scalar("train/fm_loss", loss_log[-1][1], it)
                 writer.add_scalar("train/fm_loss_ma50", ma, it)
 
         if val_gen is not None and it % args.val_every == 0:
@@ -354,15 +488,26 @@ def main():
             ema.train()
 
         if it % args.save_every == 0 or it == args.iters:
+            flush_losses()
             # loss_log rides along in the checkpoint, so the convergence curve survives even if
             # the text log is rotated or lost -- the whole per-step history, (iter, loss) pairs.
+            # "rng" makes --resume continue the exact sampling streams (older ckpts lack it).
             ck = {"model": model.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
                   "scaler": scaler.state_dict() if args.amp else None,
                   "iter": it, "args": vars(args), "fbp_scale": gen.fbp_scale,
+                  "rng": {"torch": torch.get_rng_state(),
+                          "cuda": torch.cuda.get_rng_state_all(),
+                          "numpy": np.random.get_state(),
+                          "motion": motion_gen.get_state() if motion_gen is not None else None},
                   "loss_log": loss_log}
             torch.save(ck, os.path.join(args.out, f"ckpt_iter{it:06d}.pth"))
             torch.save(ck, os.path.join(args.out, "ckpt_last.pth"))
             print(f"saved ckpt_iter{it:06d}.pth")
+            if args.keep_ckpts > 0:
+                numbered = sorted(glob.glob(os.path.join(args.out, "ckpt_iter*.pth")))
+                for f in numbered[:-args.keep_ckpts]:
+                    os.remove(f)
+                    print(f"pruned {os.path.basename(f)}")
 
     if writer is not None:
         writer.close()
