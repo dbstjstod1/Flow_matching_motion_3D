@@ -12,6 +12,8 @@ tolerance, on the quantity the estimator actually descends -- is the claim.
   T1  forward parity           the two backends compute the same line integrals
   T2  d(loss)/d(theta)         the motion gradient, the whole point. Direction (cosine) AND
                                magnitude, per DoF block.
+  T2b d(loss)/d(theta), MOVED  the same parity at theta = 0.5*theta_true, so the adjoint is
+                               tested off the nominal orbit, not only at P_nom.
   T3  d(loss)/d(volume)        unchanged by the new kernel -- a regression check, since the
                                backward now also loads the eight corner values it used to only
                                scatter into.
@@ -100,6 +102,23 @@ def main():
         c = cos(a, b)
         r = float((a - b).norm() / a.norm())
         check(f"{name} block", c > 0.9999 and r < 2e-3,
+              f"cos = {c:.6f}  rel = {r:.2e}  |grid| {a.norm():.3e} |triton| {b.norm():.3e}")
+
+    # ---- T2b the same parity at a MOVED geometry. T2 evaluates the adjoint only at
+    # theta = 0, i.e. at P = P_nom exactly -- an adjoint error term that cancels on the nominal
+    # source ring would pass it. Re-run mid-descent, where the estimator actually lives.
+    print("\nT2b d(loss)/d(theta) at theta = 0.5*theta_true   [moved geometry]")
+    grads = {}
+    for backend in ("gridsample", "triton"):
+        th = (0.5 * th_true).detach().clone().requires_grad_(True)
+        run(backend, theta=th)[1].backward()
+        grads[backend] = th.grad.clone()
+    gg, gt = grads["gridsample"], grads["triton"]
+    for name, sl in [("translation", slice(0, 3)), ("rotation", slice(3, 6))]:
+        a, b = gg[:, sl], gt[:, sl]
+        c = cos(a, b)
+        r = float((a - b).norm() / a.norm())
+        check(f"moved {name} block", c > 0.9999 and r < 2e-3,
               f"cos = {c:.6f}  rel = {r:.2e}  |grid| {a.norm():.3e} |triton| {b.norm():.3e}")
 
     # ---- T3 d/d volume -- regression

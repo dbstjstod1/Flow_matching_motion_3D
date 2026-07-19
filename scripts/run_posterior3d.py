@@ -44,6 +44,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from fm3d.dataset_cq500 import CQ500Generator
 from fm3d.dataset_slab import AAPMSlabGenerator
 from fm3d.geometry_3d import ConeBeam3DConfig, measured_region_mask
 from fm3d.motion_estimation import make_estimator
@@ -86,11 +87,17 @@ def fm_predict(model, gen, x_mu, t, dt, patch, context="auto", n_offsets=1, gene
     return gen.from_net(x_net + dt * v)[0, 0]
 
 
-def data_grad(x_mu, theta, y, gen):
-    """grad_x 0.5 ||A_{P(theta)}(x) - y||^2, in mu space."""
+def data_grad(x_mu, theta, y, gen, views=None):
+    """grad_x 0.5 ||A_{P(theta)}(x) - y||^2, in mu space.
+
+    `views` (a LongTensor of view indices) subsamples the sum over views -- an unbiased estimate
+    of the same gradient direction, and the data-prox step only uses the normalized direction.
+    None = all views (exact, and the default)."""
     x = x_mu.detach().requires_grad_(True)
-    P = params_to_Pmot(theta, gen.P_nom)[None]
-    r = gen.project(x[None, None], P, n_samples=256) - y
+    P = params_to_Pmot(theta, gen.P_nom)
+    if views is not None:
+        P, y = P[views], y[views]
+    r = gen.project(x[None, None], P[None], n_samples=256) - y
     (0.5 * (r ** 2).sum()).backward()
     return x.grad
 
@@ -118,10 +125,15 @@ def montage(path, gt, x, xt, step, t, title):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--data", default=DATA)
+    ap.add_argument("--data", default=DATA, help="AAPM data dir (aapm checkpoints only)")
+    ap.add_argument("--root", default=None,
+                    help="CQ500 root (cq500 checkpoints); default: the checkpoint's --root")
+    ap.add_argument("--split", default="val",
+                    help="CQ500 split to draw the test patient from (cq500 checkpoints only)")
     ap.add_argument("--out", default="data/posterior3d")
-    ap.add_argument("--run", type=int, default=0)
-    ap.add_argument("--z0", type=int, default=0)
+    ap.add_argument("--run", type=int, default=0,
+                    help="volume index: patient index (cq500) / run index (aapm)")
+    ap.add_argument("--z0", type=int, default=0, help="slab start slice (aapm only)")
     ap.add_argument("--motion_kind", default="mixed")
     ap.add_argument("--seed", type=int, default=3)
     ap.add_argument("--n_steps", type=int, default=30)       # 2D deploy recipe: ~30
@@ -129,7 +141,9 @@ def main():
     ap.add_argument("--estimator", default="net")            # net = hashbl, the 2D default
     ap.add_argument("--loss", default="l2si")                # l2si | lncc | ncc | ramp
     ap.add_argument("--lncc_win", type=int, default=9)
-    ap.add_argument("--lr", type=float, default=1e-2)
+    ap.add_argument("--lr", type=float, default=None,
+                    help="estimator lr; default None = each estimator's own default "
+                         "(net 1e-2, direct/basis 0.3)")
     ap.add_argument("--views_per_iter", type=int, default=24)
     ap.add_argument("--alpha", type=float, default=0.1)      # data-prox step
     ap.add_argument("--alpha_p", type=float, default=0.0)    # alpha * (1-t)^p decay; 0 = off
@@ -137,6 +151,10 @@ def main():
     ap.add_argument("--tv_iters", type=int, default=15)
     ap.add_argument("--tv_step", type=float, default=0.30)
     ap.add_argument("--pnp_k", type=int, default=1)          # data-prox <-> denoise alternations
+    ap.add_argument("--dc_views", type=int, default=0,
+                    help="random views per data-prox gradient; 0 = all views (exact, default)")
+    ap.add_argument("--metric_every", type=int, default=1,
+                    help="run aligned_metrics + montage every k steps (the last step always)")
     ap.add_argument("--est_n_samples", type=int, default=384)
     ap.add_argument("--context", default="auto", choices=["auto", "global", "none"],
                     help="auto reads in_ch off the checkpoint's in_conv weight")
@@ -150,8 +168,42 @@ def main():
 
     ck = torch.load(args.ckpt, map_location=dev, weights_only=False)
     ca = ck["args"]
-    cfg = ConeBeam3DConfig(det_bin=2, n_views=ca["views"])
-    gen = AAPMSlabGenerator(args.data, cfg, device=dev, slab=ca["slab"], in_plane=ca["in_plane"])
+
+    # ---- rebuild the EXACT world the prior was trained in. The dataset choice, geometry and
+    # grid all come off the checkpoint, not off this script's defaults: a CQ500 prior fed AAPM
+    # slabs under the non-Thies geometry loads without error and is silently out of distribution.
+    ds = ca.get("dataset")
+    if ds is None:
+        if "shape" in ca or "root" in ca:
+            raise SystemExit("checkpoint has no 'dataset' key but carries CQ500-style args "
+                             "(shape/root) -- refusing to guess which generator it trained on")
+        ds = "aapm"        # checkpoints predating --dataset could only be AAPM slab runs
+    if ds == "cq500":
+        cfg = ConeBeam3DConfig.thies(n_views=ca["views"])            # the trainer's geometry
+        root = args.root or ca.get("root")
+        if not root or not os.path.isdir(root):
+            raise SystemExit(f"CQ500 root {root!r} not found -- pass --root")
+        gen = CQ500Generator(root, cfg, device=dev, split=args.split,
+                             shape=tuple(ca["shape"]), voxel_mm=1.0,
+                             fbp_scale=ck.get("fbp_scale"))
+    elif ds == "aapm":
+        cfg = ConeBeam3DConfig(det_bin=2, n_views=ca["views"])
+        gen = AAPMSlabGenerator(args.data, cfg, device=dev, slab=ca["slab"],
+                                in_plane=ca["in_plane"])
+    else:
+        raise SystemExit(f"unknown dataset {ds!r} in checkpoint")
+    # The trainer's calibrated FBP scale, so this run's operator normalization is the one the
+    # prior saw. The cq500 path injects it via the constructor (skips recalibration); the aapm
+    # path recalibrates in __init__, so overwrite BEFORE any projection/FDK below.
+    if ck.get("fbp_scale") is not None:
+        if gen.fbp_scale != float(ck["fbp_scale"]):
+            print(f"fbp_scale: checkpoint {ck['fbp_scale']:.5g} (generator recalibrated "
+                  f"{gen.fbp_scale:.5g}, discarded)")
+            gen.fbp_scale = float(ck["fbp_scale"])
+        else:
+            print(f"fbp_scale: {gen.fbp_scale:.5g} (from the checkpoint)")
+    print(f"dataset {ds}: grid {gen.shape} @ ({gen.dz:g},{gen.dy:g},{gen.dx:g}) mm | "
+          f"{cfg.n_views} views | anchor={ca.get('anchor', '?')}")
 
     # in_ch comes off the WEIGHTS, not off ca["context"] -- the checkpoint's args are what the
     # run was launched with, the weights are what it actually trained. A mismatch here is a
@@ -176,16 +228,21 @@ def main():
     meas = measured_region_mask(gen.shape, spacing, cfg, device=dev)
 
     # ---- simulate a motion-corrupted scan
-    gt = gen.volume(args.run, args.z0)                                   # (1,1,D,H,W) mu
+    if ds == "cq500":
+        gt = gen.volume(args.run)                                        # (1,1,D,H,W) mu
+    else:
+        gt = gen.volume(args.run, args.z0)
     theta_true = make_motion(args.motion_kind, cfg.n_views, device=dev, seed=args.seed)
     with torch.no_grad():
         y = gen.project(gt, params_to_Pmot(theta_true, gen.P_nom)[None])
     gt3 = gt[0, 0]
 
-    est = make_estimator(
-        args.estimator, cfg, gen.P_nom, gen.u_coords, gen.v_coords, dev,
-        dx=gen.dx, dy=gen.dy, dz=gen.dz, loss=args.loss, lncc_win=args.lncc_win,
-        n_samples=args.est_n_samples, views_per_iter=args.views_per_iter, lr=args.lr)
+    est_kw = dict(dx=gen.dx, dy=gen.dy, dz=gen.dz, loss=args.loss, lncc_win=args.lncc_win,
+                  n_samples=args.est_n_samples, views_per_iter=args.views_per_iter)
+    if args.lr is not None:                    # None = keep each estimator's own default lr
+        est_kw["lr"] = args.lr
+    est = make_estimator(args.estimator, cfg, gen.P_nom, gen.u_coords, gen.v_coords, dev,
+                         **est_kw)
 
     with torch.no_grad():
         x = gen.fdk(y, gen.P_nom[None])[0]                               # cold start: uncorrected
@@ -195,6 +252,7 @@ def main():
           aligned_metrics(x, gt3, spacing, mask=meas, iters=200).items()}))
 
     hist = []
+    gauge_th = None                                              # warm-start for the gauge fit
     gtile = torch.Generator(device=dev).manual_seed(args.seed)   # reproducible tile jitter
     N = args.n_steps
     for k in range(N):
@@ -214,28 +272,38 @@ def main():
         a = args.alpha * ((1 - t) ** args.alpha_p if args.alpha_p > 0 else 1.0)
         z = x_prior
         for _ in range(args.pnp_k):
-            g = data_grad(z, theta, y[0], gen)
+            dc_v = None
+            if 0 < args.dc_views < cfg.n_views:
+                dc_v = torch.randperm(cfg.n_views, device=dev)[:args.dc_views]
+            g = data_grad(z, theta, y[0], gen, views=dc_v)
             z = z - a * z.norm() * g / g.norm().clamp_min(1e-12)
             z = z + args.kappa * (sidky_dtv_denoise_3d(
                 z[None, None], args.tv_iters, args.tv_step)[0, 0] - z)
         x = z.detach()
 
-        with torch.no_grad():
-            x_fdk = gen.fdk(y, params_to_Pmot(theta, gen.P_nom)[None])[0]
-        m = aligned_metrics(x_fdk, gt3, spacing, mask=meas, iters=150)
-        me = motion_error(theta, theta_true)
-        hist.append({"step": k, "t": t, "loss": loss, **m, **me})
-        print(f"step {k:3d} t={t:.2f} | fit {loss:.5f} | FBP aligned "
-              f"{m['psnr_aligned']:5.2f} dB / SSIM {m['ssim_aligned']:.3f} "
-              f"(raw {m['psnr_raw']:5.2f}) | theta rot {me['rot_rmse_deg']:.2f} deg, "
-              f"trans(gauge-fit) {me['trans_rmse_mm']:.2f} mm", flush=True)
-        montage(os.path.join(args.out, f"step{k:03d}.png"), gt3, x_fdk, x, k, t,
-                f"aligned {m['psnr_aligned']:.2f} dB / SSIM {m['ssim_aligned']:.3f}")
+        if k % max(args.metric_every, 1) == 0 or k == N - 1:
+            with torch.no_grad():
+                x_fdk = gen.fdk(y, params_to_Pmot(theta, gen.P_nom)[None])[0]
+            # warm-start the gauge fit from the last step's theta: the gauge moves slowly
+            m, gauge_th = aligned_metrics(x_fdk, gt3, spacing, mask=meas, iters=150,
+                                          init=gauge_th, return_theta=True)
+            me = motion_error(theta, theta_true, cfg=cfg)   # cfg -> beam-frame split
+            hist.append({"step": k, "t": t, "loss": loss, **m, **me})
+            print(f"step {k:3d} t={t:.2f} | fit {loss:.5f} | FBP aligned "
+                  f"{m['psnr_aligned']:5.2f} dB / SSIM {m['ssim_aligned']:.3f} "
+                  f"(raw {m['psnr_raw']:5.2f}) | theta rot {me['rot_rmse_deg']:.2f} deg, "
+                  f"trans_obs {me['trans_obs_mm']:.2f} mm "
+                  f"(depth {me['trans_depth_mm']:.2f}, gauge-fit {me['trans_rmse_mm']:.2f})",
+                  flush=True)
+            montage(os.path.join(args.out, f"step{k:03d}.png"), gt3, x_fdk, x, k, t,
+                    f"aligned {m['psnr_aligned']:.2f} dB / SSIM {m['ssim_aligned']:.3f}")
+        else:
+            print(f"step {k:3d} t={t:.2f} | fit {loss:.5f}", flush=True)
 
     with torch.no_grad():
         theta = est.current_params()
         x_final = gen.fdk(y, params_to_Pmot(theta, gen.P_nom)[None])[0]     # output = FDK(theta)
-    fm = aligned_metrics(x_final, gt3, spacing, mask=meas, iters=300)
+    fm = aligned_metrics(x_final, gt3, spacing, mask=meas, iters=300, init=gauge_th)
     print("\nFINAL " + json.dumps({k: round(v, 4) for k, v in fm.items()}))
     torch.save({"theta": theta.cpu(), "theta_true": theta_true.cpu(), "hist": hist,
                 "final": fm}, os.path.join(args.out, "result.pt"))

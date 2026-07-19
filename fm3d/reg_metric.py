@@ -49,26 +49,40 @@ def _affine_from_theta(theta: torch.Tensor, shape, spacing) -> torch.Tensor:
 
 
 def rigid_align(src: torch.Tensor, ref: torch.Tensor, spacing, *, iters: int = 300,
-                lr: float = 0.02, mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+                lr: float = 0.02, mask: torch.Tensor | None = None,
+                init: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Fit the 6-DoF pose that best maps `src` onto `ref`. -> (aligned src, theta).
 
     Objective is masked NCC, not L2: the two volumes may differ in overall brightness (the whole
-    reason `l2si` exists upstream) and the alignment must not chase that.
+    reason `l2si` exists upstream) and the alignment must not chase that. With a mask, the means
+    and norms are taken over the MASKED voxels only -- not over a zero-padded volume, whose
+    identical zeros outside the mask would dilute the correlation.
+
+    `init` warm-starts theta (e.g. the previous posterior step's gauge, which moves slowly);
+    None keeps the cold start at the identity.
     """
     D, H, W = src.shape
-    th = torch.zeros(6, device=src.device, requires_grad=True)
+    th = (torch.zeros(6, device=src.device) if init is None
+          else init.detach().to(device=src.device, dtype=torch.float32).clone())
+    th.requires_grad_(True)
     opt = torch.optim.Adam([th], lr=lr)
     r = ref[None, None]
-    m = None if mask is None else mask[None, None].float()
+    if mask is not None:
+        rm = ref[mask]
+        rm = rm - rm.mean()                                   # constant in theta: hoisted
 
     for _ in range(iters):
         opt.zero_grad(set_to_none=True)
         M = _affine_from_theta(th, (D, H, W), spacing)
         grid = F.affine_grid(M, (1, 1, D, H, W), align_corners=False)
         w = F.grid_sample(src[None, None], grid, align_corners=False, padding_mode="zeros")
-        a, b = (w, r) if m is None else (w * m, r * m)
-        a = a - a.mean()
-        b = b - b.mean()
+        if mask is None:
+            a = w - w.mean()
+            b = r - r.mean()
+        else:
+            a = w[0, 0][mask]
+            a = a - a.mean()
+            b = rm
         loss = 1.0 - (a * b).sum() / (a.norm() * b.norm()).clamp_min(1e-12)
         loss.backward()
         opt.step()
@@ -88,8 +102,13 @@ def psnr(a, b, mask=None, peak=None):
     return float(10 * torch.log10(peak ** 2 / mse))
 
 
-def ssim(a: torch.Tensor, b: torch.Tensor, *, data_range: float, win: int = 7) -> float:
-    """3D SSIM with a uniform window (self-contained; no skimage)."""
+def ssim(a: torch.Tensor, b: torch.Tensor, *, data_range: float, win: int = 7,
+         mask: torch.Tensor | None = None) -> float:
+    """3D SSIM with a uniform window (self-contained; no skimage).
+
+    `mask` averages the SSIM map over the masked voxels only -- on a cone-beam grid part of the
+    box is physically unmeasured, and a headline SSIM must not score arbitrary content there.
+    """
     C1, C2 = (0.01 * data_range) ** 2, (0.03 * data_range) ** 2
     x, y = a[None, None], b[None, None]
     k, p = win, win // 2
@@ -100,26 +119,35 @@ def ssim(a: torch.Tensor, b: torch.Tensor, *, data_range: float, win: int = 7) -
     xy = F.avg_pool3d(x * y, k, 1, p, count_include_pad=False) - mu_x * mu_y
     s = ((2 * mu_x * mu_y + C1) * (2 * xy + C2)) / \
         ((mu_x ** 2 + mu_y ** 2 + C1) * (xx + yy + C2))
+    if mask is not None:
+        return float(s[0, 0][mask].mean())
     return float(s.mean())
 
 
 def aligned_metrics(recon: torch.Tensor, gt: torch.Tensor, spacing, *,
-                    mask: torch.Tensor | None = None, iters: int = 300) -> dict:
+                    mask: torch.Tensor | None = None, iters: int = 300,
+                    init: torch.Tensor | None = None, return_theta: bool = False):
     """THE headline metric. Rigidly align `recon` to `gt`, then score. See the module docstring.
 
     Both the raw and the aligned numbers are returned, deliberately: the gap between them IS the
     gauge, and watching it is how you tell a genuinely bad reconstruction from a well-reconstructed
     one sitting at the wrong pose.
+
+    `init` warm-starts the alignment (see `rigid_align`); `return_theta=True` additionally
+    returns the fitted gauge theta, so a caller evaluating a slowly-moving reconstruction can
+    chain the warm starts.
     """
     peak = float(gt[mask].max()) if mask is not None else float(gt.max())
     dr = peak
     out = {
         "psnr_raw": psnr(recon, gt, mask, peak),
-        "ssim_raw": ssim(recon, gt, data_range=dr),
+        "ssim_raw": ssim(recon, gt, data_range=dr, mask=mask),
     }
-    al, th = rigid_align(recon, gt, spacing, mask=mask, iters=iters)
+    al, th = rigid_align(recon, gt, spacing, mask=mask, iters=iters, init=init)
     out["psnr_aligned"] = psnr(al, gt, mask, peak)
-    out["ssim_aligned"] = ssim(al, gt, data_range=dr)
+    out["ssim_aligned"] = ssim(al, gt, data_range=dr, mask=mask)
     out["gauge_shift_mm"] = float(th[:3].norm())
     out["gauge_rot_deg"] = float(torch.rad2deg(th[3:].norm()))
+    if return_theta:
+        return out, th
     return out

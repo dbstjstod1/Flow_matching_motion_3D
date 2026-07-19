@@ -155,8 +155,26 @@ def main():
         thick = [r for r in recs if r["thickness_mm"] > 4.0]
         check(2, "index_cq500 round-trips thickness through real DICOM",
               len(thin) == 9 and len(thick) == 8, f"{len(thin)} thin, {len(thick)} thick series")
-        check(2, "index is cached (2nd call reads JSON)",
-              os.path.exists(os.path.join(root, "_cq500_index.json")))
+        # The cache claim, tested for real: monkeypatch the module's os.walk so any re-scan is
+        # observable, re-call, and demand (a) zero walks and (b) records identical to the scan's.
+        # Merely checking the JSON exists would pass even if the 2nd call ignored it.
+        import fm3d.dataset_cq500 as _dsq
+        walks = {"n": 0}
+        _orig_walk = _dsq.os.walk
+
+        def _counting_walk(*a, **k):
+            walks["n"] += 1
+            return _orig_walk(*a, **k)
+
+        _dsq.os.walk = _counting_walk
+        try:
+            recs2 = index_cq500(root, verbose=False)
+        finally:
+            _dsq.os.walk = _orig_walk
+        check(2, "index is cached (2nd call reads JSON, no re-scan)",
+              os.path.exists(os.path.join(root, "_cq500_index.json"))
+              and walks["n"] == 0 and recs2 == recs,
+              f"walk calls: {walks['n']}, records equal: {recs2 == recs}")
 
         sel = select_series(recs, thin_mm=0.7, count_tol=0.5, min_slices=16)
         pats = [r["patient"] for r in sel]

@@ -35,9 +35,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fm3d.filters import calibrate_scale
 from fm3d.geometry_3d import (ConeBeam3DConfig, build_conebeam_orbit, detector_coords_3d,
-                              measured_region_mask, view_angular_weights)
+                              measured_region_mask, view_angular_weights,
+                              view_angular_weights_dot)
 from fm3d.phantom import head_phantom
-from fm3d.projector_3d import fdk_conebeam_3d_batched, forward_project_3d_batched
+from fm3d.projector_3d import (fdk_conebeam_3d_batched, fdk_conebeam_3d_tangent,
+                               forward_project_3d_batched)
 from fm3d.rigid_motion import akima_motion, params_to_Pmot
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -53,7 +55,9 @@ def check(i, name, ok, detail=""):
 
 
 class Gen:
-    """The minimum `bridge_pair` needs: P_nom, fdk, to_net -- on a phantom, with no dataset."""
+    """The minimum `bridge_pair` needs -- on a phantom, with no dataset. Since bridge_pair's
+    default is mode="analytic", that minimum includes `fdk_tangent` and `to_net_tangent`,
+    mirroring `CQ500Generator` (same Voronoi weight + weight-derivative plumbing)."""
 
     def __init__(self, dev):
         self.V = 360
@@ -72,6 +76,17 @@ class Gen:
 
     def to_net(self, mu):
         return 2.0 * (mu - self.mu_lo) / (self.mu_hi - self.mu_lo) - 1.0
+
+    def to_net_tangent(self, dmu):
+        """to_net is affine, so a DERIVATIVE maps with the gain only (no -1 shift)."""
+        return 2.0 * dmu / (self.mu_hi - self.mu_lo)
+
+    def fdk_tangent(self, y, P, Pdot):
+        vw, vwd = view_angular_weights_dot(P, Pdot)
+        return fdk_conebeam_3d_tangent(
+            y, P, Pdot, self.uc, self.vc, self.cfg, D=self.shape[0], H=self.shape[1],
+            W=self.shape[2], dx=self.dx, dy=self.dy, dz=self.dz, scale=self.fbp_scale,
+            view_chunk=8, view_weight=vw, view_weight_dot=vwd)
 
     def project(self, v, P):
         return forward_project_3d_batched(v, P, self.uc, self.vc, dx=self.dx, dy=self.dy,
@@ -132,18 +147,37 @@ def main():
     e = float((d_anc - d_bare - dlt).abs().max())
     check(3, "dx_anchored - dx_bare == Delta (exactly)", e < 1e-5, f"max|d| {e:.1e}")
 
-    # And the finite difference reproduces it AT THE SAME STEP the velocity is defined with
-    # (delta = 0.02). Comparing against a COARSER step would fail, and legitimately so: the
-    # geometry bridge is genuinely CURVED (cos 0.987 / 17% rel at h = 0.05), which is exactly why
-    # the prior regresses the true tangent instead of the secant x1 - x0.
+    # mode="fd" is the escape hatch / the gate's counterparty: ITS velocity is literally the
+    # central difference of the anchored path at its defining step (delta = 0.02), so a manual
+    # FD of the fd-mode path must reproduce it exactly. This is the old exactness claim, kept
+    # where it is still true -- it asserts the anchor bookkeeping (+t*Delta in x, +Delta in dx)
+    # is consistent inside the fd path.
     h = 0.02
     with torch.no_grad():
-        xa, _ = bridge_pair(g, T(0.5 - h), y, th, dlt)
-        xb, _ = bridge_pair(g, T(0.5 + h), y, th, dlt)
+        xa, _ = bridge_pair(g, T(0.5 - h), y, th, dlt, mode="fd")
+        xb, _ = bridge_pair(g, T(0.5 + h), y, th, dlt, mode="fd")
+        _, d_fd = bridge_pair(g, T(0.5), y, th, dlt, mode="fd")
     fd = (xb - xa) / (2 * h)
-    rel = float((fd - d_anc).norm() / fd.norm())
-    check(3, "... and matches the FD at the step it is defined with", rel < 1e-3,
+    rel = float((fd - d_fd).norm() / fd.norm())
+    check(3, "... and the fd-mode velocity IS the FD of the anchored path", rel < 1e-3,
           f"rel {rel:.1e} at h={h}")
+
+    # The ANALYTIC velocity (the default the trainer uses) must NOT match FD(0.02) to 1e-3 --
+    # the bilinear interpolant is C0, so the coarse FD carries O(h) kink error at cell-crossing
+    # voxels: measured ~1.8e-2 rel rms (scripts/gate_fdk_tangent.py T3b/T5; its full-scale T6
+    # gates the same comparison at 5e-2). So consistency, at the tolerance the FD deserves, and
+    # in the SAME metric those numbers are quoted in: rms normalized by max|ref| (a tangent
+    # field is edge-concentrated, max/rms ~ 14 here, so an rms/rms ratio reads ~14x larger --
+    # measured 1.1e-2 vs 1.6e-1 on this very phantom). A semantic error (wrong dP, dropped
+    # weight derivative) shows at O(1e-1..1) here and still fails loudly. Delta is common to
+    # both velocities and cancels in the numerator.
+    d = d_anc - d_fd
+    rel = float(d.pow(2).mean().sqrt() / d_fd.abs().amax().clamp_min(1e-30))
+    cosv = float((d_anc * d_fd).sum() / (d_anc.norm() * d_fd.norm()))
+    check(3, "... and the ANALYTIC velocity is FD-consistent (kink-limited)",
+          rel < 5e-2 and cosv > 0.98,
+          f"rel rms/max {rel:.1e} vs fd(h={h}), cos {cosv:.4f} -- "
+          f"exact-vs-FD floor is ~1.8e-2, not 0")
 
     # ---- [4] anchor=none restores the bare bridge bit-for-bit ---------------------------
     with torch.no_grad():
