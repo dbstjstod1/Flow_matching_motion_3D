@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import math
 import os
 import sys
 import time
@@ -159,6 +160,11 @@ def main():
                     help="global = the arXiv:2512.18161 conditioning (in_ch=5); "
                          "none = the bare-patch prior (in_ch=1)")
     ap.add_argument("--lr", type=float, default=1e-4)          # the 2D sibling's vanilla-FM lr
+    ap.add_argument("--lr_final", type=float, default=None,
+                    help="if set, COSINE-decay the lr from --lr (at it=0) to this value "
+                         "(at it=--iters). Default None = constant lr (the historical behavior, "
+                         "bit-identical). The schedule is a pure closed-form function of `it`, so "
+                         "--resume needs no scheduler state -- it just continues the same curve.")
     ap.add_argument("--ema", type=float, default=0.999)
     ap.add_argument("--amp", action="store_true", default=True,
                     help="fp16 AMP, like the 2D sibling. --no-amp for fp32.")
@@ -275,6 +281,15 @@ def main():
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95))
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
+
+    # Cosine LR as a PURE function of `it` (no scheduler object => nothing to save/restore, so
+    # --resume from an older ckpt that predates the schedule just picks the curve back up).
+    # lr_final=None reproduces the constant-lr path exactly (returns args.lr, never touches opt).
+    def lr_at(it):
+        if args.lr_final is None:
+            return args.lr
+        prog = min(it, args.iters) / max(args.iters, 1)
+        return args.lr_final + 0.5 * (args.lr - args.lr_final) * (1 + math.cos(math.pi * prog))
 
     # ---- RESUME ---------------------------------------------------------------------------
     # Continue a finished/killed run: restore model + EMA + OPTIMIZER STATE + the loss history,
@@ -428,6 +443,10 @@ def main():
         pending.clear()
 
     for it in range(start_it + 1, args.iters + 1):
+        if args.lr_final is not None:
+            for g in opt.param_groups:
+                g["lr"] = lr_at(it)
+
         if it % args.refresh == 0:
             cache[torch.randint(len(cache), (1,)).item()] = draw()
 
@@ -472,11 +491,14 @@ def main():
             ma = sum(recent) / len(recent)
             # rate over THIS process's steps, not `it` -- after a resume `it` starts high and
             # dividing by it would report a nonsense s/it
-            print(f"it {it:6d} | loss {loss_log[-1][1]:.5f} | ma50 {ma:.5f} | "
+            lr_now = opt.param_groups[0]["lr"]
+            lr_str = f" | lr {lr_now:.2e}" if args.lr_final is not None else ""
+            print(f"it {it:6d} | loss {loss_log[-1][1]:.5f} | ma50 {ma:.5f}{lr_str} | "
                   f"{(time.time() - t0) / max(it - start_it, 1):.2f}s/it", flush=True)
             if writer is not None:
                 writer.add_scalar("train/fm_loss", loss_log[-1][1], it)
                 writer.add_scalar("train/fm_loss_ma50", ma, it)
+                writer.add_scalar("train/lr", lr_now, it)
 
         if val_gen is not None and it % args.val_every == 0:
             # PRIOR-ONLY ODE from the cold start on the val split -- what the loss cannot tell us.
