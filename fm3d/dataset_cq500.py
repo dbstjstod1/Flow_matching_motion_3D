@@ -259,7 +259,9 @@ class CQ500Generator:
         self.sim_shape_dhw = tuple(
             int(math.ceil(n * d / self.sim_voxel_mm - 1e-9))
             for n, d in zip(self.shape_dhw, (self.dz, self.dy, self.dx)))
-        self._fine_cache: tuple[int, np.ndarray] | None = None
+        self._fine_cache: tuple[int, torch.Tensor] | None = None  # (key, PINNED fp32 hu)
+        self._fine_futures: dict[int, object] = {}  # key -> Future -- see `prefetch_fine`
+        self._fine_pool = None     # lazy 1-thread executor backing `prefetch_fine`
         if verbose and self.sim_native:
             print(f"[cq500] simulation grid: {'x'.join(map(str, self.sim_shape_dhw))} @ "
                   f"{self.sim_voxel_mm:.5f} mm (native = du*SOD/SDD) | "
@@ -346,25 +348,72 @@ class CQ500Generator:
         vol = sitk.GetArrayFromImage(rs.Execute(img)).astype(np.float32)   # (z, y, x) = (D,H,W)
         return _centre_fit(vol, shp, pad_value=-1000.0)
 
+    def _fine_load_pinned(self, key: int) -> torch.Tensor:
+        """The CPU side of `volume_fine`: load + resample + clip, returned PAGE-LOCKED.
+
+        This is what `prefetch_fine` runs on its worker thread. Pinning here (a host memcpy)
+        rather than in `volume_fine` keeps the training thread's cost to one async DMA; every
+        stage releases the GIL (npz IO, the sitk resample, the pin memcpy), so the worker
+        genuinely overlaps with the training step."""
+        hu = self._load_hu(self.records[key], voxel_mm=self.sim_voxel_mm,
+                           shape_dhw=self.sim_shape_dhw)
+        if self.clip:                                      # idempotent, so do it once per load
+            np.clip(hu, self.hu_lo, self.hu_hi, out=hu)
+        return torch.from_numpy(hu).pin_memory()
+
+    def prefetch_fine(self, idx: int) -> None:
+        """Start loading patient `idx`'s native-grid volume on a background thread.
+
+        WHY: the trainer refreshes one bridge draw every `--refresh` steps, and with 150 train
+        patients the 1-entry fine cache below misses essentially every time. The synchronous
+        cost was measured at ~1 s per draw (0.19 s npz+f32, 0.48 s sitk resample, ~0.2 s
+        pageable H2D) -- a 0% GPU dip every 6 s of wall clock, ~15% of the whole run. The
+        trainer samples the NEXT draw's patient one draw ahead and calls this, so the load
+        rides under the 12 training steps in between. No-op when the volume is already cached,
+        already in flight, or `sim_native` is off (nothing fine to load).
+
+        Futures live in a DICT keyed by patient, not a single slot: the trainer prefetches
+        draw k+1's patient at the START of draw k, i.e. BEFORE draw k consumes its own
+        prefetch -- a single slot gets overwritten right there and every join degrades to an
+        inline load (the first deployment shipped that bug; the draw profiler caught it as a
+        constant ~1.5 s inside sim_y). Entries are popped on use, so the dict only ever holds
+        what is in flight (a resume can strand one entry; it is still a valid load and gets
+        consumed whenever that patient comes up again)."""
+        if not self.sim_native:
+            return
+        key = int(idx) % len(self.records)
+        if self._fine_cache is not None and self._fine_cache[0] == key:
+            return
+        if key in self._fine_futures:
+            return
+        if self._fine_pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self._fine_pool = ThreadPoolExecutor(max_workers=1)
+        self._fine_futures[key] = self._fine_pool.submit(self._fine_load_pinned, key)
+
     def volume_fine(self, idx: int = 0) -> torch.Tensor:
         """(1,1,Ds,Hs,Ws) mu volume of patient `idx` on the NATIVE SIMULATION grid.
 
         This is the object that gets forward-projected to make y (see `simulate`); the coarse
         `volume(idx)` remains the reconstruction target and the metric's ground truth. Not
         disk-cached on purpose -- see the simulation-grid note in `__init__` -- but the last
-        volume is kept in RAM, which is what makes a first visit to a patient (y under motion
-        AND the static anchor's y0) cost one resample instead of two."""
+        volume is kept in RAM (pinned), which is what makes a first visit to a patient (y under
+        motion AND the static anchor's y0) cost one resample instead of two. If `prefetch_fine`
+        was called for this patient, the load has been running on the worker thread and this
+        only joins it."""
         key = int(idx) % len(self.records)
         if self._fine_cache is not None and self._fine_cache[0] == key:
             hu = self._fine_cache[1]
         else:
-            hu = self._load_hu(self.records[key], voxel_mm=self.sim_voxel_mm,
-                               shape_dhw=self.sim_shape_dhw)
-            if self.clip:                                  # idempotent, so do it once per load
-                np.clip(hu, self.hu_lo, self.hu_hi, out=hu)
+            fut = self._fine_futures.pop(key, None)
+            if fut is not None:
+                hu = fut.result()
+            else:                                          # cold / mispredicted: load inline
+                hu = self._fine_load_pinned(key)
             self._fine_cache = (key, hu)
         # HU -> mu ON THE GPU: at 612^3 the same arithmetic on the host costs ~0.5 s per draw.
-        v = torch.from_numpy(hu)[None, None].to(self.device, non_blocking=True)
+        # `hu` is pinned, so this H2D is a true async DMA, not a pageable sync copy.
+        v = hu[None, None].to(self.device, non_blocking=True)
         return (v / 1000.0 + 1.0) * self.mu_water
 
     @torch.no_grad()

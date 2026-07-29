@@ -397,6 +397,10 @@ def main():
           f"{mot_rot:g} deg  |  val=fixed {args.trans_mm:g} mm / {args.rot_deg:g} deg"
           f"   [Thies: train max 10/15, eval 5/5]")
 
+    next_idx = [None]        # the NEXT cq500 patient, sampled one draw ahead so `prefetch_fine`
+                             # can load its native-grid volume under the training steps
+    prof_draw = os.environ.get("FM3D_DRAW_PROF", "0") != "0"   # per-stage draw timing to stdout
+
     def draw():
         """One bridge sample, held whole-volume: (x_t (1,1,D,H,W), dx (D,H,W), t, ctx).
 
@@ -412,15 +416,37 @@ def main():
         steps. To reach the memo we sample the volume INDEX ourselves here (cq500's `volume(idx)`
         is a clean per-patient lookup); aapm slabs have no such stable key, so they keep the old
         inline path via `sample_motion`."""
+        _tm: dict[str, float] = {}
+        _tk = [time.time()]
+
+        def _tick(name):                       # FM3D_DRAW_PROF=1: wall time per draw stage
+            if prof_draw:
+                torch.cuda.synchronize()
+                now = time.time(); _tm[name] = now - _tk[0]; _tk[0] = now
+
         idx = None
         if args.dataset == "cq500":
-            idx = int(torch.randint(gen.n_slabs, (1,)).item())
+            # The patient for THIS draw was sampled by the PREVIOUS draw (and its native-grid
+            # volume has been prefetching on a worker thread ever since -- see
+            # `CQ500Generator.prefetch_fine` for the measured stall this hides). Sample the
+            # NEXT draw's patient now and start its load. This shifts the global RNG stream by
+            # one randint vs the pre-prefetch code (and a resume re-samples `next_idx[0]`, so
+            # the first draw after a resume differs from the uninterrupted stream) -- both only
+            # reshuffle which random patient is drawn when, never what a draw contains.
+            idx = next_idx[0] if next_idx[0] is not None \
+                else int(torch.randint(gen.n_slabs, (1,)).item())
+            next_idx[0] = int(torch.randint(gen.n_slabs, (1,)).item())
+            gen.prefetch_fine(next_idx[0])
+            _tick("rng")
             vol = gen.volume(idx)
+            _tick("vol")
             th = random_motion(gen.cfg.n_views, trans_mm=mot_trans, rot_deg=mot_rot,
                                amp_mode=args.motion_amp, device=dev, generator=motion_gen)[None]
+            _tick("motion")
             # y is simulated on the NATIVE grid (`gen.simulate`, see the simulation-grid note in
             # dataset_cq500.__init__); `vol` above is the coarse inversion-grid target/anchor.
             y = gen.simulate(idx, params_to_Pmot(th[0], gen.P_nom)[None])
+            _tick("sim_y")
         else:
             y, th, vol = gen.sample_motion(1, trans_mm=mot_trans, rot_deg=mot_rot,
                                            amp_mode=args.motion_amp, generator=motion_gen)
@@ -440,12 +466,19 @@ def main():
             else:                             # "static", aapm: compute inline (no stable key)
                 y0 = gen.project(vol, gen.P_nom[None])
                 x_anchor = gen.to_net(gen.fdk(y0, gen.P_nom[None])[0])
+            _tick("anchor")
             x1_geo = gen.to_net(gen.fdk(y, params_to_Pmot(th[0], gen.P_nom)[None])[0])
             dlt = x_anchor - x1_geo
+            _tick("x1_fdk")
         t = sample_t(1, dev)[0]
         x_t, dx = bridge_pair(gen, t, y, th[0], dlt, mode=args.tangent)
+        _tick("bridge")
         x_t = x_t[None, None]                                        # (1,1,D,H,W)
         ctx = volume_context(x_t, (p, p, p)) if in_ch == 5 else None
+        _tick("ctx")
+        if prof_draw:
+            print("[draw]", " ".join(f"{k} {v:.3f}" for k, v in _tm.items()),
+                  f"| total {sum(_tm.values()):.3f}", flush=True)
         return x_t, dx, t, ctx
 
     cache = [draw() for _ in range(args.cache)]
