@@ -6,10 +6,17 @@ module for the model, the measured agreement, the VD-vs-SF adjoint choice and th
 traps. There is no backend switch and no environment variable: one operator, one path.
 
 WHAT STAYS OURS, AND WHY:
-  * THE FDK, below. LEAP's `fbp` reproduces our static reconstruction to 5e-3 but has no
-    equivalent of `disp` (the motion-compensated backprojection coordinates), the Voronoi
-    per-view angular weight read out of `Pmat`, the Wang half-fan weight, or the Ohnesorge
-    padding -- and those are the whole reason this FDK exists.
+  * THE FDK **ALGORITHM**, below -- cosine/Wang/Ohnesorge pre-weights, our ramp windows, the
+    Voronoi per-view angular weight read out of `Pmat`, per-view rigid-motion geometry. LEAP's
+    own `fbp` has none of those and REFUSES tilted modular panels ("FBP only implemented for
+    modular geometries whose rowVectors are aligned with the z-axis"), which is precisely the
+    motion-compensated case. Since 2026-07-30 the backprojection OPERATOR under the algorithm
+    is LEAP's modular VD backprojector (`leap_projector.leap_fdk_backproject`, which folds
+    LEAP's geometric ray weight back to our exact 1/w^2 convention; parity vs the retired
+    fused kernel 3.1e-3 / ls-scale 1.000000, and faster). FM3D_FDK_LEAP=0 forces the torch
+    reference loop. The bridge's analytic s-TANGENT stays on our fused kernel
+    (`triton_backproject.backproject_tangent`) -- LEAP has no tangent -- while the tangent
+    path's VALUE also comes from LEAP, keeping x(1) consistent with the static anchor.
   * `d(loss)/dP`. LEAP has no geometry derivative at all (`leaptorch`'s backward returns the
     volume gradient and `None` for everything else), so the motion estimator could never run
     on it. `LEAPProject` takes its value and its volume gradient from LEAP and its geometry
@@ -39,6 +46,7 @@ FM prior's volume-size problem is the OTHER half and is solved by 3D patches (pr
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn.functional as F
@@ -721,18 +729,23 @@ def fdk_conebeam_3d_batched(
     half_v = 0.5 * nv * dv
     Npix = D * H * W
 
-    # 3) distance-weighted backprojection.
+    # 3) distance-weighted backprojection -- THROUGH LEAP's modular VD backprojector
+    # (2026-07-30, user decision: the FDK ALGORITHM -- cosine/Wang/Ohnesorge/ramp/Voronoi,
+    # per-view motion Pmat -- is ours; the OPERATOR under it is LEAP's, like every other
+    # A/A^T in the repo). `leap_fdk_backproject` folds LEAP's geometric ray weight back to
+    # our exact 1/w^2 convention (its docstring has the algebra; parity vs the retired
+    # fused kernel 3.1e-3 rel / corr 0.999995 / ls-scale 1.000000, and it is FASTER).
+    # NOTE: LEAP's own `fbp` cannot do this job -- it refuses modular geometries whose
+    # panels tilt past axial alignment, which is precisely the motion-compensated case.
     needs_grad = torch.is_grad_enabled() and (g.requires_grad or Pmat.requires_grad)
-    if disp is None and not needs_grad and triton_backproject.enabled() and g.is_cuda:
-        # Fused Triton kernel (triton_backproject.py, ported from Flowmatching-4DCT: 24x
-        # measured there). Covers every rigid-motion FDK -- our motion enters through Pmat,
-        # never `disp`. NOT bit-identical to the torch loop (float reassociation only:
-        # per-voxel sequential view sum, and no grid_sample [-1,1] round-trip); agreement
-        # is gated by scripts/gate_fdk_fast.py. FM3D_FDK_TRITON=0 forces the torch path.
-        recon = triton_backproject.backproject_static(
-            g, Pmat, D, H, W, dx=dx, dy=dy, dz=dz, du=du, dv=dv,
-            u0=u0, v_off=v_off, half_u=half_u, half_v=half_v, eps=eps).view(B, Npix)
+    if disp is None and not needs_grad and g.is_cuda \
+            and os.environ.get("FM3D_FDK_LEAP", "1") != "0":
+        from .leap_projector import leap_fdk_backproject
+        recon = leap_fdk_backproject(
+            g, Pmat, D=D, H=H, W=W, dx=dx, dy=dy, dz=dz, du=du, dv=dv,
+            u0=u0, v_off=v_off).view(B, Npix)
     else:
+        # torch loop: the differentiable / disp / CPU / FM3D_FDK_LEAP=0 reference path.
         recon = _backproject_static_torch(
             g, Pmat, disp, D=D, H=H, W=W, dx=dx, dy=dy, dz=dz, du=du, dv=dv,
             u0=u0, v_off=v_off, half_u=half_u, half_v=half_v, eps=eps,
@@ -1000,9 +1013,20 @@ def fdk_conebeam_3d_tangent(
         g.requires_grad or Pmat.requires_grad or Pdot.requires_grad
         or wgt.requires_grad or dwgt.requires_grad)
     if not needs_grad and triton_backproject.enabled() and g.is_cuda:
-        x, dxds = triton_backproject.backproject_tangent(
+        # dx/ds comes from OUR fused tangent kernel (the analytic s-derivative of the
+        # bilinear/1/w^2 FDK model -- LEAP has no tangent); the VALUE x(s) comes from the
+        # SAME LEAP backprojection as `fdk_conebeam_3d_batched`, so the bridge endpoint
+        # x(1) stays bit-consistent with the static anchor. The tangent is therefore the
+        # derivative of a 3e-3-close SIBLING model of the value path -- the same
+        # cross-model contract the theta gradient lives under, gated by
+        # `gate_fdk_tangent.py` (FD of THIS x(s)).
+        _, dxds = triton_backproject.backproject_tangent(
             g, Pmat, Pdot, wgt, dwgt, D, H, W, dx=dx, dy=dy, dz=dz, du=du, dv=dv,
             u0=u0, v_off=v_off, half_u=half_u, half_v=half_v, eps=eps)
+        from .leap_projector import leap_fdk_backproject
+        x = leap_fdk_backproject(
+            g * wgt.to(g.dtype).view(B, V, 1, 1), Pmat, D=D, H=H, W=W,
+            dx=dx, dy=dy, dz=dz, du=du, dv=dv, u0=u0, v_off=v_off)
     else:
         x, dxds = _backproject_tangent_torch(
             g, Pmat, Pdot, wgt, dwgt, D=D, H=H, W=W, dx=dx, dy=dy, dz=dz, du=du, dv=dv,

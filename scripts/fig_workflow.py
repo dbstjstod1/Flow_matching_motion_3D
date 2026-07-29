@@ -2,8 +2,12 @@
 
 Pure matplotlib (no external SVG tooling), so it regenerates anywhere the project runs:
 
-    python scripts/fig_workflow.py            # -> figs/workflow_{training,inference,overview}.{png,pdf,svg}
-    python scripts/fig_workflow.py --out figs --dpi 300
+    python scripts/fig_workflow.py            # -> figs/workflow_{blind,manifold,training,inference,overview}.*
+    python scripts/fig_workflow.py --font_scale 1.3 --suffix _big     # the projector-friendly set
+
+The layout is fixed and every font size is multiplied by --font_scale, so the two settings above
+are the gated ones: 1.0 and 1.3 were both checked panel by panel for text that runs into a
+neighbour. Push the scale higher and you have to re-check (and probably shorten a caption).
 
 Every label is taken from the code it describes, so keep them in sync when the pipeline moves:
   training  -- scripts/train_fm3d.py (bridge, anchor, cache, optimizer) + fm3d/prior_patch.py
@@ -40,12 +44,12 @@ def box(ax, x, y, w, h, title, body="", color=OUT, ts=10.0, bs=8.0, ls="-", ha="
     ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0,rounding_size=1.6",
                                 fc=fc, ec=ec, lw=1.6, ls=ls, zorder=2))
     if title:
-        ax.text(x + w / 2, y + h - 3.1, title, ha="center", va="center", fontsize=ts,
+        ax.text(x + w / 2, y + h - 3.1, title, ha="center", va="center", fontsize=ts * FS,
                 fontweight="bold", color=ec, zorder=3)
     if body:
         yb = y + (h - 5.6) / 2 if title else y + h / 2
         xb = x + w / 2 if ha == "center" else x + 3.5
-        ax.text(xb, yb, body, ha=ha, va="center", fontsize=bs,
+        ax.text(xb, yb, body, ha=ha, va="center", fontsize=bs * FS,
                 color="#111827", linespacing=1.45, zorder=3)
 
 
@@ -56,7 +60,8 @@ def arrow(ax, p0, p1, color="#334155", lw=1.8, style="-|>", rad=0.0, ls="-"):
 
 
 def tag(ax, x, y, text, color="#334155", fs=8.0, ha="center"):
-    ax.text(x, y, text, ha=ha, va="center", fontsize=fs, color=color, fontstyle="italic",
+    ax.text(x, y, text, ha=ha, va="center", fontsize=fs * FS, color=color,
+            fontstyle="italic",
             zorder=5)
 
 
@@ -66,7 +71,8 @@ def band(ax, y, text, x=2.5, ha="left"):
 
 
 def foot(ax, y, text, fs=7.9):
-    ax.text(FIG_W / 2, y, text, ha="center", va="center", fontsize=fs, color="#475569",
+    ax.text(FIG_W / 2, y, text, ha="center", va="center", fontsize=fs * FS,
+            color="#475569",
             fontstyle="italic")
 
 
@@ -119,16 +125,15 @@ def draw_training(ax):
     arrow(ax, (29.0, 42.2), (32.0, 42.2))
     arrow(ax, (109.0, 42.2), (106.0, 42.2))
 
-    ax.text(32.0, 31.0, "$t=0:\\;\\; x_0=\\mathrm{FDK}(y,P_{nom})$ — the uncorrected recon, "
-            "which is exactly the INFERENCE COLD START",
+    ax.text(32.0, 31.0, "$t=0$:  $x_0=\\mathrm{FDK}(y,P_{nom})$ — the uncorrected recon "
+            "= the inference cold start",
             ha="left", va="center", fontsize=8.3 * FS, color="#7c2d12")
-    ax.text(32.0, 27.6, "$t=1:\\;\\; x_1=x_{static}$ — an image this scanner can really produce "
-            "(the bare bridge endpoint FDK($\\theta_{true}$) is still 1–3 dB short)",
+    ax.text(32.0, 27.6, "$t=1$:  $x_1=x_{static}$ — the motion-free scan "
+            "(the bare endpoint FDK($\\theta_{true}$) is 1–3 dB short)",
             ha="left", va="center", fontsize=8.3 * FS, color="#7c2d12")
 
     # ---- 3. patch prior ------------------------------------------------------------------
-    band(ax, 23.5, "3.  Train the patch prior   (the net only ever sees $64^3$ patches)",
-         x=157.0, ha="right")
+    band(ax, 23.5, "3.  Train the patch prior", x=157.0, ha="right")
     y3, h3 = 7.0, 13.5
     box(ax, 3.0, y3, 30.0, h3, "Patch sampling",
         "$64^3$ crops, origins inside\nthe MEASURED-REGION mask", PRIOR)
@@ -146,14 +151,13 @@ def draw_training(ax):
     arrow(ax, (18.0, 34.5), (18.0, y3 + h3), color="#6d28d9")
     tag(ax, 21.5, 26.0, "$x_t$", color="#6d28d9")
     arrow(ax, (96.0, 34.5), (112.0, y3 + h3), color="#6d28d9", rad=-0.15)
-    tag(ax, 108.0, 27.5, "$dx_t/dt$", color="#6d28d9")
+    tag(ax, 115.0, 30.0, "$dx_t/dt$", color="#6d28d9")
 
-    foot(ax, 4.4, "MEMORY SPLIT — the OPERATOR (FDK + its tangent) runs on the full volume under "
-                  "no_grad; the NET only ever sees $64^3$ patches. That is what lets a 3D prior "
-                  "train on one 24 GB card.")
-    foot(ax, 2.4, "A rolling cache of 8 whole-volume bridge draws is refreshed every 12 steps, and "
-                  "each batch of 8 patches mixes several draws, so $t$ varies within a batch.  "
-                  "Validation = prior-only ODE from the cold start on held-out patients: "
+    foot(ax, 5.0, "MEMORY SPLIT — the OPERATOR (FDK + its tangent) runs on the FULL volume under "
+                  "no_grad; the NET only ever sees $64^3$ patches.")
+    foot(ax, 2.9, "A rolling cache of 8 whole-volume bridge draws is refreshed every 12 steps; "
+                  "each batch of 8 patches mixes several draws, so $t$ varies within a batch.")
+    foot(ax, 0.8, "Validation = prior-only ODE from the cold start on held-out patients: "
                   "25.42 dB / SSIM 0.78 (rigid-aligned).")
 
 
@@ -182,7 +186,7 @@ def draw_inference(ax):
     ax.add_patch(FancyBboxPatch((3.0, 20.0), 154.0, 41.5,
                                 boxstyle="round,pad=0,rounding_size=2.0",
                                 fc="#ffffff", ec="#334155", lw=1.7, ls="--", zorder=1))
-    ax.text(6.0, 58.0, "for  $k=0\\ldots N-1$   ($t=k/N$,   $dt=1/N$,   $N=50$)",
+    ax.text(6.0, 58.0, "for  $k=0\\ldots N-1$,   $t=k/N$,   $N=50$",
             ha="left", va="center", fontsize=10.2 * FS, fontweight="bold", color="#334155")
 
     yl, hl = 28.5, 25.0
@@ -389,11 +393,11 @@ def draw_manifold(ax):
         lp = p + d + np.array([-u[1], u[0]]) * 3.8            # off the line, away from the path
         ax.text(lp[0], lp[1], lab, ha="center", va="center",
                 fontsize=9.2 * FS, color="#1d4ed8", alpha=al, zorder=3)
-    ax.text(96.0, 28.5, "$\\mathcal{C}(\\hat\\theta)=\\{x:\\;A_{\\hat\\theta}\\,x\\approx y\\}$  "
+    ax.text(96.0, 32.0, "$\\mathcal{C}(\\hat\\theta)=\\{x:\\;A_{\\hat\\theta}\\,x\\approx y\\}$  "
             "— the constraint that PHYSICALLY EXISTS:\nthe measured projections. It is not a "
             "regularizer we chose, it is the scan.",
             ha="left", va="center", fontsize=8.6 * FS, color="#1d4ed8", zorder=3, linespacing=1.5)
-    ax.text(96.0, 35.5, "the ESTIMATE stage is what re-aims it:  "
+    ax.text(96.0, 39.0, "the ESTIMATE stage is what re-aims it:  "
             "$\\mathcal{C}(\\hat\\theta_0)\\rightarrow\\mathcal{C}(\\hat\\theta_k)"
             "\\rightarrow\\mathcal{C}(\\theta_{true})$,\nuntil the feasible set finally "
             "CONTAINS the clean image.",
@@ -423,13 +427,13 @@ def draw_manifold(ax):
             ha="left", va="center", fontsize=8.2 * FS, color="#64748b", fontstyle="italic", zorder=3)
 
     # ---- the legend IS the loop: one step, three moves --------------------------------------
-    box(ax, 4.0, 55.0, 58.0, 24.0, "ONE STEP OF THE LOOP  (x50)", "",
+    box(ax, 4.0, 52.5, 58.0, 27.5, "ONE STEP OF THE LOOP  (x50)", "",
         ("#f8fafc", "#334155"), ts=10.2)
-    rows = ((70.0, "#6d28d9", "PREDICT — the prior steps toward $\\mathcal{M}_{clean}$\n"
+    rows = ((70.5, "#6d28d9", "PREDICT — the prior steps toward $\\mathcal{M}_{clean}$\n"
                               "it knows the direction: it was TRAINED on this path"),
-            (63.5, "#15803d", "ESTIMATE — $\\hat\\theta$ is refit on that better image,\n"
+            (63.0, "#15803d", "ESTIMATE — $\\hat\\theta$ is refit on that better image,\n"
                               "which RE-AIMS the constraint set itself"),
-            (57.5, "#be123c", "CORRECT — the data step pulls it back onto\n"
+            (55.5, "#be123c", "CORRECT — the data step pulls it back onto\n"
                               "$\\mathcal{C}(\\hat\\theta)$; the TV corrector keeps it regular"))
     for yr, col, txt in rows:
         arrow(ax, (7.5, yr), (13.0, yr), color=col, lw=1.9)

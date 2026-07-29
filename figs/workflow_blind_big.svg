@@ -7,7 +7,7 @@
   <rdf:RDF xmlns:cc="http://creativecommons.org/ns#" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
    <cc:Work>
     <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
-    <dc:date>2026-07-29T16:54:26.955616</dc:date>
+    <dc:date>2026-07-29T16:54:47.393080</dc:date>
     <dc:format>image/svg+xml</dc:format>
     <dc:creator>
      <cc:Agent>
@@ -31,7 +31,7 @@ z
   </g>
   <g id="axes_1">
    <g id="patch_2">
-    <path clip-path="url(#paaf73a2cdf)" d="M 43.92 226.8 
+    <path clip-path="url(#pb7d75afa87)" d="M 43.92 226.8 
 L 1129.68 226.8 
 Q 1141.2 226.8 1141.2 215.28 
 L 1141.2 108.72 
@@ -44,7 +44,7 @@ z
 " style="fill:#f8fafc;stroke:#94a3b8;stroke-linejoin:miter;stroke-width:1.6;"/>
    </g>
    <g id="patch_3">
-    <path clip-path="url(#paaf73a2cdf)" d="M 360.72 212.4 
+    <path clip-path="url(#pb7d75afa87)" d="M 360.72 212.4 
 L 582.48 212.4 
 Q 594 212.4 594 200.88 
 L 594 123.12 
@@ -57,7 +57,7 @@ z
 " style="fill:#dbeafe;stroke:#1d4ed8;stroke-linejoin:miter;stroke-width:1.6;"/>
    </g>
    <g id="patch_4">
-    <path clip-path="url(#paaf73a2cdf)" d="M 627.12 212.4 
+    <path clip-path="url(#pb7d75afa87)" d="M 627.12 212.4 
 L 848.88 212.4 
 Q 860.4 212.4 860.4 200.88 
 L 860.4 123.12 
@@ -70,7 +70,7 @@ z
 " style="fill:#dcfce7;stroke:#15803d;stroke-linejoin:miter;stroke-width:1.6;"/>
    </g>
    <g id="patch_5">
-    <path clip-path="url(#paaf73a2cdf)" d="M 893.52 212.4 
+    <path clip-path="url(#pb7d75afa87)" d="M 893.52 212.4 
 L 1108.08 212.4 
 Q 1119.6 212.4 1119.6 200.88 
 L 1119.6 123.12 
@@ -83,7 +83,7 @@ z
 " style="fill:#ffe4e6;stroke:#be123c;stroke-linejoin:miter;stroke-width:1.6;"/>
    </g>
    <g id="patch_6">
-    <path clip-path="url(#paaf73a2cdf)" d="M 43.92 435.6 
+    <path clip-path="url(#pb7d75afa87)" d="M 43.92 435.6 
 L 438.48 435.6 
 Q 450 435.6 450 424.08 
 L 450 267.12 
@@ -96,7 +96,7 @@ z
 " style="fill:#dcfce7;stroke:#15803d;stroke-linejoin:miter;stroke-width:1.6;"/>
    </g>
    <g id="patch_7">
-    <path clip-path="url(#paaf73a2cdf)" d="M 735.12 435.6 
+    <path clip-path="url(#pb7d75afa87)" d="M 735.12 435.6 
 L 1129.68 435.6 
 Q 1141.2 435.6 1141.2 424.08 
 L 1141.2 267.12 
@@ -109,7 +109,7 @@ z
 " style="fill:#ffe4e6;stroke:#be123c;stroke-linejoin:miter;stroke-width:1.6;"/>
    </g>
    <g id="patch_8">
-    <path clip-path="url(#paaf73a2cdf)" d="M 43.92 637.2 
+    <path clip-path="url(#pb7d75afa87)" d="M 43.92 637.2 
 L 560.88 637.2 
 Q 572.4 637.2 572.4 625.68 
 L 572.4 475.92 
@@ -122,7 +122,7 @@ z
 " style="fill:#e2e8f0;stroke:#0f172a;stroke-linejoin:miter;stroke-width:1.6;"/>
    </g>
    <g id="patch_9">
-    <path clip-path="url(#paaf73a2cdf)" d="M 612.72 637.2 
+    <path clip-path="url(#pb7d75afa87)" d="M 612.72 637.2 
 L 1129.68 637.2 
 Q 1141.2 637.2 1141.2 625.68 
 L 1141.2 475.92 
@@ -136,7 +136,7 @@ z
    </g>
    <g id="text_1">
     <!-- The problem is BLIND:  one measurement,  two unknowns -->
-    <g style="fill:#0f172a;" transform="translate(333.337461 40.277031)scale(0.155 -0.155)">
+    <g style="fill:#0f172a;" transform="translate(257.298699 41.560141)scale(0.2015 -0.2015)">
      <defs>
       <path d="M 0.484375 72.90625 
 L 67.671875 72.90625 
@@ -642,7 +642,7 @@ z
    </g>
    <g id="text_2">
     <!-- $P$ cannot be corrected without a clean $x$ — and $x$ cannot be reconstructed without the right $P$ -->
-    <g style="fill:#475569;" transform="translate(372.348 68.77)scale(0.092 -0.092)">
+    <g style="fill:#475569;" transform="translate(308.0124 69.529)scale(0.1196 -0.1196)">
      <defs>
       <path d="M 16.890625 72.90625 
 L 39.703125 72.90625 
@@ -1170,7 +1170,7 @@ z
    </g>
    <g id="text_3">
     <!-- $y \;=\; A_{P(\theta)}\; x$ -->
-    <g style="fill:#0f172a;" transform="translate(127.53 141.015)scale(0.21 -0.21)">
+    <g style="fill:#0f172a;" transform="translate(110.709 142.4955)scale(0.273 -0.273)">
      <defs>
       <path d="M 24.8125 -5.078125 
 Q 18.5625 -15.578125 14.625 -18.1875 
@@ -1275,7 +1275,7 @@ z
    </g>
    <g id="text_4">
     <!-- $P(\theta)=P_{nom}\,T(\theta)$ — the nominal geometry, -->
-    <g style="fill:#334155;" transform="translate(96.744 190.531083)scale(0.084 -0.084)">
+    <g style="fill:#334155;" transform="translate(70.6872 189.586408)scale(0.1092 -0.1092)">
      <defs>
       <path d="M 89.796875 33.015625 
 L 83.40625 0 
@@ -1619,7 +1619,7 @@ z
      <use transform="translate(2035.288411 0.234375)" xlink:href="#DejaVuSans-44"/>
     </g>
     <!-- times the rigid motion we did not see -->
-    <g style="fill:#334155;" transform="translate(104.834906 201.54998)scale(0.084 -0.084)">
+    <g style="fill:#334155;" transform="translate(81.205378 203.910974)scale(0.1092 -0.1092)">
      <defs>
       <path d="M 44.28125 53.078125 
 L 44.28125 44.578125 
@@ -1735,7 +1735,7 @@ z
    </g>
    <g id="text_5">
     <!-- $y$  —  KNOWN -->
-    <g style="fill:#1d4ed8;" transform="translate(433.172 136.768625)scale(0.104 -0.104)">
+    <g style="fill:#1d4ed8;" transform="translate(421.6436 137.623212)scale(0.1352 -0.1352)">
      <defs>
       <path d="M 9.1875 72.90625 
 L 27.984375 72.90625 
@@ -1802,7 +1802,7 @@ z
    </g>
    <g id="text_6">
     <!-- the measured projections -->
-    <g style="fill:#111827;" transform="translate(420.451875 179.128531)scale(0.08 -0.08)">
+    <g style="fill:#111827;" transform="translate(405.107438 178.219091)scale(0.104 -0.104)">
      <defs>
       <path d="M 8.5 21.578125 
 L 8.5 54.6875 
@@ -1916,7 +1916,7 @@ z
      <use x="1226.603516" xlink:href="#DejaVuSans-115"/>
     </g>
     <!-- $360\times500\times700 = 126$ M values -->
-    <g style="fill:#111827;" transform="translate(407.32 189.606469)scale(0.08 -0.08)">
+    <g style="fill:#111827;" transform="translate(388.036 191.840409)scale(0.104 -0.104)">
      <defs>
       <path d="M 40.578125 39.3125 
 Q 47.65625 37.796875 51.625 33 
@@ -2138,7 +2138,7 @@ z
    </g>
    <g id="text_7">
     <!-- $\theta$  —  UNKNOWN -->
-    <g style="fill:#15803d;" transform="translate(690.888 136.78975)scale(0.104 -0.104)">
+    <g style="fill:#15803d;" transform="translate(676.7544 137.650675)scale(0.1352 -0.1352)">
      <defs>
       <path d="M 9.1875 72.90625 
 L 27.984375 72.90625 
@@ -2174,7 +2174,7 @@ z
    </g>
    <g id="text_8">
     <!-- 6 DoF per view (a rigid head pose) -->
-    <g style="fill:#111827;" transform="translate(668.835 179.120406)scale(0.08 -0.08)">
+    <g style="fill:#111827;" transform="translate(648.0855 178.208528)scale(0.104 -0.104)">
      <defs>
       <path d="M 19.671875 64.796875 
 L 19.671875 8.109375 
@@ -2242,7 +2242,7 @@ z
      <use x="1690.087891" xlink:href="#DejaVuSans-41"/>
     </g>
     <!-- $6\times360 = 2\,160$ parameters -->
-    <g style="fill:#111827;" transform="translate(682.68 189.598344)scale(0.08 -0.08)">
+    <g style="fill:#111827;" transform="translate(666.084 191.829847)scale(0.104 -0.104)">
      <use transform="translate(0 0.78125)" xlink:href="#DejaVuSans-54"/>
      <use transform="translate(83.105469 0.78125)" xlink:href="#DejaVuSans-215"/>
      <use transform="translate(186.376953 0.78125)" xlink:href="#DejaVuSans-51"/>
@@ -2268,7 +2268,7 @@ z
    </g>
    <g id="text_9">
     <!-- $x$  —  UNKNOWN -->
-    <g style="fill:#be123c;" transform="translate(953.792 136.78975)scale(0.104 -0.104)">
+    <g style="fill:#be123c;" transform="translate(939.6896 137.650675)scale(0.1352 -0.1352)">
      <use transform="translate(0 0.78125)" xlink:href="#DejaVuSans-Oblique-120"/>
      <use transform="translate(59.179688 0.78125)" xlink:href="#DejaVuSans-Bold-32"/>
      <use transform="translate(93.994141 0.78125)" xlink:href="#DejaVuSans-Bold-32"/>
@@ -2286,7 +2286,7 @@ z
    </g>
    <g id="text_10">
     <!-- the volume we are after -->
-    <g style="fill:#111827;" transform="translate(952.669375 179.128531)scale(0.08 -0.08)">
+    <g style="fill:#111827;" transform="translate(938.230187 178.219091)scale(0.104 -0.104)">
      <defs>
       <path d="M 37.109375 75.984375 
 L 37.109375 68.5 
@@ -2334,7 +2334,7 @@ z
      <use x="1162.162109" xlink:href="#DejaVuSans-114"/>
     </g>
     <!-- $256^3 = 16.8$ M voxels -->
-    <g style="fill:#111827;" transform="translate(958.68 189.606469)scale(0.08 -0.08)">
+    <g style="fill:#111827;" transform="translate(946.044 191.840409)scale(0.104 -0.104)">
      <defs>
       <path d="M 10.6875 12.40625 
 L 21 12.40625 
@@ -2418,7 +2418,7 @@ z
    </g>
    <g id="text_11">
     <!-- Correcting  $P$  needs a clean  $x$ -->
-    <g style="fill:#15803d;" transform="translate(154.653 280.674)scale(0.102 -0.102)">
+    <g style="fill:#15803d;" transform="translate(128.6889 281.5002)scale(0.1326 -0.1326)">
      <defs>
       <path d="M 67 4 
 Q 61.8125 1.3125 56.203125 -0.046875 
@@ -2556,7 +2556,7 @@ z
    </g>
    <g id="text_12">
     <!-- $\hat\theta=\arg\min_\theta \Vert A_{P(\theta)}\,x-y\Vert ^2$ -->
-    <g style="fill:#111827;" transform="translate(193.845 330.561628)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(179.6385 320.002117)scale(0.1066 -0.1066)">
      <defs>
       <path d="M -28.609375 79.984375 
 L -21.390625 79.984375 
@@ -2610,9 +2610,9 @@ z
      <use transform="translate(1107.485676 39.03125)scale(0.7)" xlink:href="#DejaVuSans-50"/>
     </g>
     <!--  -->
-    <g style="fill:#111827;" transform="translate(241.2 344.10617)scale(0.082 -0.082)"/>
+    <g style="fill:#111827;" transform="translate(241.2 337.610021)scale(0.1066 -0.1066)"/>
     <!-- the fit is only as good as the image you hand it — -->
-    <g style="fill:#111827;" transform="translate(138.986359 354.846056)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(108.322267 351.571873)scale(0.1066 -0.1066)">
      <defs>
       <path d="M 4.890625 30.90625 
 L 95.125 30.90625 
@@ -2673,7 +2673,7 @@ z
      <use x="2393.066406" xlink:href="#DejaVuSans-8212"/>
     </g>
     <!-- a streaked $x$ happily explains the streaks. -->
-    <g style="fill:#111827;" transform="translate(155.346 365.5878)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(129.5898 365.53614)scale(0.1066 -0.1066)">
      <defs>
       <path d="M 9.078125 75.984375 
 L 18.109375 75.984375 
@@ -2733,9 +2733,9 @@ z
      <use transform="translate(2061.523438 0.015625)" xlink:href="#DejaVuSans-46"/>
     </g>
     <!--  -->
-    <g style="fill:#111827;" transform="translate(241.2 376.344342)scale(0.082 -0.082)"/>
+    <g style="fill:#111827;" transform="translate(241.2 379.519645)scale(0.1066 -0.1066)"/>
     <!-- MEASURED (our estimator sweep): from the COLD FDK -->
-    <g style="fill:#111827;" transform="translate(128.719703 387.084228)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(94.975614 393.481497)scale(0.1066 -0.1066)">
      <defs>
       <path d="M 9.8125 72.90625 
 L 55.90625 72.90625 
@@ -2965,7 +2965,7 @@ z
      <use x="2677.876953" xlink:href="#DejaVuSans-75"/>
     </g>
     <!-- every configuration plateaus at $\approx 2.0\degree$; from a clean -->
-    <g style="fill:#111827;" transform="translate(133.37 397.825972)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(101.021 407.445763)scale(0.1066 -0.1066)">
      <defs>
       <path d="M 73.1875 30.421875 
 L 73.1875 21.6875 
@@ -3098,7 +3098,7 @@ z
      <use transform="translate(2566.113281 0.015625)" xlink:href="#DejaVuSans-110"/>
     </g>
     <!-- reference the same budget reaches $0.09$–$0.27\degree$. -->
-    <g style="fill:#111827;" transform="translate(142.8 408.584372)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(113.28 421.431683)scale(0.1066 -0.1066)">
      <defs>
       <path d="M 48.6875 27.296875 
 Q 48.6875 37.203125 44.609375 42.84375 
@@ -3211,7 +3211,7 @@ z
    </g>
    <g id="text_13">
     <!-- Reconstructing  $x$  needs the true  $P$ -->
-    <g style="fill:#be123c;" transform="translate(829.635 280.674)scale(0.102 -0.102)">
+    <g style="fill:#be123c;" transform="translate(798.8055 281.5002)scale(0.1326 -0.1326)">
      <defs>
       <path d="M 35.890625 40.578125 
 Q 41.796875 40.578125 44.359375 42.765625 
@@ -3280,7 +3280,7 @@ z
    </g>
    <g id="text_14">
     <!-- $\hat x=\arg\min_x \Vert A_{P(\theta)}\,x-y\Vert ^2$ -->
-    <g style="fill:#111827;" transform="translate(884.963 330.319728)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(870.7319 319.687647)scale(0.1066 -0.1066)">
      <use transform="translate(64.226562 11.453125)" xlink:href="#DejaVuSans-770"/>
      <use transform="translate(0 0.265625)" xlink:href="#DejaVuSans-Oblique-120"/>
      <use transform="translate(82.076172 0.265625)" xlink:href="#DejaVuSans-61"/>
@@ -3304,9 +3304,9 @@ z
      <use transform="translate(1108.897786 38.546875)scale(0.7)" xlink:href="#DejaVuSans-50"/>
     </g>
     <!--  -->
-    <g style="fill:#111827;" transform="translate(932.4 342.55227)scale(0.082 -0.082)"/>
+    <g style="fill:#111827;" transform="translate(932.4 335.589951)scale(0.1066 -0.1066)"/>
     <!-- a wrong $\theta$ does not just blur — it BAKES its own -->
-    <g style="fill:#111827;" transform="translate(834.574 353.412914)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(805.2262 349.708788)scale(0.1066 -0.1066)">
      <defs>
       <path d="M 19.671875 34.8125 
 L 19.671875 8.109375 
@@ -3387,7 +3387,7 @@ z
      <use transform="translate(2321.630859 0.234375)" xlink:href="#DejaVuSans-110"/>
     </g>
     <!-- artefacts into whatever image the solver returns. -->
-    <g style="fill:#111827;" transform="translate(831.327312 364.169456)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(801.005506 363.692293)scale(0.1066 -0.1066)">
      <use xlink:href="#DejaVuSans-97"/>
      <use x="61.279297" xlink:href="#DejaVuSans-114"/>
      <use x="102.392578" xlink:href="#DejaVuSans-116"/>
@@ -3439,9 +3439,9 @@ z
      <use x="2433.451172" xlink:href="#DejaVuSans-46"/>
     </g>
     <!--  -->
-    <g style="fill:#111827;" transform="translate(932.4 374.909342)scale(0.082 -0.082)"/>
+    <g style="fill:#111827;" transform="translate(932.4 377.654145)scale(0.1066 -0.1066)"/>
     <!-- MEASURED (same loop, oracle $\theta$ from step 0): -->
-    <g style="fill:#111827;" transform="translate(838.182 385.769986)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(809.9166 391.772982)scale(0.1066 -0.1066)">
      <use transform="translate(0 0.234375)" xlink:href="#DejaVuSans-77"/>
      <use transform="translate(86.279297 0.234375)" xlink:href="#DejaVuSans-69"/>
      <use transform="translate(149.462891 0.234375)" xlink:href="#DejaVuSans-65"/>
@@ -3487,7 +3487,7 @@ z
      <use transform="translate(2264.107422 0.234375)" xlink:href="#DejaVuSans-58"/>
     </g>
     <!-- $x_t$ reaches 40.45 dB with the true geometry, -->
-    <g style="fill:#111827;" transform="translate(841.175 396.528386)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(813.8075 405.758902)scale(0.1066 -0.1066)">
      <defs>
       <path d="M 37.796875 64.3125 
 L 12.890625 25.390625 
@@ -3552,7 +3552,7 @@ z
      <use transform="translate(2192.241211 0.015625)" xlink:href="#DejaVuSans-44"/>
     </g>
     <!-- 38.16 dB when $\theta$ has to be estimated blind. -->
-    <g style="fill:#111827;" transform="translate(842.692 407.284928)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(815.7796 419.742407)scale(0.1066 -0.1066)">
      <use transform="translate(0 0.234375)" xlink:href="#DejaVuSans-51"/>
      <use transform="translate(63.623047 0.234375)" xlink:href="#DejaVuSans-56"/>
      <use transform="translate(127.246094 0.234375)" xlink:href="#DejaVuSans-46"/>
@@ -3599,7 +3599,7 @@ z
    </g>
    <g id="text_15">
     <!-- CIRCULAR -->
-    <g style="fill:#0f172a;" transform="translate(554.58293 334.373281)scale(0.115 -0.115)">
+    <g style="fill:#0f172a;" transform="translate(544.917809 335.325266)scale(0.1495 -0.1495)">
      <defs>
       <path d="M 53.421875 13.28125 
 L 24.03125 13.28125 
@@ -3628,7 +3628,7 @@ z
    </g>
    <g id="text_16">
     <!-- DEPENDENCY -->
-    <g style="fill:#0f172a;" transform="translate(543.247344 363.173281)scale(0.115 -0.115)">
+    <g style="fill:#0f172a;" transform="translate(530.181547 364.125266)scale(0.1495 -0.1495)">
      <defs>
       <path d="M 9.1875 72.90625 
 L 59.90625 72.90625 
@@ -3689,7 +3689,7 @@ z
    </g>
    <g id="text_17">
     <!-- Counting says it is solvable — the difficulty is elsewhere -->
-    <g style="fill:#0f172a;" transform="translate(143.428906 489.440313)scale(0.1 -0.1)">
+    <g style="fill:#0f172a;" transform="translate(95.737578 490.256406)scale(0.13 -0.13)">
      <defs>
       <path d="M 1.21875 54.6875 
 L 18.703125 54.6875 
@@ -3805,7 +3805,7 @@ z
    </g>
    <g id="text_18">
     <!-- 126 M measurements vs 16.8 M + 2 160 unknowns: NOT underdetermined. -->
-    <g style="fill:#111827;" transform="translate(57.6 534.722823)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(57.6 523.851669)scale(0.1066 -0.1066)">
      <defs>
       <path d="M 46 62.703125 
 L 46 35.5 
@@ -3913,9 +3913,9 @@ z
      <use x="3759.582031" xlink:href="#DejaVuSans-46"/>
     </g>
     <!--  -->
-    <g style="fill:#111827;" transform="translate(57.6 545.462709)scale(0.082 -0.082)"/>
+    <g style="fill:#111827;" transform="translate(57.6 537.813521)scale(0.1066 -0.1066)"/>
     <!-- • the coupling is BILINEAR in $(x,\theta)$ — the joint problem is non-convex, -->
-    <g style="fill:#111827;" transform="translate(57.6 556.323352)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(57.6 551.932358)scale(0.1066 -0.1066)">
      <defs>
       <path d="M 14.984375 37.203125 
 Q 14.984375 43.265625 19.203125 47.4375 
@@ -4013,7 +4013,7 @@ z
      <use transform="translate(3472.607422 0.234375)" xlink:href="#DejaVuSans-44"/>
     </g>
     <!--    and every local minimum is an image that explains the data -->
-    <g style="fill:#111827;" transform="translate(57.6 567.079895)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(57.6 565.915863)scale(0.1066 -0.1066)">
      <use xlink:href="#DejaVuSans-32"/>
      <use x="31.787109" xlink:href="#DejaVuSans-32"/>
      <use x="63.574219" xlink:href="#DejaVuSans-32"/>
@@ -4077,7 +4077,7 @@ z
      <use x="3053.376953" xlink:href="#DejaVuSans-97"/>
     </g>
     <!-- • an EXACT SE(3) GAUGE: $(x,\theta)$ and $(g\!\cdot\!x,\;\theta\circ g^{-1})$ give the SAME $y$, -->
-    <g style="fill:#111827;" transform="translate(57.6 579.486238)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(57.6 582.04411)scale(0.1066 -0.1066)">
      <defs>
       <path d="M 6.296875 72.90625 
 L 16.890625 72.90625 
@@ -4212,7 +4212,7 @@ z
      <use transform="translate(3332.805062 0.684375)" xlink:href="#DejaVuSans-44"/>
     </g>
     <!--    so the solution is an orbit, never a single pose -->
-    <g style="fill:#111827;" transform="translate(57.6 590.24278)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(57.6 596.027615)scale(0.1066 -0.1066)">
      <use xlink:href="#DejaVuSans-32"/>
      <use x="31.787109" xlink:href="#DejaVuSans-32"/>
      <use x="63.574219" xlink:href="#DejaVuSans-32"/>
@@ -4266,7 +4266,7 @@ z
      <use x="2344.726562" xlink:href="#DejaVuSans-101"/>
     </g>
     <!-- • per-view translation ALONG THE BEAM is nearly unobservable -->
-    <g style="fill:#111827;" transform="translate(57.6 600.982666)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(57.6 609.989466)scale(0.1066 -0.1066)">
      <defs>
       <path d="M 14.984375 37.203125 
 Q 14.984375 43.265625 19.203125 47.4375 
@@ -4356,7 +4356,7 @@ z
      <use x="3123.898438" xlink:href="#DejaVuSans-101"/>
     </g>
     <!--    (92% of a converged estimator's residual lives there) -->
-    <g style="fill:#111827;" transform="translate(57.6 611.722552)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(57.6 623.951318)scale(0.1066 -0.1066)">
      <defs>
       <path d="M 72.703125 32.078125 
 Q 68.453125 32.078125 66.03125 28.46875 
@@ -4471,7 +4471,7 @@ z
    </g>
    <g id="text_19">
     <!-- What breaks the cycle -->
-    <g style="fill:#6d28d9;" transform="translate(808.395312 489.440313)scale(0.1 -0.1)">
+    <g style="fill:#6d28d9;" transform="translate(789.553906 490.256406)scale(0.13 -0.13)">
      <use xlink:href="#DejaVuSans-Bold-87"/>
      <use x="110.302734" xlink:href="#DejaVuSans-Bold-104"/>
      <use x="181.494141" xlink:href="#DejaVuSans-Bold-97"/>
@@ -4497,7 +4497,7 @@ z
    </g>
    <g id="text_20">
     <!-- $\min_{x,\,\theta}\;\frac{1}{2}\Vert A_{P(\theta)}x-y\Vert ^2+\lambda\,\mathrm{TV}(x)$   +   a learned prior on $x$ -->
-    <g style="fill:#111827;" transform="translate(626.4 539.809257)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(626.4 530.464034)scale(0.1066 -0.1066)">
      <defs>
       <path d="M 36.71875 67.4375 
 L 48.828125 0 
@@ -4586,9 +4586,9 @@ z
 "/>
     </g>
     <!--  -->
-    <g style="fill:#111827;" transform="translate(626.4 553.927799)scale(0.082 -0.082)"/>
+    <g style="fill:#111827;" transform="translate(626.4 548.818139)scale(0.1066 -0.1066)"/>
     <!-- 1.  the PRIOR supplies what the data cannot: it improves $x$ without knowing $\theta$ -->
-    <g style="fill:#111827;" transform="translate(626.4 564.788443)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(626.4 562.936976)scale(0.1066 -0.1066)">
      <defs>
       <path d="M 19.671875 64.796875 
 L 19.671875 37.40625 
@@ -4688,7 +4688,7 @@ z
      <use transform="translate(3820.507812 0.234375)" xlink:href="#DejaVuSans-Oblique-952"/>
     </g>
     <!-- 2.  ALTERNATE (Gauss–Seidel): fit $\theta$ on the improved $x$, then solve $x$ under it -->
-    <g style="fill:#111827;" transform="translate(626.4 575.665743)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(626.4 577.077466)scale(0.1066 -0.1066)">
      <use transform="translate(0 0.234375)" xlink:href="#DejaVuSans-50"/>
      <use transform="translate(63.623047 0.234375)" xlink:href="#DejaVuSans-46"/>
      <use transform="translate(95.410156 0.234375)" xlink:href="#DejaVuSans-32"/>
@@ -4767,7 +4767,7 @@ z
      <use transform="translate(3786.669922 0.234375)" xlink:href="#DejaVuSans-116"/>
     </g>
     <!-- 3.  the GEOMETRY BRIDGE keeps every intermediate $x$ a real reconstruction, -->
-    <g style="fill:#111827;" transform="translate(626.4 586.424143)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(626.4 591.063386)scale(0.1066 -0.1066)">
      <defs>
       <path d="M -0.203125 72.90625 
 L 10.40625 72.90625 
@@ -4856,7 +4856,7 @@ z
      <use transform="translate(3815.869141 0.015625)" xlink:href="#DejaVuSans-44"/>
     </g>
     <!--      so the $\theta$ fit never runs on an image the operator cannot produce -->
-    <g style="fill:#111827;" transform="translate(626.4 597.301443)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(626.4 605.203876)scale(0.1066 -0.1066)">
      <use transform="translate(0 0.234375)" xlink:href="#DejaVuSans-32"/>
      <use transform="translate(31.787109 0.234375)" xlink:href="#DejaVuSans-32"/>
      <use transform="translate(63.574219 0.234375)" xlink:href="#DejaVuSans-32"/>
@@ -4927,7 +4927,7 @@ z
      <use transform="translate(3333.740234 0.234375)" xlink:href="#DejaVuSans-101"/>
     </g>
     <!-- 4.  score modulo the gauge: rigid-align before PSNR/SSIM, report RPE for $\theta$ -->
-    <g style="fill:#111827;" transform="translate(626.4 608.178743)scale(0.082 -0.082)">
+    <g style="fill:#111827;" transform="translate(626.4 619.344366)scale(0.1066 -0.1066)">
      <defs>
       <path d="M 25.390625 72.90625 
 L 33.6875 72.90625 
@@ -5013,30 +5013,30 @@ z
     </g>
    </g>
    <g id="patch_10">
-    <path clip-path="url(#paaf73a2cdf)" d="M 451.290015 298.029641 
+    <path clip-path="url(#pb7d75afa87)" d="M 451.290015 298.029641 
 Q 586.803041 217.488552 720.393896 296.890777 
 " style="fill:none;stroke:#15803d;stroke-linecap:round;stroke-width:2;"/>
-    <path clip-path="url(#paaf73a2cdf)" d="M 716.768965 291.246322 
+    <path clip-path="url(#pb7d75afa87)" d="M 715.681486 289.552986 
 L 720.393896 296.890777 
-L 713.703374 296.404049 
-L 716.768965 291.246322 
+L 711.696217 296.258031 
+L 715.681486 289.552986 
 z
 " style="fill:#15803d;stroke:#15803d;stroke-linecap:round;stroke-width:2;"/>
    </g>
    <g id="patch_11">
-    <path clip-path="url(#paaf73a2cdf)" d="M 722.309985 393.170359 
+    <path clip-path="url(#pb7d75afa87)" d="M 722.309985 393.170359 
 Q 586.796959 473.711448 453.206104 394.309223 
 " style="fill:none;stroke:#be123c;stroke-linecap:round;stroke-width:2;"/>
-    <path clip-path="url(#paaf73a2cdf)" d="M 456.831035 399.953678 
+    <path clip-path="url(#pb7d75afa87)" d="M 457.918514 401.647014 
 L 453.206104 394.309223 
-L 459.896626 394.795951 
-L 456.831035 399.953678 
+L 461.903783 394.941969 
+L 457.918514 401.647014 
 z
 " style="fill:#be123c;stroke:#be123c;stroke-linecap:round;stroke-width:2;"/>
    </g>
    <g id="text_21">
     <!-- hand it a better $x$ -->
-    <g style="fill:#15803d;" transform="translate(549.261 242.133062)scale(0.086 -0.086)">
+    <g style="fill:#15803d;" transform="translate(537.9993 242.844981)scale(0.1118 -0.1118)">
      <use transform="translate(0 0.015625)" xlink:href="#DejaVuSans-Oblique-104"/>
      <use transform="translate(63.378906 0.015625)" xlink:href="#DejaVuSans-Oblique-97"/>
      <use transform="translate(124.658203 0.015625)" xlink:href="#DejaVuSans-Oblique-110"/>
@@ -5059,7 +5059,7 @@ z
    </g>
    <g id="text_22">
     <!-- hand it a better $\hat\theta$ -->
-    <g style="fill:#be123c;" transform="translate(549.175 453.199469)scale(0.086 -0.086)">
+    <g style="fill:#be123c;" transform="translate(537.8875 454.159309)scale(0.1118 -0.1118)">
      <use transform="translate(0 0.75)" xlink:href="#DejaVuSans-Oblique-104"/>
      <use transform="translate(63.378906 0.75)" xlink:href="#DejaVuSans-Oblique-97"/>
      <use transform="translate(124.658203 0.75)" xlink:href="#DejaVuSans-Oblique-110"/>
@@ -5084,7 +5084,7 @@ z
   </g>
  </g>
  <defs>
-  <clipPath id="paaf73a2cdf">
+  <clipPath id="pb7d75afa87">
    <rect height="648" width="1152" x="10.8" y="10.8"/>
   </clipPath>
  </defs>

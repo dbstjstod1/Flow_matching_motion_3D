@@ -1,4 +1,14 @@
-"""Fused Triton backprojector for the static (disp=None) FDK, plus its ANALYTIC s-tangent.
+"""Fused Triton backprojector for the static FDK (RETIRED to reference duty 2026-07-30),
+plus its ANALYTIC s-tangent (STILL THE PRODUCTION TANGENT).
+
+STATUS: the production FDK VALUE path backprojects through LEAP's modular VD kernel since
+2026-07-30 (`leap_projector.leap_fdk_backproject`; the operator-unification decision).
+`backproject_static` survives as the second implementation the FDK gates compare against
+and as this module's tangent's value-sibling. `backproject_tangent` remains deployed: LEAP
+has no s-derivative, and the bridge's analytic tangent is this kernel -- its VALUE output
+is discarded in production (the value comes from LEAP, keeping the bridge endpoint
+consistent with the static anchor) and its TANGENT is the derivative of this 3e-3-close
+sibling model, gated by `gate_fdk_tangent.py` against FD of the deployed value path.
 
 WHY. Ported from Flowmatching-4DCT's `fdct/triton_backproject.py` (2026-07-18), where profiling
 put the torch FDK at 14.5 s/call and 70% of a bridge draw -- and INSENSITIVE to view_chunk, so

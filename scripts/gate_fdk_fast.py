@@ -1,23 +1,26 @@
-"""Gate the Triton static backprojector (2026-07-18, ported from Flowmatching-4DCT).
+"""Gate the DEPLOYED FDK backprojection: LEAP's modular VD kernel under our FDK algorithm.
 
-WHAT IS CLAIMED, AND BY WHOM:
-  * fm3d/triton_backproject.py claims the fused kernel computes THE SAME backprojection as
-    the torch loop up to float reassociation (per-voxel sequential view-sum association +
-    skipping grid_sample's [-1,1] round-trip), and that it is bit-DETERMINISTIC across runs.
-  * fm3d/projector_3d.py claims the routing is transparent: every disp=None FDK call lands on
-    the kernel, with the FM3D_FDK_TRITON=0 kill switch restoring the torch loop bit-for-bit.
+Since 2026-07-30 the static FDK's distance-weighted backprojection runs through
+`leap_projector.leap_fdk_backproject` (the operator-unification decision: our
+cosine/Wang/Ohnesorge/ramp/Voronoi algorithm, LEAP's backprojector under it, with LEAP's
+geometric ray weight folded back to our exact 1/w^2 convention -- the algebra is in that
+function's docstring). The torch loop survives as the reference; FM3D_FDK_LEAP=0 routes to it.
 
-G1  rigid-motion P + Voronoi weights, Triton vs torch:  rel max < 1e-4 and rel RMS < 1e-5
-G2  Triton determinism:                                 two runs bit-identical (max|d| == 0)
-G3a identical rows in one batch (Triton):               bit-identical rows
-G3b batched B=2 vs 2x B=1 (Triton):                     rel max < 1e-6 (cuFFT plan choice only)
-G4  head-phantom round-trip FDK(A(phantom)):            backends agree, rel max < 1e-4
+WHAT IS CLAIMED:
+  * the LEAP-backed FDK computes the SAME reconstruction as the torch reference up to the
+    KNOWN model gap: tex3D bilinear (9-bit lerp fractions) vs grid_sample, and the folded
+    1/(sdd*dist) weight being interpolated WITH the data instead of applied per voxel
+    (second-order in the detector cell). Measured at adoption: rel-to-peak max ~1e-3-level,
+    3.1e-3 in norm at 256^3. An actual semantic error (offset, mask edge, weight power)
+    shows up at O(1e-1..1) and fails loudly.
+  * determinism and batch-consistency of the deployed path.
+
+G1  rigid-motion P + Voronoi weights, LEAP vs torch:    rel max < 5e-2 (panel-edge model, see G1 note) and rel RMS < 1e-3
+G2  determinism:                                        two runs bit-identical (max|d| == 0)
+G3a identical rows in one batch:                        bit-identical rows
+G3b batched B=2 vs 2x B=1:                              rel max < 1e-6
+G4  head-phantom round-trip FDK(A(phantom)):            backends agree, rel max < 1e-2
 G5  full CQ500/Thies-scale timing (360 views, 500x700 panel, 256^3 @ 1 mm): report only.
-
-The 1e-4 band is NOT slack for a wrong kernel: grid_sample's own pixel coordinate carries
-~nu*eps/2 of normalization rounding that the kernel legitimately skips, and a filtered
-sinogram's per-pixel gradient turns that into rel ~1e-5 value noise. An actual semantic
-difference (a tap, a mask edge, an offset) shows up at O(1e-2..1) and fails loudly.
 """
 from __future__ import annotations
 
@@ -46,12 +49,12 @@ def gate(name, ok, detail):
         FAIL.append(name)
 
 
-def fdk(sino, P, u, v, cfg, triton: bool, **kw):
-    os.environ["FM3D_FDK_TRITON"] = "1" if triton else "0"
+def fdk(sino, P, u, v, cfg, leap: bool, **kw):
+    os.environ["FM3D_FDK_LEAP"] = "1" if leap else "0"
     try:
         return fdk_conebeam_3d_batched(sino, P, u, v, cfg, **kw)
     finally:
-        os.environ.pop("FM3D_FDK_TRITON", None)
+        os.environ.pop("FM3D_FDK_LEAP", None)
 
 
 def smooth_sino(B, V, nv, nu, seed=0):
@@ -83,11 +86,15 @@ def main():
     vw = view_angular_weights(P)
     sino = smooth_sino(1, cfg.n_views, cfg.nv, cfg.nu)
 
-    # G1: rigid-motion geometry + Voronoi weights, Triton vs torch
+    # G1: rigid-motion geometry + Voronoi weights, LEAP vs torch. The max bar is set by the
+    # PANEL-EDGE handling difference (our hard half_u mask vs LEAP's tex border, which fades
+    # over the last half pixel): this synthetic sinogram has O(1) values AT the edge, so a
+    # few edge voxels read ~2.7e-2 of peak (measured) while the volume RMS sits at 3.6e-4.
+    # A physical sinogram decays at the panel edge -- G4's head phantom reads max 5.4e-4.
     r_t = fdk(sino, P, u, v, cfg, True, view_weight=vw, **vox)
     r_c = fdk(sino, P, u, v, cfg, False, view_weight=vw, **vox)
     m, r = rel(r_t, r_c)
-    gate("G1 triton-vs-torch", m < 1e-4 and r < 1e-5, f"rel max {m:.3e} rms {r:.3e}")
+    gate("G1 leap-vs-torch", m < 5e-2 and r < 1e-3, f"rel max {m:.3e} rms {r:.3e}")
 
     # G2: determinism
     r_t2 = fdk(sino, P, u, v, cfg, True, view_weight=vw, **vox)
@@ -119,7 +126,7 @@ def main():
     q_t = fdk(y, P_nom[None], u, v, cfg, True, **vox)
     q_c = fdk(y, P_nom[None], u, v, cfg, False, **vox)
     m, r = rel(q_t, q_c)
-    gate("G4 round-trip", m < 1e-4, f"rel max {m:.3e} rms {r:.3e}")
+    gate("G4 round-trip", m < 1e-2, f"rel max {m:.3e} rms {r:.3e}")
 
     # G5: full-scale timing (the training/inference config: 360 views, 256^3 @ 1 mm)
     cfgF = ConeBeam3DConfig.thies(n_views=360)
@@ -143,7 +150,7 @@ def main():
     t_tri = clock(lambda: fdk(sF, PF, uF, vF, cfgF, True, view_weight=vwF, **voxF))
     t_tor = clock(lambda: fdk(sF, PF, uF, vF, cfgF, False, view_weight=vwF, **voxF), n=1)
     gate("G5 timing", True,
-         f"full FDK 256^3/360v: torch {t_tor:.2f}s vs triton {t_tri:.2f}s "
+         f"full FDK 256^3/360v: torch {t_tor:.2f}s vs leap {t_tri:.2f}s "
          f"({t_tor / t_tri:.1f}x)")
 
     print(f"\n{'ALL PASS' if not FAIL else 'FAILED: ' + ', '.join(FAIL)}", flush=True)

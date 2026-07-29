@@ -19,8 +19,10 @@ T3b coarse central difference (delta=0.02, the old bridge_pair step) vs analytic
 T4  value-path factoring: fdk_conebeam_3d_tangent's x output vs fdk_conebeam_3d_batched
     (weights folded into the sinogram BEFORE the filter). This is the "positive per-view
     scalar commutes with cosine/Wang/ohnesorge-clamp/ramp" claim:        rel max < 5e-4
-T5  the fp32 Triton fused kernel vs the fp32 torch reference, same filtered sinogram:
-      value rel max < 1e-4;  tangent rel rms < 1e-3 AND outlier fraction (rel > 1e-3) < 1e-3.
+T5  the fp32 fast path vs the fp32 torch reference, same filtered sinogram:
+      value rel max < 5e-2 (the fast value is LEAP's backprojector since 2026-07-30 --
+      cross-model, panel-edge dominated, see the bar note in the code; T4 carries the tight
+      value identity);  tangent rel rms < 1e-3 AND outlier fraction (rel > 1e-3) < 1e-3.
     The tangent's MAX is deliberately NOT gated: the bilinear derivative g_u is DISCONTINUOUS
     at detector-cell edges, so a voxel whose ju lands within an ulp of an integer can be put
     on opposite sides by the two implementations' fp32 op orders (einsum vs in-register dot),
@@ -182,7 +184,13 @@ def main():
     # max NOT gated for the tangent -- cell-edge kink voxels, see the module docstring
     reld = (dx_tan - dx_ref).abs() / dx_ref.abs().amax().clamp_min(1e-30)
     frac = float((reld > 1e-3).float().mean())
-    gate("T5 triton-vs-torch", m_x < 1e-4 and r_d < 1e-3 and frac < 1e-3,
+    # VALUE bar moved 1e-4 -> 5e-2 on 2026-07-30: the fast path's value is now LEAP's VD
+    # backprojection (a different-but-gated model) while the torch reference keeps
+    # grid_sample -- same cross-model panel-edge story as gate_fdk_fast G1 (this synthetic
+    # sinogram has O(1) values at the panel edge; the physical round-trips sit at ~5e-4).
+    # The IMPORTANT value identity is T4 (tangent-x == batched-x, both on the deployed
+    # path), which stays at 5e-4.
+    gate("T5 fast-vs-torch", m_x < 5e-2 and r_d < 1e-3 and frac < 1e-3,
          f"value rel {m_x:.3e} | tangent rms {r_d:.3e}, max {m_d:.3e} (not gated), "
          f"frac>1e-3 {frac:.2e}")
 

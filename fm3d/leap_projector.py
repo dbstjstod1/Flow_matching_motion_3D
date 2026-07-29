@@ -222,6 +222,36 @@ GRAD_MODE = "auto"           # 'auto': trend-faithful per branch (SF -> retired-
                              # 'sf':   the retired-SF surrogate on both branches
 
 
+def leap_fdk_backproject(g, Pmat, *, D, H, W, dx, dy, dz, du, dv, u0=0.0, v_off=0.0):
+    """FDK distance-weighted backprojection THROUGH LEAP's modular VD backprojector.
+
+    The FDK step our `triton_backproject.backproject_static` used to do: for each voxel,
+    sum bilinear(g_filtered)(hit point) / w^2 over views. LEAP's VD kernel instead weights
+    each contribution by  sdd * dist(hit) / w^2  (its geometric `backprojectionWeight`:
+    pmcn * sqrt(D^2(ru^2+rv^2) + pmcn^2) / (r.n)^2, with |pmcn| = sdd and
+    D*(r.u), D*(r.v) = the hit point's central-ray detector coordinates) and multiplies the
+    result by dx*dy*dz/(du*dv). So dividing the FILTERED sinogram by sdd*dist(u,v) and the
+    output by LEAP's voxel/detector scalar turns LEAP's backprojection into OUR FDK step --
+    exactly, up to interpolating the folded weight together with the data (bilinear of a
+    product vs product of bilinears; second-order in the detector cell) and LEAP's tex
+    border handling of off-panel rays (zero, like our mask). Gated against the torch FDK
+    reference by `gate_fdk_fast.py`.
+
+    g (B,V,nv,nu) = the fully filtered sinogram in the FINAL panel coordinate system
+    (u0/v_off = its centre offsets, half-fan enlargement included). Angular weights are the
+    caller's business, exactly as with the retired kernel.
+    """
+    B, V, nv, nu = g.shape
+    sdd = float(Pmat[..., 0, :3].to(torch.float64).norm(dim=-1).mean())
+    uu = (torch.arange(nu, device=g.device, dtype=g.dtype) - (nu - 1) * 0.5) * du + u0
+    vv = (torch.arange(nv, device=g.device, dtype=g.dtype) - (nv - 1) * 0.5) * dv + v_off
+    dist = torch.sqrt(sdd * sdd + uu[None, :] ** 2 + vv[:, None] ** 2)
+    g2 = (g / (sdd * dist)[None, None]).contiguous()
+    out = leap_backproject(g2, Pmat, D=D, H=H, W=W, dx=dx, dy=dy, dz=dz, du=du, dv=dv,
+                           u0=u0, v_off=v_off, mode="VD")
+    return out * (du * dv / (dx * dy * dz))
+
+
 class LEAPProject(torch.autograd.Function):
     """Differentiable `(vol, P) -> sinogram`.
 
