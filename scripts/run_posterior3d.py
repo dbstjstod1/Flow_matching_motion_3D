@@ -768,10 +768,11 @@ def main():
     #   our SF matched pair             matched to ~1e-6 and the only one with a geometry
     #                                   gradient at the time -- now gates-only (triton_sf);
     #                                   LEAP's own SF kernel is what the Joseph pin excludes.
-    # The ONE operator in production that is not LEAP's: triton_backproject.backproject_tangent,
-    # the bridge's analytic ds-derivative, because LEAP ships no tangent (trainer only; the
-    # value alongside it comes from LEAP). `reference_project_3d_batched` is the gates'
-    # independent pair; nothing in production can reach it.
+    # Every production VALUE operator is LEAP's. The two DERIVATIVE kernels are ours -- the
+    # estimator's d/dP (triton_leap_grad.leap_grad_P) and the bridge's ds-tangent
+    # (leap_fdk_backproject_tangent) -- but both are EXACT derivatives of LEAP's own kernels
+    # (LEAP ships none), so there is no second model anywhere. `reference_project_3d_batched`
+    # is the gates' independent pair; nothing in production can reach it.
     # ---- ADMM-TV (the STANDARD form; see admm_dc_step) -----------------------------------
     # NOTE rho is NOT cg_lam: rho multiplies D^T D, cg_lam multiplies I. Different operators.
     # Only lam/rho sets the soft threshold; rho alone conditions the CG system.

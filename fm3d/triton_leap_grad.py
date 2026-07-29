@@ -544,6 +544,201 @@ if HAVE_TRITON:
             tl.atomic_add(ob + 11, tl.sum(tl.where(mask, bu_z, zero)).to(tl.float64), sem="relaxed")
 
 
+if HAVE_TRITON:
+
+    @triton.jit
+    def _vd_tangent_kernel(g_ptr, src_ptr, mod_ptr, rowv_ptr, colv_ptr,
+                           dsrc_ptr, dmod_ptr, drowv_ptr, dcolv_ptr,
+                           wgt_ptr, dwgt_ptr, out_ptr, dout_ptr,
+                           V, nv, nu, Npix, W, H, D,
+                           dx, dy, dz, du, dv, eps,
+                           BLOCK: tl.constexpr):
+        """VALUE and s-directional DERIVATIVE of LEAP's modular VD backprojection.
+
+        The value replicates `modularBeamBackprojectorKernel_vox_stack` exactly (general
+        branch; the |n.z|<=1e-5 branch is the same maths with D hoisted): per (voxel, view)
+
+            n = u x v,  pmc = p - c,  r = x - p,  D = -(pmc.n)/(r.n)
+            ju = (pmc.u + D r.u)/du + (nu-1)/2      jv likewise with v, dv
+            Wt = (pmc.n) sqrt(D^2((r.u)^2+(r.v)^2) + (pmc.n)^2) / (r.n)^2
+            out += wgt_view * Wt * bilerp(g2; ju, jv)
+
+        (LEAP's dxdydz/(dudv) scalar and our FDK wrapper's inverse cancel, so none appears;
+        `g2` arrives with the 1/(sdd*dist) fold already applied, exactly like the value path.)
+
+        The derivative is the product rule through every geometry-dependent factor, with
+        (dp, dc, du_vec, dv_vec) = d/ds of the modular arrays along Pdot (supplied by
+        `modular_arrays_jvp`), plus the per-view weight derivative dwgt (the Voronoi share
+        moves with the orbit). The bilinear cell and the border mask are FROZEN at the
+        evaluation point -- the same a.e. convention as everywhere else in this module; the
+        interpolant's own (d/dju, d/djv) come from the same four taps.
+
+        Voxel-driven, no atomics, deterministic. One lane = one voxel, loop over views.
+        """
+        pid_b = tl.program_id(1)
+        p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = p < Npix
+        iz = p // (H * W)
+        rem = p - iz * (H * W)
+        iy = rem // W
+        ixv = rem - iy * W
+        x = (ixv.to(tl.float32) - (W - 1) * 0.5) * dx
+        y = (iy.to(tl.float32) - (H - 1) * 0.5) * dy
+        z = (iz.to(tl.float32) - (D - 1) * 0.5) * dz
+        off_u = (nu - 1) * 0.5
+        off_v = (nv - 1) * 0.5
+        acc = tl.zeros((BLOCK,), dtype=tl.float32)
+        dacc = tl.zeros((BLOCK,), dtype=tl.float32)
+        for view in range(0, V):
+            px = tl.load(src_ptr + view * 3 + 0)
+            py = tl.load(src_ptr + view * 3 + 1)
+            pz = tl.load(src_ptr + view * 3 + 2)
+            cx = tl.load(mod_ptr + view * 3 + 0)
+            cy = tl.load(mod_ptr + view * 3 + 1)
+            cz = tl.load(mod_ptr + view * 3 + 2)
+            vx = tl.load(rowv_ptr + view * 3 + 0)
+            vy = tl.load(rowv_ptr + view * 3 + 1)
+            vz = tl.load(rowv_ptr + view * 3 + 2)
+            ux = tl.load(colv_ptr + view * 3 + 0)
+            uy = tl.load(colv_ptr + view * 3 + 1)
+            uz = tl.load(colv_ptr + view * 3 + 2)
+            dpx = tl.load(dsrc_ptr + view * 3 + 0)
+            dpy = tl.load(dsrc_ptr + view * 3 + 1)
+            dpz = tl.load(dsrc_ptr + view * 3 + 2)
+            dcx = tl.load(dmod_ptr + view * 3 + 0)
+            dcy = tl.load(dmod_ptr + view * 3 + 1)
+            dcz = tl.load(dmod_ptr + view * 3 + 2)
+            dvx = tl.load(drowv_ptr + view * 3 + 0)
+            dvy = tl.load(drowv_ptr + view * 3 + 1)
+            dvz = tl.load(drowv_ptr + view * 3 + 2)
+            dux = tl.load(dcolv_ptr + view * 3 + 0)
+            duy = tl.load(dcolv_ptr + view * 3 + 1)
+            duz = tl.load(dcolv_ptr + view * 3 + 2)
+            wg = tl.load(wgt_ptr + pid_b * V + view)
+            dwg = tl.load(dwgt_ptr + pid_b * V + view)
+
+            nx = uy * vz - uz * vy
+            ny = uz * vx - ux * vz
+            nz = ux * vy - uy * vx
+            dnx = duy * vz + uy * dvz - duz * vy - uz * dvy
+            dny = duz * vx + uz * dvx - dux * vz - ux * dvz
+            dnz = dux * vy + ux * dvy - duy * vx - uy * dvx
+            pmcx = px - cx
+            pmcy = py - cy
+            pmcz = pz - cz
+            dpmcx = dpx - dcx
+            dpmcy = dpy - dcy
+            dpmcz = dpz - dcz
+            pmcn = pmcx * nx + pmcy * ny + pmcz * nz
+            dpmcn = dpmcx * nx + dpmcy * ny + dpmcz * nz \
+                + pmcx * dnx + pmcy * dny + pmcz * dnz
+            pmcu = pmcx * ux + pmcy * uy + pmcz * uz
+            dpmcu = dpmcx * ux + dpmcy * uy + dpmcz * uz \
+                + pmcx * dux + pmcy * duy + pmcz * duz
+            pmcv = pmcx * vx + pmcy * vy + pmcz * vz
+            dpmcv = dpmcx * vx + dpmcy * vy + dpmcz * vz \
+                + pmcx * dvx + pmcy * dvy + pmcz * dvz
+
+            rx = x - px
+            ry = y - py
+            rz = z - pz
+            rdn = rx * nx + ry * ny + rz * nz
+            drdn = -dpx * nx - dpy * ny - dpz * nz + rx * dnx + ry * dny + rz * dnz
+            ok = mask & (tl.abs(rdn) > eps)
+            rdn_s = tl.where(tl.abs(rdn) > eps, rdn, 1.0)
+            inv_rdn = 1.0 / rdn_s
+            Dm = -pmcn * inv_rdn
+            # d(-pmcn/rdn) = -(dpmcn - pmcn*drdn/rdn)/rdn, and pmcn/rdn = -Dm
+            dDm = -(dpmcn + Dm * drdn) * inv_rdn
+            ru = rx * ux + ry * uy + rz * uz
+            dru = -dpx * ux - dpy * uy - dpz * uz + rx * dux + ry * duy + rz * duz
+            rv = rx * vx + ry * vy + rz * vz
+            drv = -dpx * vx - dpy * vy - dpz * vz + rx * dvx + ry * dvy + rz * dvz
+
+            ju = (pmcu + Dm * ru) / du + off_u
+            jv = (pmcv + Dm * rv) / dv + off_v
+            dju = (dpmcu + dDm * ru + Dm * dru) / du
+            djv = (dpmcv + dDm * rv + Dm * drv) / dv
+
+            rho2 = ru * ru + rv * rv
+            drho2 = 2.0 * (ru * dru + rv * drv)
+            S2 = Dm * Dm * rho2 + pmcn * pmcn
+            S = tl.sqrt(tl.maximum(S2, 1e-30))
+            dS = (Dm * dDm * rho2 + 0.5 * Dm * Dm * drho2 + pmcn * dpmcn) / S
+            Wt = pmcn * S * inv_rdn * inv_rdn
+            dWt = (dpmcn * S + pmcn * dS) * inv_rdn * inv_rdn \
+                - 2.0 * Wt * drdn * inv_rdn
+
+            # -- bilinear taps, grid_sample(zeros) convention == tex border-zero
+            x0 = tl.floor(ju)
+            y0 = tl.floor(jv)
+            fu = ju - x0
+            fv = jv - y0
+            iu = x0.to(tl.int32)
+            ivx = y0.to(tl.int32)
+            base = ((pid_b * V + view) * nv).to(tl.int64) * nu
+            oku0 = (iu >= 0) & (iu < nu)
+            oku1 = (iu + 1 >= 0) & (iu + 1 < nu)
+            okv0 = (ivx >= 0) & (ivx < nv)
+            okv1 = (ivx + 1 >= 0) & (ivx + 1 < nv)
+            fl = base + ivx.to(tl.int64) * nu + iu
+            t00 = tl.load(g_ptr + fl, mask=ok & okv0 & oku0, other=0.0)
+            t10 = tl.load(g_ptr + fl + 1, mask=ok & okv0 & oku1, other=0.0)
+            t01 = tl.load(g_ptr + fl + nu, mask=ok & okv1 & oku0, other=0.0)
+            t11 = tl.load(g_ptr + fl + nu + 1, mask=ok & okv1 & oku1, other=0.0)
+            G = (1.0 - fu) * (1.0 - fv) * t00 + fu * (1.0 - fv) * t10 \
+                + (1.0 - fu) * fv * t01 + fu * fv * t11
+            Gu = (1.0 - fv) * (t10 - t00) + fv * (t11 - t01)
+            Gv = (1.0 - fu) * (t01 - t00) + fu * (t11 - t10)
+            dG = Gu * dju + Gv * djv
+
+            acc += tl.where(ok, wg * Wt * G, 0.0)
+            dacc += tl.where(ok, wg * (Wt * dG + dWt * G) + dwg * Wt * G, 0.0)
+
+        tl.store(out_ptr + pid_b.to(tl.int64) * Npix + p, acc, mask=mask)
+        tl.store(dout_ptr + pid_b.to(tl.int64) * Npix + p, dacc, mask=mask)
+
+
+def modular_arrays_jvp(P: torch.Tensor, dP: torch.Tensor, u0: float, v_off: float):
+    """(arrays, d/ds arrays) of the modular decomposition along Pdot, fp64 -> fp32.
+
+    The forward-mode twin of the vjp in `leap_grad_P`: the bridge parameterizes the orbit as
+    P(s) and needs d(src, mod, rowv, colv)/ds for the tangent kernel above."""
+    P64 = P.detach().to(torch.float64)
+    dP64 = dP.detach().to(torch.float64)
+    arrs, darrs = torch.autograd.functional.jvp(
+        lambda Q: modular_arrays_torch(Q, u0, v_off), P64, dP64)
+    to32 = lambda t: t.to(torch.float32).contiguous()
+    return tuple(to32(a) for a in arrs), tuple(to32(d) for d in darrs)
+
+
+def leap_vd_backproject_tangent(g2, P, dP, wgt, dwgt, *, D, H, W, dx, dy, dz, du, dv,
+                                u0=0.0, v_off=0.0, block=256):
+    """(x, dx/ds) of `sum_v wgt_v * VD-backprojection_v(g2; geometry(P))` along (dP, dwgt).
+
+    `g2` (B,V,nv,nu) is the FILTERED sinogram with the 1/(sdd*dist) fold already applied --
+    i.e. exactly what the deployed `leap_fdk_backproject` interpolates -- and s-independent.
+    The caller applies the physical-norm scale, like every other backprojection here."""
+    B, V, nv, nu = g2.shape
+    x = torch.empty((B, D, H, W), device=g2.device, dtype=torch.float32)
+    dxds = torch.empty_like(x)
+    g2 = g2.contiguous().to(torch.float32)
+    wgt = wgt.to(g2.device, torch.float32).reshape(B, V).contiguous()
+    dwgt = dwgt.to(g2.device, torch.float32).reshape(B, V).contiguous()
+    Npix = D * H * W
+    grid = (triton.cdiv(Npix, block), B)
+    for b in range(B):
+        (src, mod, rowv, colv), (dsrc, dmod, drowv, dcolv) = \
+            modular_arrays_jvp(P[b], dP[b], u0, v_off)
+        _vd_tangent_kernel[grid[:1] + (1,)](
+            g2[b:b + 1], src, mod, rowv, colv, dsrc, dmod, drowv, dcolv,
+            wgt[b:b + 1], dwgt[b:b + 1], x[b:b + 1], dxds[b:b + 1],
+            V, nv, nu, Npix, W, H, D,
+            float(dx), float(dy), float(dz), float(du), float(dv), 1e-8,
+            BLOCK=block)
+    return x, dxds
+
+
 def modular_arrays_torch(P: torch.Tensor, u0: float, v_off: float):
     """Differentiable P (V,3,4) -> (src, mod, rowv, colv), each (V,3), P's dtype/device.
 

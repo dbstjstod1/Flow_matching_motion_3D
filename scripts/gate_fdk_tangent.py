@@ -172,31 +172,35 @@ def main():
     sino32 = g64.float()
     w32, dw32 = w0.float(), dw0.float()
 
-    os.environ["FM3D_FDK_TRITON"] = "1"
+    os.environ["FM3D_FDK_TANGENT_LEAP"] = "1"
     x_tan, dx_tan = fdk_conebeam_3d_tangent(sino32, P32, dP32, u, v, cfg, **vox,
                                             view_weight=w32, view_weight_dot=dw32)
     x_plain = fdk_conebeam_3d_batched(sino32, P32, u, v, cfg, **vox, view_weight=w32)
     m, r = rel(x_tan, x_plain)
     gate("T4 value-factoring", m < 5e-4, f"rel max {m:.3e} rms {r:.3e}")
 
-    os.environ["FM3D_FDK_TRITON"] = "0"
+    os.environ["FM3D_FDK_TANGENT_LEAP"] = "0"
     x_ref, dx_ref = fdk_conebeam_3d_tangent(sino32, P32, dP32, u, v, cfg, **vox,
                                             view_weight=w32, view_weight_dot=dw32)
-    os.environ.pop("FM3D_FDK_TRITON", None)
+    os.environ.pop("FM3D_FDK_TANGENT_LEAP", None)
     m_x, _ = rel(x_tan, x_ref)
     m_d, r_d = rel(dx_tan, dx_ref)
-    # max NOT gated for the tangent -- cell-edge kink voxels, see the module docstring
     reld = (dx_tan - dx_ref).abs() / dx_ref.abs().amax().clamp_min(1e-30)
     frac = float((reld > 1e-3).float().mean())
-    # VALUE bar moved 1e-4 -> 5e-2 on 2026-07-30: the fast path's value is now LEAP's VD
-    # backprojection (a different-but-gated model) while the torch reference keeps
-    # grid_sample -- same cross-model panel-edge story as gate_fdk_fast G1 (this synthetic
-    # sinogram has O(1) values at the panel edge; the physical round-trips sit at ~5e-4).
-    # The IMPORTANT value identity is T4 (tangent-x == batched-x, both on the deployed
-    # path), which stays at 5e-4.
-    gate("T5 fast-vs-torch", m_x < 5e-2 and r_d < 1e-3 and frac < 1e-3,
-         f"value rel {m_x:.3e} | tangent rms {r_d:.3e}, max {m_d:.3e} (not gated), "
-         f"frac>1e-3 {frac:.2e}")
+    # T5 IS A CROSS-MODEL CONSISTENCY CHECK since 2026-07-30 (twice over): the deployed
+    # value is LEAP's VD backprojection and the deployed TANGENT is its exact derivative
+    # (`leap_fdk_backproject_tangent`), while the torch arm keeps the RETIRED
+    # bilinear/1-over-w^2 model and its tangent. So both columns measure a model gap, not an
+    # implementation defect: value ~3e-2 on this synthetic full-support sinogram (panel-edge
+    # dominated, like gate_fdk_fast G1; measured 6.0e-2 here since BOTH the interpolation
+    # and the ray weight differ between the models, vs ~3e-2 when only interpolation did;
+    # physical round-trips sit at ~5e-4), tangent rms at
+    # the ~0.5% cross-model level the tangent-target ledger measured. The EXACTNESS referee
+    # for the deployed tangent is dev_leap_ref_autograd's fp64 jvp (5.0e-5); the value
+    # identity that matters is T4 (tangent-x == batched-x, both deployed), still at 5e-4.
+    gate("T5 deployed-vs-retired-model", m_x < 1e-1 and r_d < 2e-2,
+         f"value rel {m_x:.3e} | tangent rms {r_d:.3e}, max {m_d:.3e}, "
+         f"frac>1e-3 {frac:.2e} (cross-model, informational)")
 
     # ---- T6: full scale -- consistency + the timing that motivated all of this -------------
     cfgF = ConeBeam3DConfig.thies(n_views=360)
@@ -207,14 +211,14 @@ def main():
     voxF = dict(D=256, H=256, W=256, dx=1.0, dy=1.0, dz=1.0)
     s_mid = 0.5
 
-    def fdk_at(s, triton=True):
-        os.environ["FM3D_FDK_TRITON"] = "1" if triton else "0"
+    def fdk_at(s, leap=True):
+        os.environ["FM3D_FDK_LEAP"] = "1" if leap else "0"
         try:
             Ps = params_to_Pmot(s * thF, P_nomF)[None]
             return fdk_conebeam_3d_batched(sF, Ps, uF, vF, cfgF, **voxF,
                                            view_weight=view_angular_weights(Ps))
         finally:
-            os.environ.pop("FM3D_FDK_TRITON", None)
+            os.environ.pop("FM3D_FDK_LEAP", None)
 
     def tangent_at(s):
         PF, dPF = bridge_P_and_dP(thF, P_nomF, s)

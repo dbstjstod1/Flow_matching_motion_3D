@@ -261,7 +261,7 @@ GRAD_MODE = "leap"           # 'leap': the EXACT gradient of LEAP's own kernel -
 def leap_fdk_backproject(g, Pmat, *, D, H, W, dx, dy, dz, du, dv, u0=0.0, v_off=0.0):
     """FDK distance-weighted backprojection THROUGH LEAP's modular VD backprojector.
 
-    The FDK step our `triton_backproject.backproject_static` used to do: for each voxel,
+    The FDK step our retired fused Triton kernel used to do: for each voxel,
     sum bilinear(g_filtered)(hit point) / w^2 over views. LEAP's VD kernel instead weights
     each contribution by  sdd * dist(hit) / w^2  (its geometric `backprojectionWeight`:
     pmcn * sqrt(D^2(ru^2+rv^2) + pmcn^2) / (r.n)^2, with |pmcn| = sdd and
@@ -286,6 +286,35 @@ def leap_fdk_backproject(g, Pmat, *, D, H, W, dx, dy, dz, du, dv, u0=0.0, v_off=
     out = leap_backproject(g2, Pmat, D=D, H=H, W=W, dx=dx, dy=dy, dz=dz, du=du, dv=dv,
                            u0=u0, v_off=v_off, mode="VD")
     return out * (du * dv / (dx * dy * dz))
+
+
+def leap_fdk_backproject_tangent(g, Pmat, Pdot, wgt, dwgt, *, D, H, W, dx, dy, dz, du, dv,
+                                 u0=0.0, v_off=0.0):
+    """(x, dx/ds) of the DEPLOYED FDK backprojection -- the bridge's velocity target.
+
+    The tangent twin of `leap_fdk_backproject`: same 1/(sdd*dist) weight fold, same VD
+    backprojection model, and the derivative is the EXACT s-derivative of that very model
+    (`triton_leap_grad.leap_vd_backproject_tangent`, chained through the modular
+    decomposition's jvp). Until 2026-07-30 the tangent came from the retired kernel's model
+    instead (~0.5% cross-model error in the FM velocity target -- measured in the
+    tangent-is-the-training-target ledger); LEAP ships no derivative, so this closes the
+    last non-LEAP operator in production. Per-view weights (wgt, dwgt) ride INSIDE the sum
+    so the Voronoi share's own s-derivative lands in dx/ds.
+
+    NOTE the VALUE output is this kernel's own bilinear (not LEAP's texture unit): identical
+    maths, ~1e-4 apart (tex 9-bit lerp). Callers that must match the static anchor BIT-TIGHT
+    keep taking the value from `leap_fdk_backproject` and only the derivative from here.
+    """
+    B, V, nv, nu = g.shape
+    sdd = float(Pmat[..., 0, :3].to(torch.float64).norm(dim=-1).mean())
+    uu = (torch.arange(nu, device=g.device, dtype=g.dtype) - (nu - 1) * 0.5) * du + u0
+    vv = (torch.arange(nv, device=g.device, dtype=g.dtype) - (nv - 1) * 0.5) * dv + v_off
+    dist = torch.sqrt(sdd * sdd + uu[None, :] ** 2 + vv[:, None] ** 2)
+    g2 = (g / (sdd * dist)[None, None]).contiguous()
+    from .triton_leap_grad import leap_vd_backproject_tangent
+    return leap_vd_backproject_tangent(g2, Pmat, Pdot, wgt, dwgt, D=D, H=H, W=W,
+                                       dx=dx, dy=dy, dz=dz, du=du, dv=dv,
+                                       u0=u0, v_off=v_off)
 
 
 class LEAPProject(torch.autograd.Function):

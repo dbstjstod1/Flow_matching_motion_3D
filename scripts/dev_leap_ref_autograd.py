@@ -241,6 +241,86 @@ def main():
             check(f"[{kind}] d/d{nm}: kernel vs autograd", rel < max(3 * floor, 2e-4),
                   f"rel = {rel:.2e}  (fp32 floor {floor:.1e})")
 
+    # ---- the VD BACKPROJECTION TANGENT (the bridge's velocity target, 2026-07-30) ---------
+    # `leap_fdk_backproject_tangent` claims to be the EXACT s-derivative of the deployed FDK
+    # backprojection. Referee: a pure-torch fp64 replica of the VD model, jvp'd through the
+    # modular decomposition AND the per-view weights. Smooth sinogram -- the kink trap above
+    # applies here too (bilinear cells in (ju, jv) instead of volume voxels).
+    from fm3d.leap_projector import leap_fdk_backproject_tangent
+
+    def vd_ref(g2, src, mod, rowv, colv, wgt, *, D, H, W, dx, dz, du, dv):
+        V, nv_, nu_ = g2.shape
+        dt = g2.dtype
+        ii = torch.arange(W, device=g2.device, dtype=dt)
+        jj = torch.arange(H, device=g2.device, dtype=dt)
+        kk = torch.arange(D, device=g2.device, dtype=dt)
+        zz, yy, xx = torch.meshgrid((kk - (D - 1) / 2) * dz, (jj - (H - 1) / 2) * dx,
+                                    (ii - (W - 1) / 2) * dx, indexing="ij")
+        out = torch.zeros((D, H, W), device=g2.device, dtype=dt)
+        for i in range(V):
+            u_, v_, p_, c_ = colv[i], rowv[i], src[i], mod[i]
+            n_ = torch.linalg.cross(u_, v_)
+            pmc = p_ - c_
+            pmcn, pmcu, pmcv = (pmc * n_).sum(), (pmc * u_).sum(), (pmc * v_).sum()
+            rx, ry, rz = xx - p_[0], yy - p_[1], zz - p_[2]
+            rdn = rx * n_[0] + ry * n_[1] + rz * n_[2]
+            Dm = -pmcn / rdn
+            ru = rx * u_[0] + ry * u_[1] + rz * u_[2]
+            rv = rx * v_[0] + ry * v_[1] + rz * v_[2]
+            ju = (pmcu + Dm * ru) / du + (nu_ - 1) / 2
+            jv = (pmcv + Dm * rv) / dv + (nv_ - 1) / 2
+            Wt = pmcn * torch.sqrt(Dm ** 2 * (ru ** 2 + rv ** 2) + pmcn ** 2) / rdn ** 2
+            x0 = torch.floor(ju)
+            y0 = torch.floor(jv)
+            fu, fv = ju - x0, jv - y0
+            iu, iv = x0.long(), y0.long()
+            gi = g2[i]
+
+            def tap(a, b):
+                okm = (a >= 0) & (a < nv_) & (b >= 0) & (b < nu_)
+                return gi[a.clamp(0, nv_ - 1), b.clamp(0, nu_ - 1)] * okm.to(dt)
+
+            G = (1 - fu) * (1 - fv) * tap(iv, iu) + fu * (1 - fv) * tap(iv, iu + 1) \
+                + (1 - fu) * fv * tap(iv + 1, iu) + fu * fv * tap(iv + 1, iu + 1)
+            out = out + wgt[i] * Wt * G
+        return out
+
+    from fm3d.rigid_motion import bridge_P_and_dP
+    th_t = torch.randn(6, 6, device=DEV, dtype=torch.float64) * torch.tensor(
+        [3., 3., 3., .05, .05, .05], device=DEV, dtype=torch.float64)
+    th_t[2, 3] += 0.14
+    P_nom64 = build_conebeam_orbit(cfg, device=DEV, dtype=torch.float64)
+    P_t, dP_t = bridge_P_and_dP(th_t, P_nom64, 0.37)
+    nvt, nut = 64, 88
+    dut, dvt = du * 1.2, dv * 1.2
+    g_t = torch.rand(1, 6, nvt, nut, device=DEV)
+    g_t = torch.nn.functional.avg_pool2d(g_t.view(6, 1, nvt, nut), 9, 1, 4)
+    g_t = torch.nn.functional.avg_pool2d(g_t, 9, 1, 4).view(1, 6, nvt, nut).contiguous()
+    wgt_t = torch.rand(1, 6, device=DEV) + 0.5
+    dwgt_t = torch.randn(1, 6, device=DEV) * 0.1
+    x_k, dx_k = leap_fdk_backproject_tangent(
+        g_t, P_t[None].float(), dP_t[None].float(), wgt_t, dwgt_t,
+        D=D, H=H, W=W, dx=dx, dy=dx, dz=dz, du=dut, dv=dvt)
+    sddt = float(P_t[:, 0, :3].norm(dim=-1).mean())
+    uu_t = (torch.arange(nut, device=DEV) - (nut - 1) / 2) * dut
+    vv_t = (torch.arange(nvt, device=DEV) - (nvt - 1) / 2) * dvt
+    dist_t = torch.sqrt(torch.tensor(sddt ** 2, device=DEV)
+                        + uu_t[None, :] ** 2 + vv_t[:, None] ** 2)
+    g2_t = (g_t[0] / (sddt * dist_t)[None]).to(torch.float64)
+
+    def tang_ref(P64, w64):
+        a = modular_arrays_torch(P64, 0.0, 0.0)
+        return vd_ref(g2_t, a[0], a[1], a[2], a[3], w64,
+                      D=D, H=H, W=W, dx=dx, dz=dz, du=dut, dv=dvt)
+
+    x_r, dx_r = torch.autograd.functional.jvp(
+        tang_ref, (P_t, wgt_t[0].to(torch.float64)),
+        (dP_t, dwgt_t[0].to(torch.float64)))
+    rv_ = float((x_k[0] - x_r.float()).norm() / x_r.norm())
+    rt_ = float((dx_k[0] - dx_r.float()).norm() / dx_r.norm())
+    check("[VD-TANGENT] value: kernel vs torch reference", rv_ < 5e-6, f"rel = {rv_:.2e}")
+    check("[VD-TANGENT] ds-derivative: kernel vs fp64 jvp", rt_ < 5e-4, f"rel = {rt_:.2e}")
+
     print("\n" + ("ALL CHECKS PASS" if not _FAILED else f"FAILED: {_FAILED}"))
     return 1 if _FAILED else 0
 

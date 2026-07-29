@@ -14,9 +14,11 @@ WHAT STAYS OURS, AND WHY:
     is LEAP's modular VD backprojector (`leap_projector.leap_fdk_backproject`, which folds
     LEAP's geometric ray weight back to our exact 1/w^2 convention; parity vs the retired
     fused kernel 3.1e-3 / ls-scale 1.000000, and faster). FM3D_FDK_LEAP=0 forces the torch
-    reference loop. The bridge's analytic s-TANGENT stays on our fused kernel
-    (`triton_backproject.backproject_tangent`) -- LEAP has no tangent -- while the tangent
-    path's VALUE also comes from LEAP, keeping x(1) consistent with the static anchor.
+    reference loop. The bridge's analytic s-TANGENT is the EXACT derivative of that same VD
+    model (`leap_fdk_backproject_tangent` -- LEAP ships no derivative, so we differentiated
+    its kernel; fp64-jvp parity 5.0e-5), while the tangent path's VALUE comes from the same
+    `leap_fdk_backproject` call the anchor uses, keeping x(1) bit-consistent with it.
+    FM3D_FDK_TANGENT_LEAP=0 forces the torch tangent reference.
   * `d(loss)/dP`, in `triton_leap_grad.leap_grad_P`. LEAP has no geometry derivative at all
     (`leaptorch`'s backward returns the volume gradient and `None` for everything else), so
     the motion estimator could never run on it. `LEAPProject` takes its value and its volume
@@ -50,7 +52,6 @@ import os
 import torch
 import torch.nn.functional as F
 
-from . import triton_backproject
 from .geometry_3d import ConeBeam3DConfig
 from .filters import DEFAULT_RAMP_WINDOW, ramp_filter, calibrate_scale  # ramp; calibrate_scale is gate-only now
 from .leap_projector import leap_backproject_3d_batched, leap_project_3d_batched
@@ -833,7 +834,7 @@ def _backproject_static_torch(g, Pmat, disp, *, D, H, W, dx, dy, dz, du, dv,
 def _backproject_tangent_torch(g, Pmat, Pdot, wgt, dwgt, *, D, H, W, dx, dy, dz, du, dv,
                                u0, v_off, half_u, half_v, eps,
                                view_chunk=8, vox_chunk=2_000_000):
-    """Torch reference for `triton_backproject.backproject_tangent`, dtype-generic.
+    """Torch tangent reference (the RETIRED bilinear/1-over-w^2 model), dtype-generic.
 
     Same math as the fused kernel, in whatever dtype `g` carries -- float64 is the point:
     scripts/gate_fdk_tangent.py uses this at float64 both to certify the tangent MATH against
@@ -1016,18 +1017,19 @@ def fdk_conebeam_3d_tangent(
     needs_grad = torch.is_grad_enabled() and (
         g.requires_grad or Pmat.requires_grad or Pdot.requires_grad
         or wgt.requires_grad or dwgt.requires_grad)
-    if not needs_grad and triton_backproject.enabled() and g.is_cuda:
-        # dx/ds comes from OUR fused tangent kernel (the analytic s-derivative of the
-        # bilinear/1/w^2 FDK model -- LEAP has no tangent); the VALUE x(s) comes from the
-        # SAME LEAP backprojection as `fdk_conebeam_3d_batched`, so the bridge endpoint
-        # x(1) stays bit-consistent with the static anchor. The tangent is therefore the
-        # derivative of a 3e-3-close SIBLING model of the value path -- the same
-        # cross-model contract the theta gradient lives under, gated by
-        # `gate_fdk_tangent.py` (FD of THIS x(s)).
-        _, dxds = triton_backproject.backproject_tangent(
-            g, Pmat, Pdot, wgt, dwgt, D, H, W, dx=dx, dy=dy, dz=dz, du=du, dv=dv,
-            u0=u0, v_off=v_off, half_u=half_u, half_v=half_v, eps=eps)
-        from .leap_projector import leap_fdk_backproject
+    if not needs_grad and g.is_cuda \
+            and os.environ.get("FM3D_FDK_TANGENT_LEAP", "1") != "0":
+        # dx/ds is the EXACT s-derivative of the DEPLOYED value path: since 2026-07-30 the
+        # tangent differentiates LEAP's own VD backprojection (`leap_fdk_backproject_tangent`
+        # -- LEAP ships no derivative, so we differentiated its kernel, closing the last
+        # non-LEAP operator; the retired cross-model tangent carried ~0.5% target error).
+        # The VALUE x(s) still comes from the SAME `leap_fdk_backproject` call the static
+        # anchor uses, so the bridge endpoint x(1) stays bit-consistent with the anchor
+        # (the tangent kernel's own value output is ~1e-4 off through the texture unit).
+        from .leap_projector import leap_fdk_backproject, leap_fdk_backproject_tangent
+        _, dxds = leap_fdk_backproject_tangent(
+            g, Pmat, Pdot, wgt, dwgt, D=D, H=H, W=W, dx=dx, dy=dy, dz=dz,
+            du=du, dv=dv, u0=u0, v_off=v_off)
         x = leap_fdk_backproject(
             g * wgt.to(g.dtype).view(B, V, 1, 1), Pmat, D=D, H=H, W=W,
             dx=dx, dy=dy, dz=dz, du=du, dv=dv, u0=u0, v_off=v_off)
