@@ -765,7 +765,7 @@ def _backproject_static_torch(g, Pmat, disp, *, D, H, W, dx, dy, dz, du, dv,
     """The original torch backprojection loop, chunked over views AND voxels. (B, Npix).
 
     Kept verbatim as (a) the `disp` MC path, which the Triton kernel does not cover, and
-    (b) the FM3D_FDK_TRITON=0 fallback / gate reference."""
+    (b) the FM3D_FDK_LEAP=0 fallback / gate reference for the deployed LEAP-backed path."""
     device, dtype = g.device, g.dtype
     B, V, nv, nu = g.shape
 

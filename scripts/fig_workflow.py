@@ -413,6 +413,9 @@ def draw_manifold(ax):
         arrow(ax, tuple(p), tuple(off), color="#6d28d9", lw=1.7)
         arrow(ax, tuple(off), tuple(q), color="#be123c", lw=1.7)
         ax.plot(*p, "o", ms=5.0, color="#b45309", zorder=5)
+        # ESTIMATE happens exactly HERE -- at the vertex between the two arrows, on the image the
+        # prior just produced. It moves theta, not x, which is why it is a POINT and not a step.
+        ax.plot(*off, "o", ms=6.2, mfc="#15803d", mec="white", mew=1.2, zorder=6)
     ax.plot(*pts[-1], "o", ms=6.5, color=CLEAN[1], zorder=5)
 
     # ---- what each force alone would do ----------------------------------------------------
@@ -429,18 +432,27 @@ def draw_manifold(ax):
     # ---- the legend IS the loop: one step, three moves --------------------------------------
     box(ax, 4.0, 52.5, 58.0, 27.5, "ONE STEP OF THE LOOP  (x50)", "",
         ("#f8fafc", "#334155"), ts=10.2)
-    rows = ((70.5, "#6d28d9", "PREDICT — the prior steps toward $\\mathcal{M}_{clean}$\n"
-                              "it knows the direction: it was TRAINED on this path"),
-            (63.0, "#15803d", "ESTIMATE — $\\hat\\theta$ is refit on that better image,\n"
-                              "which RE-AIMS the constraint set itself"),
-            (55.5, "#be123c", "CORRECT — the data step pulls it back onto\n"
-                              "$\\mathcal{C}(\\hat\\theta)$; the TV corrector keeps it regular"))
-    for yr, col, txt in rows:
-        arrow(ax, (7.5, yr), (13.0, yr), color=col, lw=1.9)
+    # The green row is a POINT, not an arrow: ESTIMATE sits at the vertex BETWEEN the purple and
+    # the red arrow, and it moves theta, not x -- so it has no length in this picture.
+    rows = ((70.5, "#6d28d9", "arrow", "PREDICT — the prior steps toward "
+                                       "$\\mathcal{M}_{clean}$\n"
+                                       "it knows the direction: it was TRAINED on this path"),
+            (63.0, "#15803d", "dot", "ESTIMATE — at the vertex between the two arrows:\n"
+                                     "$\\hat\\theta$ is refit on the image the prior just made.\n"
+                                     "It moves $\\theta$, not $x$ — so $\\mathcal{C}(\\hat"
+                                     "\\theta)$ (dashed) re-aims instead."),
+            (55.0, "#be123c", "arrow", "CORRECT — the data step pulls it back onto\n"
+                                       "$\\mathcal{C}(\\hat\\theta)$; the TV corrector keeps it "
+                                       "regular"))
+    for yr, col, glyph, txt in rows:
+        if glyph == "dot":
+            ax.plot(10.25, yr, "o", ms=6.2 * FS, mfc=col, mec="white", mew=1.2, zorder=5)
+        else:
+            arrow(ax, (7.5, yr), (13.0, yr), color=col, lw=1.9)
         ax.text(15.0, yr, txt, ha="left", va="center", fontsize=8.4 * FS, color="#111827",
                 linespacing=1.5, zorder=3)
-    box(ax, 4.0, 3.0, 74.0, 6.4, "", "the two forces alternate $N=50$ times — neither one "
-        "reaches $\\mathcal{M}_{clean}$ on its own", ("#f8fafc", "#94a3b8"), bs=8.4)
+    box(ax, 4.0, 3.0, 74.0, 6.4, "", "the three moves alternate $N=50$ times — no single one "
+        "reaches $\\mathcal{M}_{clean}$", ("#f8fafc", "#94a3b8"), bs=8.4)
     ax.text(116.0, 48.0, "landing:  $\\bar\\theta$  and the carried  $x_t$", ha="center",
             va="center", fontsize=9.2 * FS, color=CLEAN[1], fontweight="bold", zorder=3)
     arrow(ax, (119.0, 50.5), (123.0, 61.0), color=CLEAN[1], lw=1.3, rad=-0.2)

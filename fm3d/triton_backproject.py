@@ -1,14 +1,15 @@
-"""Fused Triton backprojector for the static FDK (RETIRED to reference duty 2026-07-30),
-plus its ANALYTIC s-tangent (STILL THE PRODUCTION TANGENT).
+"""The bridge's ANALYTIC s-tangent kernel (THE PRODUCTION TANGENT; the static-value kernel
+this module also used to carry was DELETED 2026-07-30).
 
 STATUS: the production FDK VALUE path backprojects through LEAP's modular VD kernel since
-2026-07-30 (`leap_projector.leap_fdk_backproject`; the operator-unification decision).
-`backproject_static` survives as the second implementation the FDK gates compare against
-and as this module's tangent's value-sibling. `backproject_tangent` remains deployed: LEAP
-has no s-derivative, and the bridge's analytic tangent is this kernel -- its VALUE output
-is discarded in production (the value comes from LEAP, keeping the bridge endpoint
-consistent with the static anchor) and its TANGENT is the derivative of this 3e-3-close
-sibling model, gated by `gate_fdk_tangent.py` against FD of the deployed value path.
+2026-07-30 (`leap_projector.leap_fdk_backproject`; the operator-unification decision), and
+the FDK gates compare it against `projector_3d._backproject_static_torch` -- so the old
+`backproject_static`/`_bp_kernel` pair had NO callers left and was removed (git history has
+it). `backproject_tangent` remains deployed: LEAP has no s-derivative, and the bridge's
+analytic tangent is this kernel -- its VALUE output is discarded in production (the value
+comes from LEAP, keeping the bridge endpoint consistent with the static anchor) and its
+TANGENT is the derivative of a 3e-3-close sibling model of the deployed value path, gated by
+`gate_fdk_tangent.py` against FD of that path (T6, rms 1.3e-2 < the historical 2e-2 bar).
 
 WHY. Ported from Flowmatching-4DCT's `fdct/triton_backproject.py` (2026-07-18), where profiling
 put the torch FDK at 14.5 s/call and 70% of a bridge draw -- and INSENSITIVE to view_chunk, so
@@ -48,8 +49,8 @@ vs THE TORCH PATH it is NOT bit-identical, for two reasons, both float-reassocia
   * the view sum is associated ((v0+v1)+v2)+... per voxel here, vs per-view_chunk partial sums;
   * `grid_sample` recovers the pixel coordinate from the normalized grid as
     ((x_norm+1)*nu-1)/2, a round-trip through [-1,1] this kernel skips (it uses ju directly).
-Measured agreement is gated by scripts/gate_fdk_fast.py; gates that compare FDK outputs must
-run BOTH operands through the same backend.
+Measured agreement is gated by scripts/gate_fdk_tangent.py T5; gates that compare FDK outputs
+must run BOTH operands through the same backend.
 
 CONVENTION. Bilinear sampling reproduces `F.grid_sample(mode='bilinear',
 padding_mode='zeros', align_corners=False)`: index 0.0 is the first detector element's
@@ -105,59 +106,6 @@ if HAVE_TRITON:
                 v = tl.load(g_ptr + base + yc * nu + xc, mask=ok, other=0.0)
                 acc += v * (wx * wy)
         return acc
-
-    @triton.jit
-    def _bp_kernel(g_ptr, P_ptr, out_ptr,
-                   V, nv, nu, Npix, W, H, D,
-                   dx, dy, dz, du, dv, u0, v_off,
-                   half_u, half_v, eps,
-                   BLOCK: tl.constexpr, W2: tl.constexpr):
-        # W2: apply FDK's 1/w^2 distance weight (the Feldkamp backprojection). W2=False is the
-        # plain voxel-driven accumulation the open-source iterative solvers use as their
-        # (unmatched) A^T -- RTK's BackProjectionImageFilter and TIGRE's Atb('matched') both
-        # backproject WITHOUT the FDK weight. See projector_3d.backproject_3d_batched.
-        pid_b = tl.program_id(1)
-        p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        mask = p < Npix
-        # voxel linear index -> world mm, matching the torch path's meshgrid exactly:
-        # x/y/z centred at the isocentre, index order (z, y, x) row-major.
-        iz = p // (H * W)
-        rem = p - iz * (H * W)
-        iy = rem // W
-        ix = rem - iy * W
-        x = (ix.to(tl.float32) - (W - 1) * 0.5) * dx
-        y = (iy.to(tl.float32) - (H - 1) * 0.5) * dy
-        z = (iz.to(tl.float32) - (D - 1) * 0.5) * dz
-        acc = tl.zeros((BLOCK,), dtype=tl.float32)
-        for view in range(0, V):
-            pb = P_ptr + (pid_b * V + view) * 12
-            p00 = tl.load(pb + 0)
-            p01 = tl.load(pb + 1)
-            p02 = tl.load(pb + 2)
-            p03 = tl.load(pb + 3)
-            p10 = tl.load(pb + 4)
-            p11 = tl.load(pb + 5)
-            p12 = tl.load(pb + 6)
-            p13 = tl.load(pb + 7)
-            p20 = tl.load(pb + 8)
-            p21 = tl.load(pb + 9)
-            p22 = tl.load(pb + 10)
-            p23 = tl.load(pb + 11)
-            u_h = p00 * x + p01 * y + p02 * z + p03
-            v_h = p10 * x + p11 * y + p12 * z + p13
-            w = p20 * x + p21 * y + p22 * z + p23
-            w_safe = tl.where(tl.abs(w) < eps, eps, w)
-            u = u_h / w_safe
-            v = v_h / w_safe
-            ju = (u - u0) / du + (nu - 1) * 0.5
-            jv = (v - v_off) / dv + (nv - 1) * 0.5
-            base = ((pid_b * V + view) * nv).to(tl.int64) * nu
-            val = _bilinear2d(g_ptr, base, ju, jv, nu, nv, mask)
-            ok = mask & (w > 0) & (tl.abs(u - u0) <= half_u) & (tl.abs(v - v_off) <= half_v)
-            if W2:
-                val = val / (w_safe * w_safe)
-            acc += tl.where(ok, val, 0.0)
-        tl.store(out_ptr + pid_b.to(tl.int64) * Npix + p, acc, mask=mask)
 
     @triton.jit
     def _bp_tangent_kernel(g_ptr, P_ptr, dP_ptr, wgt_ptr, dwgt_ptr, out_ptr, dout_ptr,
@@ -266,31 +214,6 @@ if HAVE_TRITON:
             dacc += tl.where(ok, wg * dcontrib + dwg * contrib, 0.0)
         tl.store(out_ptr + pid_b.to(tl.int64) * Npix + p, acc, mask=mask)
         tl.store(dout_ptr + pid_b.to(tl.int64) * Npix + p, dacc, mask=mask)
-
-
-def backproject_static(g: torch.Tensor, Pmat: torch.Tensor, D: int, H: int, W: int, *,
-                       dx: float, dy: float, dz: float, du: float, dv: float,
-                       u0: float, v_off: float, half_u: float, half_v: float,
-                       eps: float, block: int = 256, w2: bool = True) -> torch.Tensor:
-    """Static cone-beam voxel-driven backprojection. `w2=True` (default) applies FDK's 1/w^2
-    distance weight (a FILTERED sinogram makes this the Feldkamp step); `w2=False` is the plain
-    accumulation the open-source iterative solvers use as their unmatched A^T.
-
-    g (B,V,nv,nu) fp32, Pmat (B,V,3,4) fp32 -> (B,D,H,W). The caller applies the
-    angle_span/V weight and `scale` afterwards, exactly as the torch path does."""
-    if not HAVE_TRITON:
-        raise RuntimeError("triton is not available; use the torch backprojection")
-    B, V, nv, nu = g.shape
-    g = g.contiguous()
-    P = Pmat.reshape(B, V, 12).contiguous().to(torch.float32)
-    Npix = D * H * W
-    out = torch.empty((B, Npix), device=g.device, dtype=torch.float32)
-    grid = (triton.cdiv(Npix, block), B)
-    _bp_kernel[grid](g, P, out, V, nv, nu, Npix, W, H, D,
-                     float(dx), float(dy), float(dz), float(du), float(dv),
-                     float(u0), float(v_off), float(half_u), float(half_v), float(eps),
-                     BLOCK=block, W2=bool(w2))
-    return out.view(B, D, H, W)
 
 
 def backproject_tangent(g: torch.Tensor, Pmat: torch.Tensor, Pdot: torch.Tensor,

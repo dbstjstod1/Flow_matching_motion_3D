@@ -5,12 +5,13 @@ montages (it 10000) that the ray-march era did not show at the same 360 views. T
 
     static = FDK( A(vol; P_nom), P_nom )
 
-i.e. it involves NO motion, NO network, NO training -- so it is fully deterministic and the only
-thing that changed under it is the FORWARD operator A (the FDK backprojection itself is
-`triton_backproject`, untouched by the SF switch). That makes this a clean, cheap A/B.
+i.e. it involves NO motion, NO network, NO training -- so it is fully deterministic. Since
+2026-07-30 the FDK backprojects through LEAP's modular VD kernel too
+(`leap_projector.leap_fdk_backproject`; our algorithm, LEAP's operator -- and note LEAP's
+`ADJOINT_MODE` still never enters an FDK: `leap_fdk_backproject` forces the VD backprojector
+with our 1/w^2 weighting regardless of that flag). That makes this a clean, cheap A/B.
 
-WHAT IT COMPARES, all with the SAME FDK backprojector (ours -- `triton_backproject`; LEAP's
-`ADJOINT_MODE` never enters an FDK), varying only A:
+WHAT IT COMPARES, all with the SAME FDK backprojection path, varying only A:
   * `leap_native` -- THE DEPLOYED SCHEME: y simulated by LEAP at the NATIVE grid du*SOD/SDD
                      (612^3 @ 0.4187 mm), inverted on the reconstruction grid (256^3 @ 1 mm).
                      This is what `gen.simulate()` does with its defaults.
@@ -152,8 +153,8 @@ def main():
     print(f"simulation grid: {gen.sim_shape_dhw} @ {gen.sim_voxel_mm:.5f} mm "
           f"(native = du*SOD/SDD)")
     print(f"THE SCHEME, all defaults: forward/adjoint = LEAP modular-beam | "
-          f"adjoint mode = {ADJOINT_MODE} | FDK = ours (triton_backproject, LEAP's adjoint mode "
-          f"does NOT enter it)")
+          f"adjoint mode = {ADJOINT_MODE} | FDK = our algorithm on LEAP's VD backprojector "
+          f"(leap_fdk_backproject; ADJOINT_MODE does NOT enter it)")
     print(f"                          ramp window = {args.window or DEFAULT_RAMP_WINDOW} "
           f"(= LEAP ord2 x FBPlowpass(2.0)) | Voronoi angular weight = {gen.angle_weight} | "
           f"sim_native = {gen.sim_native}")
