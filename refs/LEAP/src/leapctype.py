@@ -5736,6 +5736,27 @@ class tomographicModels:
         self.set_model()
         return self.libprojectors.set_truncatedScan(aFlag)
         
+    def set_forceJosephModular(self, aFlag):
+        """FM3D PATCH -- force the modular-beam FORWARD onto the Joseph ray-driven kernel.
+
+        Stock LEAP picks between its separable-footprint and Joseph modular projectors per
+        GEOMETRY SET (SF only while every rowVector stays within ~5.06 deg of the z axis, see
+        `parameters::set_sourcesAndModules`). Under per-view rigid motion that switch fires
+        silently and mid-optimization. Set True to disable it and always take Joseph, so one
+        operator serves every geometry. See refs/LEAP/FM3D_PATCH.md.
+        """
+        self.libprojectors.set_forceJosephModular.argtypes = [ctypes.c_bool]
+        self.libprojectors.set_forceJosephModular.restype = ctypes.c_bool
+        self.set_model()
+        return self.libprojectors.set_forceJosephModular(aFlag)
+
+    def get_forceJosephModular(self):
+        """FM3D PATCH -- is the modular forward pinned to the Joseph kernel?"""
+        self.libprojectors.get_forceJosephModular.argtypes = []
+        self.libprojectors.get_forceJosephModular.restype = ctypes.c_bool
+        self.set_model()
+        return self.libprojectors.get_forceJosephModular()
+
     def set_offsetScan(self, aFlag):
         """Set the offsetScan parameter
         

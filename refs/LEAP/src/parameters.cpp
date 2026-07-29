@@ -54,6 +54,7 @@ void parameters::initialize()
 	whichProjector = SEPARABLE_FOOTPRINT;
 	doWeightedBackprojection = false;
 	doExtrapolation = false;
+	forceJosephModular = false;
 	volumeDimensionOrder = ZYX;
 	rampID = 2;
 	FBPlowpass = 1.0;
@@ -158,6 +159,7 @@ void parameters::assign(const parameters& other)
     this->whichProjector = other.whichProjector;
 	this->doWeightedBackprojection = other.doWeightedBackprojection;
 	this->doExtrapolation = other.doExtrapolation;
+	this->forceJosephModular = other.forceJosephModular;
 	this->rampID = other.rampID;
 	this->FBPlowpass = other.FBPlowpass;
 	this->chunkingMemorySizeThreshold = other.chunkingMemorySizeThreshold;

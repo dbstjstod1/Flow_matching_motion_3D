@@ -164,6 +164,8 @@ extern "C" PROJECTOR_API bool set_rFOV(float rFOV_in);
 extern "C" PROJECTOR_API float get_rFOV();
 extern "C" PROJECTOR_API float get_rFOV_min();
 extern "C" PROJECTOR_API float get_rFOV_max();
+extern "C" PROJECTOR_API bool set_forceJosephModular(bool);
+extern "C" PROJECTOR_API bool get_forceJosephModular();
 extern "C" PROJECTOR_API bool set_offsetScan(bool);
 extern "C" PROJECTOR_API bool get_offsetScan();
 extern "C" PROJECTOR_API bool set_truncatedScan(bool);

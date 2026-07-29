@@ -26,12 +26,12 @@ independent rigid pose on every view:
              settings ("hashbl"). This is the deployed default there.
 
 NOTE ON THE PROJECTOR. Motion estimation needs d(loss)/dP. The forward is LEAP's modular-beam
-projector (`projector_3d.forward_project_3d_batched`, no backend switch) and the geometry
-gradient is branch-aware (`leap_projector.GRAD_MODE = "auto"`): the exact gradient of LEAP's
-own Joseph kernel when that branch runs, the continuous-corner SF surrogate on the SF branch
-(the exact SF-model gradient rides a lattice ripple -- `triton_leap_grad`'s docstring has the
-measurements). Gated by `scripts/gate_leap_projector.py` (FD of the LEAP loss itself, in both
-kernel regimes) and `gate_geometry` G4a.
+projector, PINNED to its Joseph kernel (`leap_projector.FORCE_JOSEPH`, no backend switch and
+no kernel switch), and the geometry gradient is the EXACT gradient of that kernel
+(`triton_leap_grad.leap_grad_P`). Because Joseph is bilinear in continuous coordinates the
+exact gradient is also the loss TREND -- the pin removed the SF lattice ripple that used to
+force a surrogate. Gated by `scripts/gate_leap_projector.py` (FD of the LEAP loss itself) and
+`gate_geometry` G4a.
 """
 
 from __future__ import annotations
@@ -171,8 +171,8 @@ class _BaseEstimator:
         # (`n_samples` / `view_chunk` / `row_chunk` / `fp16_vol` / `backend` all lived here and
         # were all ray-march knobs. The operator is LEAP's now -- it has no ray samples, does
         # its own chunking, and there is nothing to select. Removed 2026-07-29. The forward
-        # VALUE is LEAP's; the d/dP this class optimizes through is branch-aware, wired in
-        # `leap_projector.LEAPProject` (GRAD_MODE ledger there).)
+        # VALUE is LEAP's (Joseph, pinned); the d/dP this class optimizes through is that
+        # kernel's exact gradient, wired in `leap_projector.LEAPProject`.)
         # OPTIMIZER. "adam" is ours; "gd" is Thies' (plain gradient descent, step size s0 with an
         # exponential decay t per iteration, TMI 2025 II-C). Subclasses build the optimizer, so
         # they read these.

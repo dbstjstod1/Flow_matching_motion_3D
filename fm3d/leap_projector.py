@@ -5,12 +5,18 @@ User decision 2026-07-29, after the code-level cross-check in `scripts/diag_leap
 and the adjoint are LEAP's; the FDK and the geometry gradient `d/dP` stay ours, because LEAP has
 neither an equivalent of our FDK (`disp` motion-compensated backprojection, Voronoi angular
 weights, Wang half-fan, Ohnesorge padding) nor any geometry derivative at all. The `d/dP` is
-branch-aware (`GRAD_MODE = "auto"`, 2026-07-30): on LEAP's Joseph branch it is
 `fm3d/triton_leap_grad.py`'s EXACT gradient of LEAP's own kernel maths, stacked on the
-LEAP-form (src, moduleCenter, rowVec, colVec) parameters; on the SF branch it is deliberately
-the retired-SF continuous-corner surrogate, because the exact gradient of LEAP's
-rounded-centre SF model is the slope of a lattice ripple, not of the loss trend (the
-measurement ledger lives in `triton_leap_grad`'s docstring and `LEAPProject`'s below).
+LEAP-form (src, moduleCenter, rowVec, colVec) parameters and chained back to P.
+
+ONE FORWARD KERNEL, ALWAYS (2026-07-30, user decision). Stock LEAP picks between its
+separable-footprint and Joseph modular forwards per GEOMETRY SET, and since reconstruction
+lives in the OBJECT frame an object rotation IS a panel tilt -- so the switch fired silently
+under motion (measured: 60/60 training draws Joseph, 54/60 eval, 0/60 at half amplitude).
+That cost an ~11%-of-loss cliff wherever theta-hat crossed the 5.06 deg bar, put the bridge's
+t=1 anchor (nominal orbit -> SF) on a DIFFERENT operator from its own y (motion -> Joseph),
+and forced a second surrogate gradient to exist for the SF branch. We patched the vendored
+LEAP with `set_forceJosephModular` and pin it in `_model` -- refs/LEAP/FM3D_PATCH.md is the
+provenance note, and an unpatched libleapct now raises instead of silently reverting.
 
 WHY MODULAR AND NOT CONE. LEAP's `set_conebeam` parameterizes the orbit by ONE ANGLE PER VIEW,
 which cannot express a per-view 6-DoF rigid motion. `set_modularbeam` takes the source position,
@@ -65,7 +71,8 @@ _MODELS: dict[int, "tomographicModels"] = {}
 
 
 def _model(device: torch.device):
-    """One LEAP instance per GPU, MODULAR geometry only (see the state-leak note above)."""
+    """One LEAP instance per GPU, MODULAR geometry only (see the state-leak note above),
+    with the FORWARD PINNED TO JOSEPH."""
     idx = 0 if device.index is None else int(device.index)
     m = _MODELS.get(idx)
     if m is None:
@@ -73,6 +80,20 @@ def _model(device: torch.device):
             raise RuntimeError("leapctype is not importable: the projector pair is LEAP's "
                                "(fm3d/leap_projector.py). Install LEAP or check the env.")
         m = tomographicModels()
+        # ONE OPERATOR, EVERY GEOMETRY (2026-07-30). Stock LEAP swaps its modular forward
+        # between the separable-footprint and Joseph kernels per GEOMETRY SET, and object
+        # rotation IS panel tilt, so the swap fired silently under motion -- see the module
+        # docstring. This pins it. The `set_` call is DELIBERATELY not guarded: on a stock
+        # libleapct the symbol is missing and ctypes raises here, which is exactly what we
+        # want. Silently falling back would retrain the prior against a different operator.
+        try:
+            m.set_forceJosephModular(True)
+        except AttributeError as e:                              # pragma: no cover
+            raise RuntimeError(
+                "this libleapct.so is UNPATCHED: it has no `set_forceJosephModular`. The "
+                "whole pipeline assumes one modular forward kernel (refs/LEAP/FM3D_PATCH.md "
+                "has the rationale and the rebuild recipe). Refusing to run on the stock "
+                "library, which would silently switch operators under motion.") from e
         _MODELS[idx] = m
     m.set_gpu(idx)
     return m
@@ -111,17 +132,31 @@ def modular_arrays(P: torch.Tensor, u0: float, v_off: float):
 _WARNED: set = set()
 
 
-def kernel_kind(P, *, nv, du, dv, dx, dz, D, H, W) -> str:
-    """Which modular kernel LEAP will ACTUALLY run for this geometry: 'SF' or 'JOSEPH'.
+FORCE_JOSEPH = True          # our patched libleapct pins the modular forward (see _model)
 
-    Replica of the launcher in `projectors_Joseph.cu` (~line 2255): the SF kernel runs only if
+
+def kernel_kind(P, *, nv, du, dv, dx, dz, D, H, W) -> str:
+    """Which modular kernel LEAP ACTUALLY runs for this geometry: 'SF' or 'JOSEPH'.
+
+    With `FORCE_JOSEPH` (the deployed state since 2026-07-30) the answer is always 'JOSEPH':
+    our patched libleapct sets `useSF = false` for modular geometry, so the branch below is
+    dead in production and survives only to document what STOCK LEAP would do -- and to let
+    the gates ask the counterfactual ("would this geometry have been SF?").
+
+    STOCK behaviour, replicated below from `projectors_Joseph.cu`: SF runs only when
     `modularbeamIsAxiallyAligned() && useSF`. The first condition (`set_sourcesAndModules`) is
     the one `sf_branch` does NOT cover and the one MOTION trips: every view's unit rowVector
     must keep z >= 0.9961 (a 5.06-degree panel tilt) and the source z-span must stay under
-    half the panel height. One view past the tilt bar flips the WHOLE geometry to the Joseph
-    ray-driven kernel -- silently, mid-estimation, as theta-hat grows. The geometry gradient
-    (`triton_leap_grad`) uses this to differentiate the branch that actually runs.
+    half the panel height. One view past the bar flipped the WHOLE geometry, silently and
+    mid-estimation -- which is what the patch removes (refs/LEAP/FM3D_PATCH.md).
     """
+    if FORCE_JOSEPH:
+        return "JOSEPH"
+    return stock_kernel_kind(P, nv=nv, du=du, dv=dv, dx=dx, dz=dz, D=D, H=H, W=W)
+
+
+def stock_kernel_kind(P, *, nv, du, dv, dx, dz, D, H, W) -> str:
+    """What UNPATCHED LEAP would pick for this geometry. Gates/diagnostics only."""
     C, _, e_v, _, _ = decompose_P(P)
     axial = bool((e_v[:, 2] >= 0.9961).all()) and \
         float(C[:, 2].max() - C[:, 2].min()) <= 0.5 * nv * dv
@@ -216,10 +251,11 @@ def leap_backproject(g, P, *, D, H, W, dx, dy, dz, du, dv, u0=0.0, v_off=0.0,
     return f
 
 
-GRAD_MODE = "auto"           # 'auto': trend-faithful per branch (SF -> retired-SF surrogate,
-                             #         JOSEPH -> exact LEAP-model gradient) -- THE DEFAULT
-                             # 'leap': literal LEAP-model gradient on both branches
-                             # 'sf':   the retired-SF surrogate on both branches
+GRAD_MODE = "leap"           # 'leap': the EXACT gradient of LEAP's own kernel -- THE DEFAULT,
+                             #         and with FORCE_JOSEPH there is only one kernel to be
+                             #         exact about. 'sf': the retired-SF surrogate (A/B only;
+                             #         it is the gradient of an operator we no longer run).
+                             # 'auto' (branch-aware) is GONE with the branch itself.
 
 
 def leap_fdk_backproject(g, Pmat, *, D, H, W, dx, dy, dz, du, dv, u0=0.0, v_off=0.0):
@@ -255,28 +291,22 @@ def leap_fdk_backproject(g, Pmat, *, D, H, W, dx, dy, dz, du, dv, u0=0.0, v_off=
 class LEAPProject(torch.autograd.Function):
     """Differentiable `(vol, P) -> sinogram`.
 
-    `grad_vol` is LEAP's backprojection. `grad_P` is branch-aware ('auto', 2026-07-30):
+    `grad_vol` is LEAP's backprojection. `grad_P` is `triton_leap_grad.leap_grad_P`: the
+    EXACT analytic gradient of the Joseph kernel LEAP now always runs (`FORCE_JOSEPH`). The
+    Joseph model is bilinear in CONTINUOUS coordinates, so its exact gradient is also the
+    slope of the physical loss surface -- FD parity 4e-4 against the LEAP loss itself.
 
-      * JOSEPH branch (any view's panel tilted past 5.06 deg, `kernel_kind`):
-        `triton_leap_grad.leap_grad_P` -- the EXACT analytic gradient of the kernel LEAP
-        actually runs. The Joseph model is continuous (bilinear in continuous coordinates),
-        so its exact gradient IS the slope of the physical loss surface (FD parity 4e-4).
-      * SF branch: `triton_sf.sf_grad_P`, the continuous-corner surrogate, ON PURPOSE.
-        LEAP's SF kernel projects ROUNDED voxel centres, which superimposes a lattice-scale
-        RIPPLE (~1e-3 rad period) on the loss surface. The exact gradient of that model is
-        the ripple's local slope -- measured fp64: FD -> +4.1e-5 for eps <= 3e-4 rad
-        (= the exact gradient) but -3.4e-4 for eps >= 1e-3 rad (= the TREND, = the
-        surrogate, wrong SIGN vs local). The estimator's accuracy frontier (~0.1 deg
-        = 1.7e-3 rad) sits exactly at the ripple scale, so the exact gradient chases ripple
-        minima there; the surrogate follows the trend. See `triton_leap_grad`'s docstring
-        for the full measurement ledger.
+    WHY THERE IS NO LONGER A SECOND GRADIENT. Until 2026-07-30 the SF branch had to use a
+    surrogate (`triton_sf.sf_grad_P`): LEAP's SF kernel projects ROUNDED voxel centres, which
+    puts a ~1e-3 rad RIPPLE on the loss, and the exact gradient of that model is the ripple's
+    local slope -- measured fp64, FD gives +4.1e-5 for eps <= 3e-4 rad but -3.4e-4 for
+    eps >= 1e-3 rad, i.e. the SIGN FLIPS between the local and the trend scale, and the
+    estimator's frontier (~0.1 deg = 1.7e-3 rad) sits right at the ripple. Pinning the kernel
+    removed the branch, so this whole hazard is gone; the ledger is kept in
+    `triton_leap_grad`'s docstring because it is the reason the patch exists.
 
-    THE LEDGER OF WHAT REMAINS APPROXIMATE:
-      * LEAP's 'VD' backprojection is not the transpose of LEAP's forward (1.9e-4) -- the
-        volume gradient keeps that known defect (see module docstring).
-      * on the SF branch the geometry gradient is the surrogate's (a different SF-class
-        model, 2.9e-3 in value) -- deliberately, per the ripple measurement above; it is
-        gated by FD of the actual LEAP loss (`gate_leap_projector` T3, `gate_geometry` G4a).
+    WHAT REMAINS APPROXIMATE: LEAP's 'VD' backprojection is not the transpose of LEAP's
+    forward (1.9e-4) -- the volume gradient keeps that known defect (module docstring).
     """
 
     @staticmethod
@@ -298,22 +328,13 @@ class LEAPProject(torch.autograd.Function):
             gvol = leap_backproject(gout, P, D=D, H=H, W=W, dx=dx, dy=dy, dz=dz,
                                     du=du, dv=dv, u0=u0, v_off=v_off)
         if ctx.needs_input_grad[1]:
-            from .triton_leap_grad import leap_grad_P
-            from .triton_sf import sf_grad_P
             kw = dict(dx=dx, dy=dy, dz=dz, du=du, dv=dv, u0=u0, v_off=v_off)
-            if GRAD_MODE == "leap":
-                gP = leap_grad_P(vol, gout, P, **kw)
-            elif GRAD_MODE == "sf":
+            if GRAD_MODE == "sf":
+                from .triton_sf import sf_grad_P
                 gP = sf_grad_P(vol, gout, P, **kw)
-            else:                                    # 'auto': trend-faithful per branch
-                B, D, H, W = vol.shape
-                nv, nu = gout.shape[2], gout.shape[3]
-                gP = torch.empty_like(P)
-                for b in range(B):
-                    kind = kernel_kind(P[b], nv=nv, du=du, dv=dv, dx=dx, dz=dz,
-                                       D=D, H=H, W=W)
-                    fn = leap_grad_P if kind == "JOSEPH" else sf_grad_P
-                    gP[b] = fn(vol[b:b + 1], gout[b:b + 1], P[b:b + 1], **kw)[0]
+            else:
+                from .triton_leap_grad import leap_grad_P
+                gP = leap_grad_P(vol, gout, P, **kw)
         return gvol, gP, None, None, None, None, None, None, None, None, None
 
 

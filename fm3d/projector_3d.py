@@ -17,13 +17,12 @@ WHAT STAYS OURS, AND WHY:
     reference loop. The bridge's analytic s-TANGENT stays on our fused kernel
     (`triton_backproject.backproject_tangent`) -- LEAP has no tangent -- while the tangent
     path's VALUE also comes from LEAP, keeping x(1) consistent with the static anchor.
-  * `d(loss)/dP`. LEAP has no geometry derivative at all (`leaptorch`'s backward returns the
-    volume gradient and `None` for everything else), so the motion estimator could never run
-    on it. `LEAPProject` takes its value and its volume gradient from LEAP and its geometry
-    gradient from our kernels, branch-aware (`leap_projector.GRAD_MODE = "auto"`): the exact
-    LEAP-model gradient (`triton_leap_grad`) on the Joseph branch, the continuous-corner
-    surrogate (`triton_sf.sf_grad_P`) on the SF branch -- the ripple ledger in
-    `triton_leap_grad`'s docstring is why that split is deliberate.
+  * `d(loss)/dP`, in `triton_leap_grad.leap_grad_P`. LEAP has no geometry derivative at all
+    (`leaptorch`'s backward returns the volume gradient and `None` for everything else), so
+    the motion estimator could never run on it. `LEAPProject` takes its value and its volume
+    gradient from LEAP and its geometry gradient from our kernel -- the EXACT gradient of the
+    Joseph forward LEAP is pinned to (`leap_projector.FORCE_JOSEPH`), so one operator and one
+    gradient serve every geometry.
   * The ray-march `grid_sample` REFERENCE, `reference_project_3d_batched` below. It is not a
     backend any more -- nothing in production can reach it -- but it is the gates' independent
     oracle: exact autograd by construction, in a third codebase, which is what lets a gate
@@ -208,9 +207,9 @@ def forward_project_3d_batched(
 ) -> torch.Tensor:
     """THE forward operator: LEAP modular-beam. (B,V,nv,nu) [mm * mu].
 
-    Differentiable in the volume (LEAP's backprojection) and in `Pmat` (branch-aware, see
-    `leap_projector.GRAD_MODE`); `fm3d/leap_projector.py` is where both decisions are argued
-    and gated. There is
+    Differentiable in the volume (LEAP's backprojection) and in `Pmat` (the exact gradient
+    of LEAP's pinned Joseph kernel); `fm3d/leap_projector.py` is where both decisions are
+    argued and gated. There is
     no backend argument: the volume box is the centred grid the whole repo uses, the tensors
     must be on a GPU, and that is the only configuration that exists.
     """

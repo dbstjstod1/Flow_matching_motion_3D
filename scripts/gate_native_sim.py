@@ -125,10 +125,21 @@ def main() -> int:
         # the artefact (and the 1 mm GT is itself aliased -- linear-resampled from 0.41 mm with no
         # anti-aliasing -- so 100% is not the target either). The honest comparison is against the
         # filter-based mitigation that was actually deployed.
-        check(f"p{pid}: dominates the deployed 1 mm+shepphann path",
-              tx_nat <= tx_dep + 0.5 and sh_nat >= sh_dep,
-              f"texture {tx_dep:.1f} -> {tx_nat:.1f} HU, sharpness "
-              f"{sh_dep * 100:.0f}% -> {sh_nat * 100:.0f}% of GT")
+        # CRITERION CHANGED 2026-07-30, when the forward was pinned to LEAP's Joseph kernel.
+        # It used to demand `tx_nat <= tx_dep + 0.5`, i.e. native must not lose to the 1 mm
+        # path on TEXTURE. That was a fair fight only while the SF cube basis put 18-21 HU of
+        # crosshatch into the 1 mm recon; Joseph's trilinear-tent basis cut that to 3.5-5.0 HU
+        # (ram-lak) and the deployed shepphann comparator to 0.0. And 0.0 is not a quality
+        # win -- the 1 mm path projects the VERY volume it is then compared against, so it
+        # cannot exhibit grid texture at all (the inverse crime, same trap the rmse column
+        # carries). Comparing an honest number against a structurally-zero one is the wrong
+        # test. What matters is ABSOLUTE: native must leave no crosshatch (bar 1.5 HU, ~10x
+        # below the 13-21 HU that started this and well under a real scan's ~5 HU noise) and
+        # must still win the axis the inverse crime cannot fake, SHARPNESS.
+        check(f"p{pid}: no crosshatch, and sharper than the deployed 1 mm+shepphann path",
+              tx_nat <= 1.5 and sh_nat >= sh_dep,
+              f"texture {tx_dep:.1f} (1 mm, inverse crime) -> {tx_nat:.1f} HU (bar 1.5), "
+              f"sharpness {sh_dep * 100:.0f}% -> {sh_nat * 100:.0f}% of GT")
         if i == 0:
             y_keep, gt_keep = y_nat, gt
         else:

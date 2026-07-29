@@ -629,6 +629,17 @@ float get_rFOV_max()
 	return tomo()->params.rFOV_max();
 }
 
+bool set_forceJosephModular(bool aFlag)
+{
+	tomo()->params.forceJosephModular = aFlag;
+	return true;
+}
+
+bool get_forceJosephModular()
+{
+	return tomo()->params.forceJosephModular;
+}
+
 bool set_offsetScan(bool aFlag)
 {
 	return tomo()->params.set_offsetScan(aFlag);

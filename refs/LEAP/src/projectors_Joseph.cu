@@ -2251,6 +2251,8 @@ bool project_Joseph_modular(float*& g, float* f, parameters* params, bool data_o
     // Call Kernel
     dim3 dimBlock = setBlockSize(N_g);
     dim3 dimGrid = setGridSize(N_g, dimBlock);
+    if (params->forceJosephModular == true)
+        useSF = false;   // FM3D PATCH: kill the silent SF<->Joseph switch
     if (params->modularbeamIsAxiallyAligned() == true && useSF == true)
     {
         //printf("s = %f, %f, %f\n", params->sourcePositions[0], params->sourcePositions[1], params->sourcePositions[2]);

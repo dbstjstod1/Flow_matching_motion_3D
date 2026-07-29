@@ -418,6 +418,10 @@ public:
 	int whichProjector;
 	bool doWeightedBackprojection;
 	bool doExtrapolation;
+	// FM3D PATCH: force the modular-beam FORWARD onto the Joseph ray-driven kernel even when
+	// the geometry is axially aligned, i.e. disable the silent SF<->Joseph switch. See
+	// refs/LEAP/FM3D_PATCH.md.
+	bool forceJosephModular;
 	float rFOVspecified;
 	int rampID;
 	float FBPlowpass;

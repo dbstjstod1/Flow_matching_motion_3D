@@ -41,13 +41,15 @@ differentiates params_to_Pmot on top. Reference implementation + 12-entry autogr
 scripts/dev_sf_ref_autograd.py. Descent repro: scripts/dev_sf_est_repro.py.
 Gate: scripts/gate_sf_projector.py.
 
-STATUS (2026-07-30): the forward/backprojection are RETIRED FROM PRODUCTION (the operator
-pair is LEAP's, `fm3d/leap_projector.py`) and survive only as the gates' independent SF-class
-implementation (`gate_sf_projector.py`, `gate_leap_projector.py` T1). `sf_grad_P`, however,
-is DEPLOYED: it is the SF-branch geometry gradient under `leap_projector.GRAD_MODE = "auto"`,
-on purpose -- the exact gradient of LEAP's rounded-centre SF model rides a lattice ripple
-instead of the loss trend, and this module's continuous-corner gradient IS the trend slope
-(measured ledger: `triton_leap_grad`'s docstring). The Joseph branch uses `triton_leap_grad`.
+STATUS (2026-07-30): FULLY RETIRED FROM PRODUCTION. The operator pair is LEAP's
+(`fm3d/leap_projector.py`) and its modular forward is now PINNED TO JOSEPH, so there is no SF
+branch left for `sf_grad_P` to cover either -- the deployed geometry gradient is
+`triton_leap_grad.leap_grad_P` everywhere. This module survives as (a) the gates' independent
+SF-class implementation (`gate_sf_projector.py`, `gate_leap_projector.py` T1) and (b) the
+`leap_projector.GRAD_MODE = "sf"` A/B arm, which is now the gradient of an operator we never
+run. It was briefly load-bearing: LEAP's SF kernel projects ROUNDED voxel centres, and this
+module's continuous-corner gradient was the only one following the loss TREND rather than the
+lattice ripple (ledger in `triton_leap_grad`'s docstring). Pinning the kernel removed the need.
 """
 
 from __future__ import annotations
