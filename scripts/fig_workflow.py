@@ -430,18 +430,18 @@ def draw_manifold(ax):
             ha="left", va="center", fontsize=8.2 * FS, color="#64748b", fontstyle="italic", zorder=3)
 
     # ---- the legend IS the loop: one step, three moves --------------------------------------
-    box(ax, 4.0, 52.5, 58.0, 27.5, "ONE STEP OF THE LOOP  (x50)", "",
+    box(ax, 4.0, 51.5, 58.0, 28.5, "ONE STEP OF THE LOOP  (x50)", "",
         ("#f8fafc", "#334155"), ts=10.2)
     # The green row is a POINT, not an arrow: ESTIMATE sits at the vertex BETWEEN the purple and
     # the red arrow, and it moves theta, not x -- so it has no length in this picture.
-    rows = ((70.5, "#6d28d9", "arrow", "PREDICT — the prior steps toward "
+    rows = ((72.5, "#6d28d9", "arrow", "PREDICT — the prior steps toward "
                                        "$\\mathcal{M}_{clean}$\n"
                                        "it knows the direction: it was TRAINED on this path"),
-            (63.0, "#15803d", "dot", "ESTIMATE — at the vertex between the two arrows:\n"
+            (65.0, "#15803d", "dot", "ESTIMATE — at the vertex between the two arrows:\n"
                                      "$\\hat\\theta$ is refit on the image the prior just made.\n"
                                      "It moves $\\theta$, not $x$ — so $\\mathcal{C}(\\hat"
                                      "\\theta)$ (dashed) re-aims instead."),
-            (55.0, "#be123c", "arrow", "CORRECT — the data step pulls it back onto\n"
+            (56.5, "#be123c", "arrow", "CORRECT — the data step pulls it back onto\n"
                                        "$\\mathcal{C}(\\hat\\theta)$; the TV corrector keeps it "
                                        "regular"))
     for yr, col, glyph, txt in rows:

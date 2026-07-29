@@ -29,8 +29,13 @@ the reference variant at a tight window (streaks are low-amplitude and invisible
 window), a radial/angular profile of the difference (a streak is a RIDGE in the angular
 direction), and aligned metrics vs the GT volume.
 
+`--views_extra` adds an ANGULAR-CONVERGENCE probe on the last patient (deployed scheme at
+extra view counts, residual reported vs the GT and vs the finest recon). It exists so that
+probe's outputs are reproducible files of this script rather than orphans of a scratch run.
+
     python scripts/diag_static_fdk.py --out data/diag_static_fdk --patients 3
     python scripts/diag_static_fdk.py --out data/diag_static_fdk --patients 1 --gridsample
+    python scripts/diag_static_fdk.py --out data/diag_static_fdk --views_extra 1440
 """
 from __future__ import annotations
 
@@ -113,6 +118,12 @@ def main():
                     help="ramp apodization; default = filters.DEFAULT_RAMP_WINDOW")
     ap.add_argument("--brain_window", default="40,80",
                     help="HU centre,width for the NARROW montage (default 40,80 = brain)")
+    ap.add_argument("--views_extra", type=int, nargs="*", default=[],
+                    help="ANGULAR-CONVERGENCE probe: extra view counts to reconstruct the LAST "
+                         "patient at, under the deployed scheme. Answers 'is --views already "
+                         "converged?' -- the residual is reported against the GT and against "
+                         "the FINEST reconstruction, and each lands in raw/ as p<id>_views<N>. "
+                         "e.g. --views_extra 720 1440")
     args = ap.parse_args()
 
     dev = "cuda"
@@ -268,6 +279,45 @@ def main():
                                                                "patient": pid},
                    os.path.join(args.out, f"static_p{i}.pt"))
 
+    # ---- ANGULAR-CONVERGENCE PROBE (--views_extra) ------------------------------------------
+    # Is the deployed 360 already converged in VIEW COUNT? Reconstruct the last patient under
+    # the deployed scheme at each requested count and report the residual twice: against the GT
+    # (which is dominated by the FDK's own cone/partial-volume floor and therefore barely moves)
+    # and against the FINEST reconstruction (which isolates angular aliasing alone). Measured
+    # 2026-07-29 at 360/720/1440: sd-vs-GT 68.12/68.01/68.01 HU, sd-vs-finest 3.8/0.8/0 HU --
+    # i.e. aliasing is ~0.3% of the variance and more views buy nothing.
+    if args.views_extra:
+        i = args.patients - 1
+        pid = gen.records[i]["patient"]
+        counts = sorted({args.views, *args.views_extra})
+        print(f"\nangular convergence, p{pid} (deployed scheme, ramp {win0}): views {counts}")
+        vsweep = {}
+        for nv_ in counts:
+            g2 = CQ500Generator(args.root, ConeBeam3DConfig.thies(n_views=nv_), device=dev,
+                                shape=tuple(args.shape), split=args.split)
+            with torch.no_grad():
+                y2 = g2.simulate(i, g2.P_nom[None])
+                vsweep[nv_] = g2.fdk(y2, g2.P_nom[None], **fkw)[0]
+            del g2, y2
+            torch.cuda.empty_cache()
+        gt_l = gen.volume(i)[0, 0]
+        fine = vsweep[counts[-1]]
+        for nv_ in counts:
+            r = vsweep[nv_]
+            sd_gt = float((r - gt_l)[meas].std()) / MU_WATER * 1000.0
+            sd_fi = float((r - fine)[meas].std()) / MU_WATER * 1000.0
+            print(f"  views {nv_:5d}   sd vs GT {sd_gt:6.2f} HU   "
+                  f"sd vs the {counts[-1]}-view recon {sd_fi:5.2f} HU")
+            rows.append(dict(patient=pid, mode=f"views{nv_}", sd_vs_gt_hu=sd_gt,
+                             sd_vs_finest_hu=sd_fi))
+            hu = (r / MU_WATER - 1.0) * 1000.0
+            D_, H_, W_ = hu.shape
+            hu.detach().cpu().numpy().astype("<f4").tofile(
+                os.path.join(args.out, "raw",
+                             f"p{pid}_views{nv_}_{W_}x{H_}x{D_}_float32_HU.raw"))
+        del vsweep, fine
+        torch.cuda.empty_cache()
+
     with open(os.path.join(args.out, "raw", "README.txt"), "w") as fh:
         D_, H_, W_ = args.shape
         fh.write(
@@ -282,7 +332,9 @@ def main():
             "variants (see the script docstring):\n"
             "  gt                        the CQ500 volume the sinogram was simulated FROM\n"
             "  leap_native_<window>      THE DEPLOYED SCHEME (native-grid simulation)\n"
-            "  leap_1mm_<window>         the inverse-crime ablation, same operator at 1 mm\n")
+            "  leap_1mm_<window>         the inverse-crime ablation, same operator at 1 mm\n"
+            "  views<N>                  --views_extra angular-convergence probe, deployed\n"
+            "                            scheme at N views (last patient only)\n")
     torch.save({"rows": rows, "args": vars(args), "adjoint_mode": ADJOINT_MODE,
                 "window": args.window or DEFAULT_RAMP_WINDOW,
                 "sim_grid": gen.sim_shape_dhw, "sim_voxel_mm": gen.sim_voxel_mm},
