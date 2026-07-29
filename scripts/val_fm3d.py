@@ -71,7 +71,7 @@ _VAL_CACHE: dict[tuple, dict] = {}
 
 
 def run_validation(model, gen, meas, out_dir, *, it=0, patients=3, patch=64, ode_steps=50,
-                   anchor="static", trans_mm=5.0, rot_deg=5.0, blend="hann", n_offsets=1,
+                   anchor="static", trans_mm=10.0, rot_deg=10.0, blend="hann", n_offsets=1,
                    tile_batch=64, writer=None, dev="cuda"):
     """Prior-ONLY ODE from the cold start, on `patients` fixed val cases. Returns the per-patient
     metrics AND the montage paths, and (if given) logs scalars + images to a tensorboard writer.
@@ -91,17 +91,18 @@ def run_validation(model, gen, meas, out_dir, *, it=0, patients=3, patch=64, ode
     for i in range(patients):
         pid = gen.records[i]["patient"]
         ref_kind = "gt" if anchor == "gt" else "static"
-        key = (gen.split, pid, 1000 + i, float(trans_mm), float(rot_deg), ref_kind,
-               float(gen.fbp_scale))
+        key = (gen.split, pid, 1000 + i, float(trans_mm), float(rot_deg), ref_kind)
         ent = _VAL_CACHE.get(key)
         if ent is None:
             with torch.no_grad():
                 gt = gen.volume(i)
                 theta = make_motion("akima", gen.cfg.n_views, device=dev, seed=1000 + i,
                                     trans_mm=(trans_mm,) * 3, rot_deg=(rot_deg,) * 3)
-                y = gen.project(gt, params_to_Pmot(theta, gen.P_nom)[None])
+                # both y's come from the NATIVE simulation grid (dataset_cq500.simulate); `gt` is
+                # the coarse inversion-grid volume and stays the metric's reference
+                y = gen.simulate(i, params_to_Pmot(theta, gen.P_nom)[None])
                 x0_mu = gen.fdk(y, gen.P_nom[None])[0]                  # cold start, MU
-                static_mu = gen.fdk(gen.project(gt, gen.P_nom[None]), gen.P_nom[None])[0]
+                static_mu = gen.fdk(gen.simulate(i, gen.P_nom[None]), gen.P_nom[None])[0]
                 ref_mu = static_mu if ref_kind == "static" else gt[0, 0]
             # the metric's rigid_align needs grad (it optimizes the alignment by backprop),
             # so it sits OUTSIDE the no_grad block
@@ -153,13 +154,8 @@ def evaluate(ckpt, gen, meas, args, dev):
     ck = torch.load(ckpt, map_location=dev, weights_only=False)
     ca = ck["args"]
     it = ck.get("iter", 0)
-    # Score in the SAME NET normalization the checkpoint was trained under: its fbp_scale was
-    # calibrated on TRAIN patient 0, while this generator (val/test split) calibrated on its own
-    # patient 0. Old checkpoints without the key fall back to this generator's calibration.
-    fs = ck.get("fbp_scale")
-    if fs is not None and float(fs) != gen.fbp_scale:
-        print(f"[val] fbp_scale {gen.fbp_scale:.6g} -> {float(fs):.6g} (from the checkpoint)")
-        gen.fbp_scale = float(fs)
+    # NET normalization is operator-determined now (self-normalized FDK), so there is no
+    # per-checkpoint scale to restore -- see projector_3d._fdk_physical_norm.
     in_ch = int(ck["ema"]["in_conv.weight"].shape[1])
     model = UNet3D(in_ch=in_ch, base=ca["base"]).to(dev).eval()
     model.load_state_dict(ck["ema"])
@@ -182,8 +178,8 @@ def main():
     ap.add_argument("--ode_steps", type=int, default=50)       # the deploy loop's count
     ap.add_argument("--anchor", default="static", choices=["static", "gt"],
                     help="which target to SCORE against -- must match how the ckpt was trained")
-    ap.add_argument("--trans_mm", type=float, default=5.0)
-    ap.add_argument("--rot_deg", type=float, default=5.0)
+    ap.add_argument("--trans_mm", type=float, default=10.0)   # PEAK-TO-PEAK
+    ap.add_argument("--rot_deg", type=float, default=10.0)    # PEAK-TO-PEAK
     ap.add_argument("--blend", default="hann", choices=["hann", "uniform"],
                     help="hann = overlapping Hann-window blend (family A, ours); uniform = "
                          "non-overlapping random tilings averaged (family B, arXiv:2512.18161 -- "

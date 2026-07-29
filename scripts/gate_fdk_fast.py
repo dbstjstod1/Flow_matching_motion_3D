@@ -78,7 +78,7 @@ def main():
     D = H = W = 96
     vox = dict(D=D, H=H, W=W, dx=2.0, dy=2.0, dz=2.0)
 
-    theta = random_motion(cfg.n_views, trans_mm=5.0, rot_deg=5.0, device=dev)
+    theta = random_motion(cfg.n_views, trans_mm=10.0, rot_deg=10.0, device=dev)
     P = params_to_Pmot(theta, P_nom)[None]                       # (1, V, 3, 4)
     vw = view_angular_weights(P)
     sino = smooth_sino(1, cfg.n_views, cfg.nv, cfg.nu)
@@ -103,7 +103,7 @@ def main():
 
     # G3b: batched vs single calls (different rows)
     sino_b = smooth_sino(2, cfg.n_views, cfg.nv, cfg.nu, seed=1)
-    theta_b = random_motion(cfg.n_views, trans_mm=5.0, rot_deg=5.0, device=dev)
+    theta_b = random_motion(cfg.n_views, trans_mm=10.0, rot_deg=10.0, device=dev)
     P_b = torch.stack([params_to_Pmot(theta, P_nom), params_to_Pmot(theta_b, P_nom)], 0)
     vw_b = view_angular_weights(P_b)
     rb = fdk(sino_b, P_b, u, v, cfg, True, view_weight=vw_b, **vox)
@@ -115,8 +115,7 @@ def main():
 
     # G4: physical round-trip, both backends
     vol = head_phantom((D, H, W), (2.0, 2.0, 2.0), device=dev)[None, None]
-    y = forward_project_3d_batched(vol, P_nom[None], u, v, dx=2.0, dy=2.0, dz=2.0,
-                                   n_samples=256)
+    y = forward_project_3d_batched(vol, P_nom[None], u, v, dx=2.0, dy=2.0, dz=2.0)
     q_t = fdk(y, P_nom[None], u, v, cfg, True, **vox)
     q_c = fdk(y, P_nom[None], u, v, cfg, False, **vox)
     m, r = rel(q_t, q_c)
@@ -126,7 +125,7 @@ def main():
     cfgF = ConeBeam3DConfig.thies(n_views=360)
     P_f = build_conebeam_orbit(cfgF, device=dev)
     uF, vF = detector_coords_3d(cfgF, device=dev)
-    thF = random_motion(cfgF.n_views, trans_mm=5.0, rot_deg=5.0, device=dev)
+    thF = random_motion(cfgF.n_views, trans_mm=10.0, rot_deg=10.0, device=dev)
     PF = params_to_Pmot(thF, P_f)[None]
     vwF = view_angular_weights(PF)
     sF = smooth_sino(1, cfgF.n_views, cfgF.nv, cfgF.nu, seed=2)

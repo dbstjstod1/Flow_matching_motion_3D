@@ -69,7 +69,6 @@ def main():
     ap.add_argument("--max_iters", type=int, default=4000)
     ap.add_argument("--every", type=int, default=100)
     ap.add_argument("--views_per_iter", type=int, default=24)
-    ap.add_argument("--n_samples", type=int, default=384)
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--seed", type=int, default=3)
     ap.add_argument("--kinds", default="sinusoid,mixed")
@@ -85,7 +84,7 @@ def main():
     gt = gen.volume(0, 0)
     gt3 = gt[0, 0]
     print(f"grid {gen.shape} @ {spacing} mm | {cfg.n_views} views | "
-          f"{args.views_per_iter} views/iter, n_samples {args.n_samples}, lr {args.lr}")
+          f"{args.views_per_iter} views/iter, lr {args.lr}")
 
     hist = {}
     for kind in args.kinds.split(","):
@@ -107,7 +106,6 @@ def main():
             torch.manual_seed(args.seed)
             est = make_estimator("net", cfg, gen.P_nom, gen.u_coords, gen.v_coords, dev,
                                  dx=gen.dx, dy=gen.dy, dz=gen.dz, loss=loss,
-                                 n_samples=args.n_samples,
                                  views_per_iter=args.views_per_iter, lr=args.lr)
             print(f"\n    {kind} / {loss}")
             print(f"    {'iters':>6} {'fit':>10} {'rot deg':>8} {'t_obs mm':>9} "

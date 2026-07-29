@@ -92,13 +92,13 @@ def main():
           f"(uniform {uni:.6f})  -> ratio {float(w_nom.mean()) / uni:.6f}")
 
     with torch.no_grad():
-        static = gen.fdk(gen.project(gt, gen.P_nom[None]), gen.P_nom[None])[0]
+        static = gen.fdk(gen.simulate(0, gen.P_nom[None]), gen.P_nom[None])[0]
     p_static = psnr(static, g3, meas)
     print(f"STATIC FDK ceiling                 {p_static:6.2f} dB\n")
     print(f"{'motion':<34s} {'FDK (uniform)':>14s} {'FDK (dbeta from P)':>20s} {'gain':>7s}")
 
     base = make_motion("sinusoid", V, device=dev, seed=args.seed,
-                       trans_mm=(5.0,) * 3, rot_deg=(5.0,) * 3)
+                       trans_mm=(10.0,) * 3, rot_deg=(10.0,) * 3)
     cases = {}
     for k, name in enumerate(["tx (5 mm)", "rx (5 deg)", "rz (5 deg, GANTRY AXIS)"]):
         idx = {0: 0, 1: 3, 2: 5}[k]
@@ -109,13 +109,13 @@ def main():
     cases["ALL rotation"] = th_r
     cases["full 6-DoF (5 mm / 5 deg)"] = base
     mixed = make_motion("mixed", V, device=dev, seed=args.seed,
-                        trans_mm=(5.0,) * 3, rot_deg=(5.0,) * 3)
+                        trans_mm=(10.0,) * 3, rot_deg=(10.0,) * 3)
     cases["full 6-DoF, 'mixed' profile"] = mixed
 
     for name, th in cases.items():
         P = params_to_Pmot(th, gen.P_nom)
         with torch.no_grad():
-            y = gen.project(gt, P[None])
+            y = gen.simulate(0, P[None])
             x_uni = gen.fdk(y, P[None])[0]
             w = angular_weights(P, cfg.angle_span)                  # (V,)
             y_w = y * (w / uni)[None, :, None, None]                # exact per-view reweighting

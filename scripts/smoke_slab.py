@@ -90,7 +90,7 @@ def main():
     gen = AAPMSlabGenerator(args.data, cfg, device=dev, slab=args.slab, in_plane=args.in_plane)
     print(f"S1  dataset ({time.time() - t0:.0f}s)")
     print(f"    runs {len(gen.runs)} (lengths {[int(b - a) for a, b in gen.runs]}) -> {gen.n_slabs} slabs")
-    print(f"    grid {gen.shape} @ ({gen.dz}, {gen.dy}, {gen.dx}) mm | fdk_scale {gen.fbp_scale:.5g}")
+    print(f"    grid {gen.shape} @ ({gen.dz}, {gen.dy}, {gen.dx}) mm | self-normalized FDK")
     print(f"    detector {cfg.nv}x{cfg.nu} @ {cfg.du:.3f} mm | FOV {cfg.fov_diameter_mm():.0f} mm"
           f" | axial {cfg.axial_coverage_mm():.0f} mm")
 
@@ -138,7 +138,7 @@ def main():
         t1 = time.time()
         est = make_estimator(est_name, cfg, gen.P_nom, gen.u_coords, gen.v_coords, dev,
                              dx=gen.dx, dy=gen.dy, dz=gen.dz, loss=loss,
-                             n_samples=384, views_per_iter=args.views_per_iter,
+                             views_per_iter=args.views_per_iter,
                              lr=1e-2 if est_name == "net" else 0.3)
         fit = est.refine_global(gt3, y[0], iters=args.iters)
         th = est.current_params()

@@ -72,7 +72,7 @@ def main():
     V = cfg.n_views
 
     with torch.no_grad():
-        y0 = gen.project(gt, gen.P_nom[None])
+        y0 = gen.simulate(0, gen.P_nom[None])
         static = gen.fdk(y0, gen.P_nom[None])[0]
     p_static = psnr(static, g3, meas)
     print(f"STATIC FDK (the ceiling)                      {p_static:6.2f} dB\n", flush=True)
@@ -80,7 +80,7 @@ def main():
     def oracle(theta, tag):
         """simulate with theta, reconstruct with the SAME theta -> the oracle recon."""
         with torch.no_grad():
-            y = gen.project(gt, params_to_Pmot(theta, gen.P_nom)[None])
+            y = gen.simulate(0, params_to_Pmot(theta, gen.P_nom)[None])
             x = gen.fdk(y, params_to_Pmot(theta, gen.P_nom)[None])[0]
         p = psnr(x, g3, meas)
         print(f"  {tag:<42s} {p:6.2f} dB   ({p - p_static:+.2f} vs static)", flush=True)
@@ -100,7 +100,7 @@ def main():
     # ---- [B] per-axis: which DoF costs the dB? -------------------------------------------
     print("\n[B] PER-VIEW motion, one DoF at a time (sinusoid, 1.5 cycles over the scan)")
     base = make_motion("sinusoid", V, device=dev, seed=args.seed,
-                       trans_mm=(5.0,) * 3, rot_deg=(5.0,) * 3)
+                       trans_mm=(10.0,) * 3, rot_deg=(10.0,) * 3)
     for k, name in enumerate(["tx (5 mm)", "ty (5 mm)", "tz (5 mm)",
                               "rx (5 deg)", "ry (5 deg)", "rz (5 deg, THE GANTRY AXIS)"]):
         th = torch.zeros_like(base)
@@ -121,13 +121,13 @@ def main():
     # simple preconditioned gradient descent on 0.5||A x - y||^2 (A is the ray-march projector)
     for it in range(args.cg_iters):
         xr = x.detach().requires_grad_(True)
-        r = gen.project(xr[None, None], P_true, n_samples=256) - y_full
+        r = gen.project(xr[None, None], P_true) - y_full
         loss = 0.5 * (r ** 2).sum()
         loss.backward()
         gr = xr.grad
         with torch.no_grad():
             # exact line search along -g:  step = <g,g> / ||A g||^2
-            Ag = gen.project(gr[None, None], P_true, n_samples=256)
+            Ag = gen.project(gr[None, None], P_true)
             step = (gr * gr).sum() / (Ag * Ag).sum().clamp_min(1e-30)
             x = (x - step * gr).detach()
         if (it + 1) % 3 == 0 or it == 0:

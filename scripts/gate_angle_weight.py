@@ -64,8 +64,7 @@ def main():
     meas = measured_region_mask(shape, sp, cfg, device=dev)
 
     def project(v, P):
-        return forward_project_3d_batched(v, P, uc, vc, dx=sp[2], dy=sp[1], dz=sp[0],
-                                          n_samples=384, view_chunk=8)
+        return forward_project_3d_batched(v, P, uc, vc, dx=sp[2], dy=sp[1], dz=sp[0])
 
     def fdk(y, P, w=None, scale=None):
         return fdk_conebeam_3d_batched(y, P, uc, vc, cfg, D=shape[0], H=shape[1], W=shape[2],
@@ -74,7 +73,11 @@ def main():
 
     with torch.no_grad():
         y_nom = project(vol, P_nom[None])
-        scale = calibrate_scale(fdk(y_nom, P_nom[None], scale=1.0), vol[0, 0], meas)
+        # NO FITTING: the FDK self-normalizes (projector_3d._fdk_physical_norm). scale=None
+        # everywhere below; the residual fit is only asserted to be ~1.0.
+        scale = None
+        _k = calibrate_scale(fdk(y_nom, P_nom[None]), vol[0, 0], meas)
+        assert abs(_k - 1.0) < 0.05, f"FDK is not self-normalized: residual fit {_k:.4f}"
 
     def psnr(a):
         e = (a - vol[0, 0])[meas]
@@ -153,8 +156,8 @@ def main():
     # central difference never exceeds 1.0x and is harmless. The gate has to hurt to be a gate.)
     from fm3d.rigid_motion import make_motion
     th = torch.zeros(V, 6, device=dev)
-    th[:, 5] = make_motion("mixed", V, device=dev, seed=2, trans_mm=(5.,) * 3,
-                           rot_deg=(5.,) * 3)[:, 5]
+    th[:, 5] = make_motion("mixed", V, device=dev, seed=2, trans_mm=(10.,) * 3,
+                           rot_deg=(10.,) * 3)[:, 5]
     P = params_to_Pmot(th, P_nom)[None]
     S = source_positions(P[0])
     beta = torch.atan2(S[:, 1], S[:, 0])

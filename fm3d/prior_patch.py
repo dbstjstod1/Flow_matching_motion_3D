@@ -154,7 +154,8 @@ def _grid_offsets(psize, stride, n_offsets: int, generator=None, full_random=Fal
 def predict_x1_patched(model, x_t: torch.Tensor, t: float, *, patch: int = 64,
                        stride: int | None = None, batch: int = 8,
                        context: str = "auto", n_offsets: int = 1,
-                       blend: str = "hann", generator=None) -> torch.Tensor:
+                       blend: str = "hann", generator=None,
+                       amp: bool = False) -> torch.Tensor:
     """Blended clean-endpoint prediction of the 3D-patch FM prior over a volume.
 
     model : UNet3D velocity net (NET space)   x_t : (1,1,D,H,W) NET
@@ -179,7 +180,14 @@ def predict_x1_patched(model, x_t: torch.Tensor, t: float, *, patch: int = 64,
                 "none" the bare-patch path; "auto" reads the net's in_conv width.
     n_offsets : number of tile GRIDS blended. Offset 0 deterministic (flush); pass `generator` to
                 make the random ones reproducible. Family B is meaningless at n_offsets=1 with no
-                overlap, so pass >=2 there."""
+                overlap, so pass >=2 there.
+    amp       : run the NET FORWARD ONLY under fp16 autocast (GroupNorm stays fp32 on autocast's
+                own list; v is cast back before use, so the x1 arithmetic, the (1-t) cancellation
+                bookkeeping and the blend all remain exactly fp32). fp16, NOT bf16, deliberately:
+                the 500k prior TRAINED under fp16 autocast (ckpt args amp=True,
+                amp_dtype=float16), so an fp16 forward is the regime the weights saw for 500k
+                iterations -- reduced-precision inference here is train-MATCHING, not a new
+                approximation. (No GradScaler needed: that exists for backward only.)"""
     assert x_t.ndim == 5 and x_t.shape[:2] == (1, 1)
     if context == "auto":
         context = "global" if model_in_channels(model) >= 5 else "none"
@@ -212,7 +220,10 @@ def predict_x1_patched(model, x_t: torch.Tensor, t: float, *, patch: int = 64,
         for c0 in range(0, len(pos), batch):
             chunk = pos[c0:c0 + batch]
             tiles = make_tile_inputs(x_t, chunk, (pd, ph, pw), ctx)
-            v = model(tiles, t_t.expand(tiles.shape[0]))
+            with torch.autocast(device_type=x_t.device.type, dtype=torch.float16,
+                                enabled=amp):
+                v = model(tiles, t_t.expand(tiles.shape[0]))
+            v = v.float()
             x1 = tiles[:, :1] + (1.0 - float(t)) * v            # clean endpoint (ch 0)
             for i, (z, y, x) in enumerate(chunk):
                 acc[:, :, z:z + pd, y:y + ph, x:x + pw] += x1[i:i + 1] * win

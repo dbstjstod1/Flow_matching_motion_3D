@@ -1,0 +1,1075 @@
+                   This article has been accepted for publication in IEEE Transactions on Medical Imaging. This is the author's version which has not been fully edited and
+                                             content may change prior to final publication. Citation information: DOI 10.1109/TMI.2024.3474250
+
+
+
+                                                                      IEEE TRANSACTIONS ON MEDICAL IMAGING, VOL. XX, NO. XX, XXXX 2020                                                       1
+
+
+
+
+ A gradient-based approach to fast and accurate
+  head motion compensation in cone-beam CT
+   Mareike Thies, Fabian Wagner, Noah Maul, Haijun Yu, Manuela Goldmann, Linda-Sophie Schneider,
+   Mingxuan Gu, Siyuan Mei, Lukas Folle, Alexander Preuhs, Michael Manhart, Andreas Maier, Member,
+                                                IEEE
+
+
+
+
+   Abstract— Cone-beam computed tomography (CBCT)                                            hospital [1]. This transport can be problematic for critically-
+systems, with their flexibility, present a promising avenue                                  ill patients because it carries the risk of adverse effects in
+for direct point-of-care medical imaging, particularly in crit-                              up to 70% of the cases [2]. Furthermore, the transport of the
+ical scenarios such as acute stroke assessment. However,
+the integration of CBCT into clinical workflows faces chal-                                  patient to the imaging device takes time, and medical staff
+lenges, primarily linked to long scan duration resulting in                                  accompanying the patient is required [3]. For that reason,
+patient motion during scanning and leading to image qual-                                    specialized and portable CBCT has been considered as an
+ity degradation in the reconstructed volumes. This paper                                     alternative for direct point-of-care imaging, e.g., of the head
+introduces a novel approach to CBCT motion estimation                                        [3], [4]. Also, patients coming to the hospital with acute
+using a gradient-based optimization algorithm, which lever-
+ages generalized derivatives of the backprojection operator                                  stroke symptoms require head imaging. In that case, any
+for cone-beam CT geometries. Building on that, a fully                                       delay caused by transporting the patient to the MDCT scanner
+differentiable target function is formulated which grades                                    can have severe negative effects on the patient outcome. For
+the quality of the current motion estimate in reconstruction                                 patients with acute ischemic stroke, it is crucial to initiate an
+space. We drastically accelerate motion estimation yielding                                  endovascular treatment as soon as possible. Upon 150 minutes
+a 19-fold speed-up compared to existing methods. Addi-
+tionally, we investigate the architecture of networks used                                   after symptom onset, their chance to overcome the stroke
+for quality metric regression and propose predicting voxel-                                  without any functional impairment drops by 10% to 20% per
+wise quality maps, favoring autoencoder-like architectures                                   additional hour [5]. Bringing the patient directly to the angio
+over contracting ones. This modification improves gradient                                   suite and performing a CBCT scan where the endovascular
+flow, leading to more accurate motion estimation. The pre-                                   procedure can be initiated without delay can potentially speed
+sented method is evaluated through realistic experiments
+on head anatomy. It achieves a reduction in reprojection                                     up the workflow substantially and improve patient outcome
+error from an initial average of 3 mm to 0.61 mm after motion                                [1].
+compensation and consistently demonstrates superior per-                                        Despite these advantages, the integration of CBCT systems
+formance compared to existing approaches. The analytic                                       into the clinical workflow for stroke or bedside imaging in the
+Jacobian for the backprojection operation, which is at the                                   ICU is challenging. One primary reason for that is patient mo-
+core of the proposed method, is made publicly available.
+In summary, this paper contributes to the advancement                                        tion which can lead to severe deterioration of the reconstructed
+of CBCT integration into clinical workflows by proposing                                     image. As an average CBCT scan takes from 4 to 30 seconds
+a robust motion estimation approach that enhances effi-                                      [6] compared to approximately 0.4 seconds for one gantry
+ciency and accuracy, addressing critical challenges in time-                                 rotation in modern MDCT scanners [7], involuntary motion
+sensitive scenarios.                                                                         has a more prominent influence on CBCT reconstructions [8].
+   Index Terms— computed tomography, deep learning, dif-                                     Cancelliere et al. showed that out of 310 patients presenting
+ferentiable programming, gradient descent, motion com-                                       at the hospital with acute stroke symptoms and receiving a
+pensation                                                                                    non-contrast CBCT in the angio suite, 51% exhibited motion
+                                                                                             artifacts in the reconstructed volume and 11% could not be
+                          I. I NTRODUCTION                                                   clinically interpreted due to the severity of the deteriorations
+                                                                                             in the image [9]. For a successful integration of CBCT systems
+     ONE-beam computed tomography (CBCT) systems are
+C    CT scanning devices that come with a decisive flexibility
+advantage over helical multi-detector computed tomography
+                                                                                             into the clinical workflow for critically-ill or stroke patients,
+                                                                                             a reliable method for preventing motion artifacts is therefore
+                                                                                             desired.
+(MDCT) scanners. MDCT systems are stationary and patients
+                                                                                                The reduction of overall scan time in modern CBCT systems
+need to be transported from their point-of-care to the imaging
+                                                                                             is beneficial in terms of motion artifacts [10]. However, it
+device which might be located in a different area of the
+                                                                                             is often insufficient to fully suppress involuntary motion. As
+   M. Thies, F. Wagner, N. Maul, H. Yu, M. Goldmann, L. S. Schneider,                        a result, software-based solutions which estimate the motion
+M. Gu, S. Mei, L. Folle, and A. Maier are with the Pattern Recogni-                          patterns from the measured data and compensate for the
+tion Lab, Friedrich-Alexander-Universität Erlangen-Nürnberg, Erlangen,                     misalignment during the reconstruction have been proposed.
+Germany. N. Maul, M. Goldmann, A. Preuhs, and M. Manhart are with
+Siemens Healthineers AG, Forchheim, Germany. Corresponding author                            These approaches share a two-step pipeline consisting of (1)
+e-mail: mareike.thies@fau.de.                                                                motion estimation and (2) a motion-compensated reconstruc-
+
+                   © 2024 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.See https://www.ieee.org/publications/rights/index.html for more information.
+                                This article has been accepted for publication in IEEE Transactions on Medical Imaging. This is the author's version which has not been fully edited and
+                                                           content may change prior to final publication. Citation information: DOI 10.1109/TMI.2024.3474250
+2                                                                                                          IEEE TRANSACTIONS ON MEDICAL IMAGING, VOL. XX, NO. XX, XXXX 2020
+
+
+
+
+                                               Motion estimation by
+    Motion-affected volume                      gradient descent
+                                                                                                             Multiple recent works propose learning-based functions
+                                                                                                          which are shown to regress a certain quality metric robustly on
+                                                                                                          their target anatomy. Still, this type of motion compensation
+                                                                                                          has not prevailed in practice. We identify two main reasons
+                                                                                                          for this: (1) The optimization is too slow. Each evaluation
+                                                                                                          of the target function is expensive and many intermediate
+                                               Motion-compensated
+    Motion-compensated volume
+
+
+
+
+                                                 reconstruction
+                                                                                                          reconstructions are needed to converge. (2) Some motion
+                                                                                                          artifacts remain even after optimization. The optimization does
+                                                                                                          not estimate the underlying motion patterns precisely enough.
+                                                                                                             In this work, we propose a new motion estimation approach
+                                                                                                          for rigid, inter-frame motion in CBCT which addresses both
+                                                                                                          short-comings mentioned above. First, we observe that most
+Fig. 1: Rigid motion compensation is performed by first                                                   existing methods for autofocus motion compensation use
+solving an optimization problem to estimate the motion pat-                                               gradient-free optimization algorithms which results in high
+terns from the measured data. Then, a motion-compensated                                                  numbers of target function evaluations and long computation
+reconstruction is performed based on the estimated motion                                                 times. We propose to replace the optimizer by a gradient-
+patterns to compute the compensated volume.                                                               based one. Only few existing studies made use of gradient
+                                                                                                          information in this context before, e.g., by approximating
+                                                                                                          first and second derivatives numerically [24]. Alternatively,
+                                                                                                          differentiable grid sampling and interpolation has been paired
+tion based on the estimated motion patterns from the previous                                             with multiple partial angle reconstructions for gradient com-
+step. Fig. 1 illustrates this two step approach.                                                          putation [25]. Instead, building upon our previous work [26],
+   Whereas the motion-compensated CT reconstruction is rel-                                               [27], we generalize the derivation and implementation of
+atively straight-forward given a known motion pattern, the                                                analytical derivatives of the reconstructed volume to the ge-
+estimation of the scan- and patient-specific motion is the                                                ometry parameters from fan-beam to cone-beam geometries.
+crucial step. To solve this in an image-based manner, the                                                 This allows us to formulate a fully differentiable autofocus-
+3D patient motion must be derived from the 2D projection                                                  type target function for CBCT which expresses the quality
+images. This is a non-trivial inverse problem since it depends                                            of an intermediate reconstruction. Since it is differentiable,
+on both the measured projection data as well as the scanning                                              the gradient of this target function concerning the motion
+geometry. Consequently, instead of a direct estimation, it is                                             parameters, a subgroup of the geometry parameters, can be
+usually formulated as an optimization problem. A number                                                   obtained and used for gradient-based optimization, thereby
+of target functions have been proposed in prior work. First,                                              speeding up the motion estimation.
+these include consistency-based functions which are evaluated                                                Further, we observe that most existing networks for image
+on the sinogram and require no intermediate reconstruction                                                quality metric regression use a contracting architecture. The
+[11]–[14]. Second, target functions incorporating the forward                                             spatial dimensions are gradually reduced until only one scalar
+model of X-ray imaging have been proposed which maxi-                                                     value is regressed at the output [6], [20], [23]. However, in
+mize the alignment of a usually known, motion-free volume                                                 the gradient-based case, this structure is not ideal as gradients
+or a simultaneously estimated volume with the measured                                                    of the scalar output value with respect to the volume tend to
+projection data in sinogram domain in a 2D/3D-registration                                                behave unstably and have an unevenly distributed amplitude
+setting [15]–[17]. Third, target functions have been proposed                                             across the input. Thus, we propose to regress voxel-wise qual-
+which measure the image quality on the reconstructed volume                                               ity maps, thereby promoting autoencoder-like architectures
+itself. These functions incorporate an inverse model of the CT                                            over contracting ones for the image quality metric. Spatially
+imaging process in each evaluation and are often referred to                                              resolved quality maps have recently been proven beneficial
+as autofocus objectives [6], [18]–[21].                                                                   for deformable CT motion compensation [28]. We show that
+   Autofocus-type objectives have some decisive advantages                                                this modification also leads to more informative gradient
+over other types of target functions. They can handle truncated                                           information and improved overall motion estimation in a rigid
+data as opposed to consistency-based objectives and do not                                                motion compensation framework.
+require a prior motion-free scan in contrast to most forward                                                 In summary, the contributions of this paper are:
+model-based objectives. However, they also crucially depend                                                  • The generalization of analytic derivatives for CT recon-
+on the choice of quality metric quantifying the severity of                                                     struction from fan-beam to cone-beam geometries.
+motion artifacts in the volume. Formulating a discriminative                                                 • The application of gradient-based optimization for motion
+quality metric is challenging since it is a reference-free task                                                 estimation in clinical CBCT applications.
+meaning that it depends only the potentially motion-corrupted                                                • The regression of voxel-wise quality metrics for improved
+volume. Typical choices therefore rely on basic properties of                                                   gradient-flow.
+motion-free images such as sharp edges, piece-wise constancy,
+or low entropy [21], [22]. Nowadays, research focuses on data-
+driven quality metrics which are parameterized by deep neural
+networks [6], [20], [23].
+
+                                © 2024 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.See https://www.ieee.org/publications/rights/index.html for more information.
+                 This article has been accepted for publication in IEEE Transactions on Medical Imaging. This is the author's version which has not been fully edited and
+                                           content may change prior to final publication. Citation information: DOI 10.1109/TMI.2024.3474250
+THIES et al.: PREPARATION OF PAPERS FOR IEEE TRANSACTIONS ON MEDICAL IMAGING                                                                                                                        3
+
+
+
+
+                           II. M ETHODS                                                                             Motion model                 Backprojection           Quality metric
+
+
+A. Rigid motion compensation for CBCT
+
+
+
+
+                                                                                             Motion parameters
+   In CBCT reconstruction, the measured line integrals from
+different directions are translated into a spatially resolved map                                                        Ongoing scan
+
+
+
+of X-ray attenuation coefficients. This process depends funda-
+mentally on the exact knowledge of the scanning geometry
+describing the 3D relationship between X-ray source, flat-                                                                                                                  Quality value
+
+                                                                                                                 Automatic differentiation       Analytic derivative   Automatic differentiation
+panel detector, and patient. Usually, stillness of the patient
+during the scan is assumed. In that case, any reproducible,                                Fig. 2: Overview of the proposed method for rigid motion
+circular scanning trajectory of the CBCT scanner is uniquely                               estimation in CBCT. The three basic building blocks are (1) the
+characterized by a set of calibrated projection matrices [29]                              motion model, (2) the differentiable backprojection enabling
+which map a point in the 3D world coordinate system onto a                                 end-to-end gradient flow, and (3) a trained quality metric
+point in the detector coordinate system of a specific projection                           which regresses spatially resolved quality maps.
+view. Given accurate projection matrices corresponding to
+the projection data, there exist a number of analytic and
+algebraic algorithms to solve the reconstruction problem [30].                             In the following, we will detail our proposed method to for-
+Movement of the patient introduces a mismatch between the                                  mulate the target function f (x) and to solve the optimization
+calibrated projection matrices and the projection data. During                             problem.
+reconstruction, this mismatch leads to artifacts in the final
+image.
+   The characteristics of motion patterns that can occur in                                B. Differentiable autofocus pipeline
+CBCT differ depending on the anatomy. While some regions                                       We propose an autofocus-inspired target function for motion
+of the human body tend to move non-rigidly, we assume rigid                                estimation which yields informative gradient updates for the
+motion patterns for the head which is non-deformable. In                                   free parameters describing the patient motion. The target
+that case, the motion patterns can be parameterized by three                               function depends only on the projection data and a set of cal-
+rotational and three translational components. Moreover, we                                ibrated projection matrices as an initialization of the scanning
+require that the frequency of the motion is low compared to                                geometry. The full target function f (x) : RN → R consists
+the exposure time for a single projection. This justifies the                              of three distinct processing steps which are highlighted in
+assumption that motion occurs only in between projections                                  Fig. 2. The free parameters x ∈ RN describing the motion
+(inter-frame) and not during the acquisition of one projection                             trajectory are processed by the motion model p : RN → RM
+(intra-frame). This is a valid assumption given typical exposure                           which computes projection matrices from the initial calibrated
+times of around 5 ms per projection which is also in accor-                                matrices and the motion pattern described by x. Here, M is
+dance with prior work [6], [13], [31].                                                     the number of entries in all projection matrices of the scan.
+   We aim to eliminate the mismatch between projection matri-                              Subsequently, the backprojection r : RM → RK uses the
+ces and projection data introduced by rigid, inter-frame patient                           updated projection matrices to analytically backproject the
+motion by updating the projection matrices. This is drawing                                filtered projection data into a volume with K elements. Note
+from the observation that any rigid motion of the patient inside                           that, for simplicity, we omit the filtered projection data as
+the scanner can identically be modeled by the inverse rigid                                an input to the backprojection function r. The backprojection
+transformation applied to the scanner itself. Hence, for each                              results in an intermediate reconstruction of the data given the
+projection j, we seek to estimate rigid transformation matrices                            current estimate of the free parameters. Eventually, a quality
+Tj ∈ R4×4 which are multiplied to the initial projection                                   metric q : RK → R returns a scalar quality value given the
+matrices Pj ∈ R3×4 to yield updated projection matrices                                    intermediate reconstruction. In our proposed method, we first
+P̂j ∈ R3×4                                                                                 regress a full quality map of the same dimensions as the input
+                       P̂j = Pj · Tj (x) .                     (1)                         volume which is subsequently averaged to a single value. The
+                                                                                           full target function can be written as f (x) = q(r(p(x))).
+The transformation matrices Tj are parameterized by a vector                               To compute the gradient of the target function to the free
+of free parameters x ∈ RN , where N is the number of                                       parameters, we apply the chain rule
+free parameters (see section II-B.1). The corrected projection                                                                               df   dq dr dp
+matrices are then reconstructed together with the original                                                                                      =   ·  ·   .                                       (2)
+                                                                                                                                             dx   dr dp dx
+projection data to yield the motion corrected reconstruction.
+The crucial part of this method is the estimation of the                                   Here, dq
+                                                                                                  dr ∈ R
+                                                                                                         1×K
+                                                                                                              is the gradient of the quality metric to the
+                                                                                                                         dr
+transformation matrices Tj which depend on the projection                                  intermediate reconstruction. dp  ∈ RK×M is the Jacobian of
+data and are scan-specific. Here, we solve an unconstrained                                the backprojection function and dpdx ∈ R
+                                                                                                                                     M ×N
+                                                                                                                                           is the Jacobian
+optimization problem of the form x∗ = arg minx f (x), where                                of the motion model. In the following sections II-B.1, II-
+x∗ ∈ RN is the optimized set of free parameters which ideally                              B.2, and II-B.3, we will explain each of the three steps in
+compensates for the patient motion and yields a consistent set                             detail and present how the corresponding derivative can be
+of projection data and projection matrices P∗j = Pj · Tj (x∗ ).                            obtained. Furthermore, in section II-B.3, we will highlight why
+
+                 © 2024 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.See https://www.ieee.org/publications/rights/index.html for more information.
+                    This article has been accepted for publication in IEEE Transactions on Medical Imaging. This is the author's version which has not been fully edited and
+                                              content may change prior to final publication. Citation information: DOI 10.1109/TMI.2024.3474250
+4                                                                                              IEEE TRANSACTIONS ON MEDICAL IMAGING, VOL. XX, NO. XX, XXXX 2020
+
+
+
+
+the regression of a spatially resolved quality map followed by                                Here, Np is the number of projections in the scan and
+an average operator is superior in the gradient-based setting.                                p̃world = (x, y, z, 1)⊤ ∈ P3+ is the homogeneous represen-
+   1) Motion model: In general, the projection geometry of                                    tation of pworld following the same notation for homogeneous
+any CBCT scan is uniquely defined by a set of projection                                      coordinates as used in Aichert et al. [13]. Function sj :
+matrices Pj , j = 1, . . . , Np , where Np is the number of                                   P3+ → P2+ computes the forward projected homogeneous
+projections in a scan. This is the most flexible form to describe                             position of p̃world in the detector coordinate system of the j-
+an unconstrained CBCT trajectory. Each projection matrix is                                   th projection image by multiplication with the j-th projection
+only unique up to scale and not every 3 × 4 matrix is a valid                                 matrix sj (p̃) = Pj · p̃. Subsequently, g : P2+ → R2 restores
+projection matrix. Therefore, it is not advisable to directly                                 the euclidean coordinate from the homogeneous coordinate
+optimize for the projection matrix entries. Instead, for rigid                                by dividing all elements by the last component of the vector.
+motion compensation, prior knowledge restricts the degrees                                    Finally, dj : R2 → R bilinearly interpolates the j-th filtered
+of freedom to six per view. Without further constraints, the                                  projection image at the forward projected position and returns
+rigid motion state of each projection is unrelated to that of the                             the corresponding value which is summed up over all Np
+neighboring views. In a typical CBCT scan, however, multiple                                  projections to yield the final backprojected value I.
+projection images are acquired per second. Hence, we impose                                      To reconstruct a full volume, equation 3 needs to be applied
+an additional temporal smoothness constraint on the motion                                    to all voxel positions in world coordinates which is extremely
+patterns by fitting an Akima spline to each of the six motion                                 time intensive when evaluated sequentially and prohibits the
+parameters (tx , ty , tz , rx , ry , rz ) separately. The spline is                           straight-forward use of automatic differentiation. For that
+parameterized by Nn nodes. Given that Nn < Np , this reduces                                  reason, we implement a custom GPU-accelerated version of
+the degrees of freedom from 6Np to 6Nn and enforces each                                      the backprojection and derive and implement the correspond-
+motion parameter to vary smoothly throughout the scan. This                                   ing analytic expression for the derivative. This allows us to
+is a reasonable assumption given that the typical types of                                    have GPU-accelerated implementations for backprojection and
+head motion were identified to be slow oscillations as well as                                gradient computation and still connect the reconstructed image
+uniformly increasing deviations from an initial position [8].                                 and the projection matrices in a differentiable manner. In
+Furthermore, our parameterization is in accordance with prior                                 our previous paper, we have proposed a similar differentiable
+work which relied identically on Akima splines [20], other                                    formulation for fan-beam CT backprojection [26]. However,
+types of smooth functions [11], [32], or regularization terms in                              it is not applicable to cone-beam geometries and, therefore,
+the target function which implicitly punish non-smooth motion                                 its practical applicability is limited. In the following, we
+patterns [6], [19], [33].                                                                     generalize that formulation to cone-beam geometries.
+   As motion model we refer to the function that translates                                      We give an expression for the gradient of the backprojected
+N = 6Nn parameters, stored in the vector x and describing                                     value at position pworld = (x, y, z)⊤ to the 12 entries of the
+Akima spline node values for each motion parameter, into                                      γ-th projection matrix Pγ . For that, we define p̃detector
+                                                                                                                                                    γ      =
+M = 12Np projection matrix entries. This is achieved by                                       sγ (p̃world ) = (uγ , vγ , wγ )⊤ ∈ P2+ as the homogeneous for-
+evaluating the splines at the time point of each projection                                   ward projected position in detector coordinates. The gradient
+and updating a set of initial projection matrices according to                                Gγ ∈ R3×4 is
+equation 1. Since this is a relatively cheap computation, we                                                    gu,γ x      gu,γ y gu,γ z   gu,γ 
+implement the splines in native PyTorch and obtain the corre-                                                            wγ           wγ            wγ            wγ
+                                                                                                                        gv,γ x       gv,γ y        gv,γ z        gv,γ 
+sponding derivatives automatically. If not stated differently, we                                         Gγ = 
+                                                                                                               
+                                                                                                                         wγ           wγ            wγ            wγ          ,        (4)
+utilize ten nodes for the simulation of artificial motion patterns                                                      − h(x)
+                                                                                                                             2       − h(y)
+                                                                                                                                         2         − h(z)
+                                                                                                                                                       2        − h(1)
+                                                                                                                                                                     2
+                                                                                                                           wγ           wγ           wγ            wγ
+and 30 nodes for the motion patterns being estimated by our
+method. The nodes are evenly spaced across the temporal                                       with
+direction of the scan with one node at the beginning and one                                                            h(i) = gu,γ iuγ + gv,γ ivγ .                                    (5)
+node at the end of the scan range.
+    2) Analytic derivative for CBCT backprojection operator:                                  To obtain the values gu,γ ∈ R and gv,γ ∈ R, the spa-
+An analytic backprojection is implemented to perform inter-                                   tial derivative of the filtered projection data along the two
+mediate reconstructions given the iteratively updated projec-                                 axes of the detector coordinate system is computed. It is
+tion matrices returned from the motion model. In addition                                     numerically approximated by second order accurate central
+to the projection matrices, the backprojection depends on                                     differences along the horizontal and vertical axis of each
+an appropriately filtered version of the projection images.                                   filtered projection image yielding two gradient images per
+Since we consider projection data acquired on a full circular                                 view. These are interpolated bilinearly at the euclidean detector
+                                                                                                         u     v
+trajectory, we apply a classical shift-invariant ramp filter.                                 position ( wγγ , wγγ )⊤ ∈ R2 . The interpolated values from the
+During backprojection, the reconstructed value I at position                                  γ-th gradient image with respect to the first and second
+pworld = (x, y, z)⊤ in world coordinates is computed as the                                   detector axis are denoted gu,γ and gv,γ , respectively. All
+sum over the values of the filtered projection data at the                                    investigations are restricted to the discretized problem setting,
+forward projected positions in each projection image                                          where projection images are measured at discrete angles and in
+                                 Np
+                                 X                                                            a discrete detector coordinate system. We refer to our previous
+                    world
+                                       dj g sj p̃world                                        work for a more in-depth comparison between the continuous
+                                                              
+             I(p̃           )=                                        .              (3)
+                                 j=1                                                          derivation and the corresponding discretized version [26].
+
+                    © 2024 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.See https://www.ieee.org/publications/rights/index.html for more information.
+                 This article has been accepted for publication in IEEE Transactions on Medical Imaging. This is the author's version which has not been fully edited and
+                                           content may change prior to final publication. Citation information: DOI 10.1109/TMI.2024.3474250
+THIES et al.: PREPARATION OF PAPERS FOR IEEE TRANSACTIONS ON MEDICAL IMAGING                                                                                                            5
+
+
+
+
+    Equation 4 provides the partial derivatives of the back-                               by setting the motion-free volume as reference image and
+projected value at one position pworld in the volume to                                    the motion-affected volume as distorted image. The VIF map
+the twelve entries of one projection matrix Pγ . It needs                                  is further scaled by the number of voxels K such that an
+to be evaluated for all K discrete volume positions as                                     average operation yields values in the range [0, 1]. As the final
+well as for all Np = M/12 projection matrices to                                           regression target for the network we use VIF∗ (Idist , Iref ) =
+                           dr
+fill the full Jacobian dp     . The implementation of GPU-                                 1 − K · VIF(Idist , Iref ). We then train a 3D U-net architecture
+accelerated backprojection and corresponding gradient com-                                 [36] to regress the adjusted VIF map VIF∗ from the motion-
+putation is openly available at https://github.com/                                        affected volume. The U-net consists of basic building blocks
+mareikethies/geometry_gradients_CT. All com-                                               with 3D convolutions and ReLU activation function. The
+putations are wrapped in a custom PyTorch function which                                   number of feature maps per level is 8l with l = 1, . . . , 4 levels.
+is directly compatible with the automatic differentiation func-                            Because we train a regression task, the final layer is a 1 × 1
+tionality of the library. Due to memory constraints, we never                              convolution and no further final activation function is used.
+explicitly evaluate the full Jacobian, but directly compute                                The model is trained with an L1-loss and Adam optimizer
+Jacobian-vector products given the gradient signal of the                                  with a learning rate of 0.001 and a batch size of 16 with input
+downstream operations.                                                                     and output volumes of size 128 × 128 × 128. After training,
+    3) Pixel-wise quality metric regression: Given an intermedi-                           the predicted map is simply averaged to get a scalar value.
+ate reconstruction from the backprojection, we seek to quantify                            The trained network performs a reference-free mapping and
+its quality in terms of motion artifacts. At inference time,                               does not require the motion-free volume anymore.
+this mapping needs to be reference-free, meaning that the
+quality is estimated given only a motion-affected volume and                               C. Gradient-based optimization algorithm
+no motion-free reference. To solve this task, a neural network
+is trained on a simulated paired data set of motion-affected and                              The average of the predicted quality map is minimized to
+corresponding motion-free scans to approximate a reference-                                obtain a scan specific motion estimate x∗ . Importantly, at
+based target metric given the motion-affected volume only.                                 optimization time, the parameters of the quality metric network
+This has been proposed similarly in prior work [6], [20], [23].                            are fully trained and frozen. The majority of existing motion
+In contrast to existing approaches, we are using the trained                               compensation algorithms utilize a gradient-free optimizer to
+network in a gradient-based setting where derivatives of the                               minimize the objective with respect to the motion parameters.
+network output to the input volume are computed for motion                                 For gradient-free optimization algorithms it suffices to specify
+estimation. For gradient-free methods, an accurate regression                              the target function alone whereas gradient-based algorithms
+of the quality metric from the input volume is the crucial part.                           require an expression of the gradient which can be hard to
+In the gradient-based case, an informative volume gradient                                 formulate because the dependency of the objective value on
+obtained via backpropagation through the trained network is                                the motion parameters is not trivial [37]. We are the first to use
+equally important as the forward mapping. To ensure that an                                a fully differentiable autofocus target function which allows us
+informative volume gradient is obtained, we propose to train                               to apply gradient-based optimization. Specifically, we utilize
+a volume-to-volume network which regresses a full spatially                                a basic gradient descent update scheme of the form
+resolved quality map. This is in contrast to existing approaches                                                                                        df
+which directly regress a scalar quality metric using contracting                                                    x(n+1) = x(n) − s(n) ·                 .                         (6)
+                                                                                                                                                        dx
+architectures. To obtain a scalar for optimization, we then
+                                                                                           Updated estimates x(n) are iteratively computed from an initial
+simply average the volumetric quality map, ensuring that each
+                                                                                           estimate x(0) = 0 by taking a step into the negative gradient
+spatial position has equal contribution to the final value.
+                                                                                           direction scaled by the step size s(n) ∈ R. The step size is
+    As the regression target, we choose the visual information
+                                                                                           subject to an exponential decay such that s(n) = s0 · tn with
+fidelity (VIF) [34]. This metric quantifies the information
+                                                                                           t ∈ R being the decay factor and s0 ∈ R describing the initial
+present in the reference image as well as the loss of informa-
+                                                                                           step size. If not stated differently, we run the algorithm for 100
+tion that can be attributed to some distortion process, motion
+                                                                                           iterations with an initial step size of s0 = 100 and a decay
+in our case. It explicitly models the human visual system and
+                                                                                           factor of t = 0.97.
+is thought to provide an image similarity measure between
+distorted and reference image that aligns well with human
+perception [6]. The original formulation of VIF computes a                                                                         III. DATA
+scalar where 0 is the lower bound which indicates that all                                    The CQ500 data set is used for our experiments [38].
+information from the reference image has been lost due to the                              Originally, this data set includes 491 reconstructed head CT
+distortion and 1 indicates that the distorted image contains the                           scans acquired on different MDCT scanners. We first filter
+same information as the reference, i.e., they are identical [34].                          the data set for scans which have been reconstructed with a
+Theoretically, the VIF can be greater than 1 in cases where                                small slice thickness. From the remaining scans we further
+the image under consideration has a higher information content                             exclude those which have considerably fewer or more slices
+than the reference. To obtain a spatially resolved volumetric                              than the average sample. This results in 320 scans which
+map of the VIF, we follow the approach by Shao et al. [35].                                we split sequentially on patient level into training set (150),
+    Given a paired data set of motion-free and motion-affected                             validation set (50), and test set (120). After filtering, all
+head CT volumes, we compute their corresponding VIF map                                    scans have a reconstructed slice thickness of 0.625 mm and
+
+                 © 2024 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.See https://www.ieee.org/publications/rights/index.html for more information.
+                                   This article has been accepted for publication in IEEE Transactions on Medical Imaging. This is the author's version which has not been fully edited and
+                                                                 content may change prior to final publication. Citation information: DOI 10.1109/TMI.2024.3474250
+6                                                                                                                IEEE TRANSACTIONS ON MEDICAL IMAGING, VOL. XX, NO. XX, XXXX 2020
+
+
+
+
+                                                                                                                           2.5                                         2.5                                       2.5
+                         Gradient descent      0.95                             0.8                                                     Gradient descent
+        200              CMAES                                                                                             2.0          CMAES                          2.0                                       2.0
+                                               0.90                             0.7
+
+
+
+
+                                                                                                                Error tx [mm]
+
+
+
+
+                                                                                                                                                           Error ty [mm]
+RMSE [HU]
+
+
+
+
+                                                                                                                                                                                                    Error rz [deg]
+        150                                                                     0.6                                        1.5                                         1.5                                       1.5
+                                               0.85
+
+
+
+
+                                            SSIM
+
+
+
+
+                                                                              VIF
+        100                                    0.80                             0.5                                        1.0                                         1.0                                       1.0
+
+                                               0.75                             0.4                                        0.5                                         0.5                                       0.5
+            50
+                                               0.70                             0.3                                        0.0                                         0.0                                       0.0
+                 TV Huang Ko Ours Init                TV Huang Ko Ours Init           TV Huang Ko Ours Init                       TV Huang Ours     Init                     TV Huang Ours   Init                      TV Huang Ours   Init
+
+
+Fig. 3: Comparison of the proposed quality metric with total                                                                                       (a) In-plane motion parameters
+variation (TV) and the network-based quality metric proposed                                                                2.5                                        2.5                                       2.5
+                                                                                                                                        Gradient descent
+by Huang et al. [6] as well as the image-based one-step method                                                              2.0         CMAES                          2.0                                       2.0
+
+
+
+
+                                                                                                                                                           Error rx [deg]
+
+
+
+
+                                                                                                                                                                                                    Error ry [deg]
+                                                                                                                Error tz [mm]
+by Ko et al. [40]. Metrics are root mean squared error (RMSE)                                                               1.5                                        1.5                                       1.5
+(↓), SSIM (↑), and VIF (↑) which are computed on the motion-                                                                1.0                                        1.0                                       1.0
+compensated reconstructed volumes.                                                                                          0.5                                        0.5                                       0.5
+
+                                                                                                                            0.0                                        0.0                                       0.0
+                                                                                                                                  TV Huang Ours     Init                     TV Huang Ours   Init                      TV Huang Ours   Init
+
+an isotropic in-slice spacing between 0.38 mm and 0.58 mm                                                                                      (b) Out-of-plane motion parameters
+(mean of 0.472 mm). Because we are working on cone-beam
+geometry, we simulate the corresponding detector data from                                                     Fig. 4: Comparison of the proposed quality metric with total
+the reconstructed MDCT volumes. Each volume is forward                                                         variation (TV) and the network-based quality metric proposed
+projected on a circular trajectory in cone-beam geometry using                                                 by Huang et al. [6]. The upper (4a) and lower (4b) plots depict
+the software PyroNN [39] with 360 projections on a full 2π                                                     the mean absolute error (MAE) (↓) for the in-plane motion
+angular range, a source-to-isocenter distance of 785 mm, a                                                     parameters (tx , ty , and rz ) and out-of-plane motion parameters
+source-to-detector distance of 1200 mm, and a detector of                                                      (tz , rx , and ry ), respectively, referring to the plane in which
+shape 500 × 700 pixels of isotropic pixel spacing (0.64 mm).                                                   the source rotates.
+A ramp filter and a cosine filter are applied to the computed
+projection images.
+    To train the quality metric network (section II-B.3), we dy-                                               size 1 mm for the final motion-compensated reconstruction.
+namically sample a new random motion perturbation each time                                                    For the evaluation we rigidly register all motion-compensated
+a sample is used for training and apply it to the projection ma-                                               reconstructions to their respective ground truth reconstruction
+trices. The spline-based motion model (section II-B.1) with 10                                                 in 3D. All box plots in this paper show the median and
+nodes per spline is used with a maximal amplitude of 10 mm                                                     inter-quartile range as well as the minimum and maximum
+for translation parameters and 15◦ for rotation parameters. To                                                 values. Outliers are highlighted by cross markers. Values of the
+ensure that all motion states that could be encountered during                                                 initial metrics before motion compensation are shown by the
+optimization are represented in the training data, we include                                                  gray box. Additionally, we apply our method to two clinical
+motion patterns with unequal amplitude across the different                                                    cone-beam CT head scans that are affected by real patient
+motion parameters as well as motion patterns that perturb                                                      motion. Since the motion patterns underlying these scans are
+the data only slightly (see supplementary material for pseudo                                                  introduced by the patients during the scanning procedure, a
+code). All splines are individually zero-centered and translated                                               quantitative analysis is not possible in this case, but qualitative
+into perturbed projection matrices using the motion model. The                                                 results are presented in section IV-D.
+filtered projection data is reconstructed from these perturbed
+matrices and the training target VIF∗ is computed from                                                         A. Motion compensation performance
+the perturbed and unperturbed reconstruction as described in
+section II-B.3. The intensities of the reconstructed volumes are                                                  To assess the motion compensation performance of our
+normalized with fixed, sample-independent offset and slope to                                                  proposed method, we compare it to three previously published
+lie approximately in the interval [0, 1] before feeding them to                                                reference methods, two of which are optimization-based algo-
+the network.                                                                                                   rithms. For a fair comparison, the data setup, motion model,
+                                                                                                               and backprojection step is identical in all methods, but only
+                                                                                                               the quality metric is replaced. First, 3D total variation (TV) is
+                            IV. E XPERIMENTS AND RESULTS                                                       chosen as a classical autofocus quality metric which enforces
+   All motion compensation experiments are performed on                                                        sparse volume gradients via minimization of the L1-norm.
+the same 30 patients from the test set for quality metric                                                      It is a parameter-free quality metric and has been shown to
+model training. A random motion pattern is sampled for each                                                    yield informative information for image alignment [20], [22].
+patient with an amplitude of 5 mm for translation and 5◦ for                                                   Second, we re-implement the quality metric network proposed
+rotation which is kept constant across different methods and                                                   by Huang et al., which also regresses the VIF measure using a
+optimization algorithms. The motion estimation itself runs on                                                  3D architecture [6]. In contrast to our quality metric, it is not
+grids of size 128 × 128 × 128 with a 2 mm spacing for the                                                      trained on spatially resolved quality maps, but the authors use
+reconstructed signal, but the image-based results are computed                                                 a contracting residual convolutional architecture followed by
+on higher resolved signals with 256 × 256 × 256 voxels of                                                      a fully-connected layer for the final regression task. We train
+
+                                   © 2024 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.See https://www.ieee.org/publications/rights/index.html for more information.
+                 This article has been accepted for publication in IEEE Transactions on Medical Imaging. This is the author's version which has not been fully edited and
+                                           content may change prior to final publication. Citation information: DOI 10.1109/TMI.2024.3474250
+THIES et al.: PREPARATION OF PAPERS FOR IEEE TRANSACTIONS ON MEDICAL IMAGING                                                                                                            7
+
+
+
+
+the network on the same data as our proposed network, but                                                                         5         Gradient descent
+                                                                                                                                            CMAES
+directly compute the spatial average of the VIF as the training                                                                   4
+
+
+
+
+                                                                                                                           RPE [mm]
+target. The learning rate is set to 0.0001 and the weights are                                                                    3
+optimized by the Adam algorithm for 500 epochs. Third, we                                                                         2
+compare our method to the approach proposed by Ko et al. [40]                                                                     1
+which is a pure image-to-image approach mapping motion-                                                                               TV Huang Ours     Init
+affected input volume to motion-corrected output volume. In
+contrast to our approach and the optimization-based reference                              Fig. 5: Comparison of the proposed quality metric with total
+methods, it does not estimate underlying motion patterns                                   variation (TV) and the network-based quality metric proposed
+explicitly. We use the code released by Ko et al. at https://                              by Huang et al. [6]. The plot shows the reprojection error
+github.com/youngjun-ko/ct_mar_attention and                                                (RPE) (↓) which quantifies the distance between points after
+prepare the training data in the same way as for all other                                 forward projection onto the detector planes thereby emphasiz-
+methods.                                                                                   ing on measurable deviations.
+   As can be seen in Fig. 3, our method consistently achieves
+the best results concerning metrics computed on the final
+motion-compensated volume. Focusing on the blue box plots                                  locations such as the upper part of the head in the axial view
+for gradient-based optimization, our proposed method consis-                               of example 2. A small bone structure can be viewed in the
+tently improves upon the initial motion-affected reconstruction                            enlarged regions of interest (ROI) for each slice. Only our
+(gray box) in terms of root mean squared error (RMSE),                                     method can fully recover the shape and structure of all details
+SSIM, and VIF, reaching an SSIM of more than 0.90 for all                                  of these ROIs and successfully removes streaks and blurred
+cases in the test set. In comparison, both other optimization-                             edges.
+based methods (TV target function and the method by Huang                                     Fig. 7 visualizes the motion patterns across the scan range
+et al.) cannot stably improve upon the initial state and the                               for the first qualitative example in Fig. 6. The motion curves
+performance of the image-to-image approach by Ko et al.                                    estimated by our proposed method are closest to the ground-
+also achieves inferior results. The reason for this observation                            truth motion curves, but with a slightly higher error for in-
+can be identified in Fig. 4. While all three optimization-                                 plane translations tx and ty than for the other four parameters.
+based methods successfully improve upon the initial motion-                                The reference methods exhibit larger deviations from the
+affected state in terms of out-of-plane parameters, this is not                            ground truth with particularly large errors for the in-plane
+the case for the in-plane parameters. Optimization using TV                                motion estimated with TV quality metric. These findings
+as quality metric results in particularly large in-plane errors,                           correlate well with the characteristics of the reconstructed
+often larger than in the initial state while leading to accurate                           images in Fig. 6.
+fits for the out-of-plane parameters. The method by Huang et
+al. yields improved in-plane and out-of-plane parameters, but
+the improvement is marginal in some cases. For our method,                                 B. Optimizer comparison
+too, out-of-plane motion is recovered almost perfectly with                                   To analyze the impact of the gradient-based optimization,
+absolute errors below 0.5 mm and 0.5◦ in all cases, whereas                                we compare our method as well as the two existing iterative
+in-plane parameters tx and ty exhibit a median absolute error                              approaches in a gradient-based and in a gradient-free scenario.
+of more than 0.5 mm. In Fig. 5, we analyze the reprojection                                For the gradient-free setting, we choose the covariance ma-
+error (RPE), which is computed by forward projecting a                                     trix adaptation evolution strategy (CMAES) algorithm [41]
+fixed set of 300 3D points with radii 25 mm, 50 mm, and                                    because it is frequently applied for similar problems in related
+100 mm around the isocenter onto the detector planes using                                 work [19], [23]. It is configured with an initial standard
+the recovered and target geometries. Our method outperforms                                deviation of 0.5 mm and 0.5◦ for translations and rotations,
+both comparison methods by a large margin improving from                                   respectively, and iterated until the number of target function
+an initial median RPE of around 3 mm to RPEs below 1 mm                                    evaluations reaches 10000.
+in all cases. Table I summarizes the mean of all metrics for                                  Fig. 8 presents the average runtime required in both opti-
+the gradient-based case.                                                                   mization settings. Whereas all three investigated methods re-
+   Fig. 6 validates our findings by two qualitative examples.                              quire less than two minutes when using the proposed gradient-
+The reconstructed slices confirm that our method successfully                              based updates, the same optimization takes substantially longer
+compensates motion artifacts. The output of our proposed                                   (more than 30 minutes) when using CMAES. It can be
+algorithm is visually close to the ground truth. The method                                observed that the different quality metrics vary slightly in
+proposed by Huang et al. can reduce motion artifacts, but vis-                             the time needed for evaluation and gradient computation, but
+ible streaks and blurred edges remain, especially for example                              this effect is negligible when compared against the difference
+2. For the TV quality metric, we can visually confirm the                                  between the two optimization strategies. For example, for our
+previous result that it leads to acceptable results for out-of-                            proposed quality metric, the CMAES optimization is approx-
+plane motion (mostly visible in the sagittal views), but fails                             imately 19 times slower than the gradient descent algorithm.
+to recover in-plane motion (see axial views). The algorithm                                All runs have been executed using the same implementation
+by Ko et al. produces visually very clean images. However,                                 for all processing steps except the quality metric and on the
+the anatomy appears altered in shape and structure at multiple                             same hardware (Nvidia A40 GPU). Moreover, from figures 3,
+
+                 © 2024 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.See https://www.ieee.org/publications/rights/index.html for more information.
+                  This article has been accepted for publication in IEEE Transactions on Medical Imaging. This is the author's version which has not been fully edited and
+                                            content may change prior to final publication. Citation information: DOI 10.1109/TMI.2024.3474250
+8                                                                                            IEEE TRANSACTIONS ON MEDICAL IMAGING, VOL. XX, NO. XX, XXXX 2020
+
+
+
+               RMSE (↓)     SSIM (↑)        VIF (↑)       RPE (↓)       MAE tx (↓)          MAE ty (↓)         MAE tz (↓)         MAE rx (↓)          MAE ry (↓)         MAE rz (↓)
+Init            120.75        0.83           0.48          3.00           0.92                0.94               0.97               0.97                1.03               0.96
+TV              144.97        0.82           0.41          3.44           1.76                1.73               0.46               0.53                0.61               1.39
+Huang et al.    122.63        0.85           0.48          2.19           0.77                0.87               0.65               0.80                0.81               0.83
+Ko et al.       108.67        0.87           0.53            -              -                   -                  -                  -                   -                  -
+Ours             58.49        0.94           0.70          0.61           0.61                0.64               0.14               0.20                0.23               0.32
+
+TABLE I: Average quantitative values for all investigated metrics and motion compensation methods optimized with gradient
+descent. Only image-based metrics can be computed for the method by Ko et al. since it does not explicitly estimate motion
+patterns.
+
+
+
+
+Fig. 6: Qualitative reconstructions for two example patients. For each patient, the upper row shows an axial slice and the lower
+row shows a sagittal slice through the volume. A ×3 zoom of a region of interest is inserted. All gray values are windowed
+between −1200 HU and 1500 HU.
+
+
+4, and 5, we can observe that the choice of optimization                                    C. Quality metric choice
+algorithm does not influence the performance of the motion                                     In our proposed method, we use a voxelized VIF map as
+estimation for our proposed method. All metrics are at least                                regression target for the trained quality metric. Recent work
+the same (RPE or MAE for out-of-plane motion parameters) or                                 identified VIF to be a suitable metric for motion compen-
+even slightly better (image-based metrics or MAE for in-plane                               sation [6]. Nevertheless, any metric which can be computed
+motion parameters) when using gradient descent compared                                     in a per-voxel manner is a valid choice for our algorithm.
+to CMAES for our quality metric. We conclude, that the                                      Therefore, we evaluate the influence of the target metric on
+gradient-based optimization speeds up all three investigated                                the performance of our method by training the quality metric to
+methods by a factor of approximately 19. At the same time,                                  regress the mean squared error (MSE) as well as the structural
+the performance of the motion estimation is either not affected                             similarity index measure (SSIM) from the motion-affected
+or even slightly improved for both quality metrics which are                                input. For SSIM, similar to the strategy described for VIF,
+parameterized by neural networks.                                                           we regress an adjusted map ensuring that an average value
+                                                                                            of 0 corresponds to the ideal image via SSIM∗ (Idist , Iref ) =
+                                                                                            1 − SSIM(Idist , Iref ). The training setup is not altered except
+                                                                                            for the computation of the regression target.
+
+                  © 2024 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.See https://www.ieee.org/publications/rights/index.html for more information.
+                          This article has been accepted for publication in IEEE Transactions on Medical Imaging. This is the author's version which has not been fully edited and
+                                                                                   content may change prior to final publication. Citation information: DOI 10.1109/TMI.2024.3474250
+THIES et al.: PREPARATION OF PAPERS FOR IEEE TRANSACTIONS ON MEDICAL IMAGING                                                                                                                     9
+
+
+
+
+          2.5                        2.5                                                    2.5
+                                                                                                                 Ground truth
+tx [mm]
+
+
+
+
+                          ty [mm]
+
+
+
+
+                                                                                 rz [deg]
+          0.0                        0.0                                                    0.0                  Ours
+                                                                                                                 TV
+          2.5                        2.5                                                    2.5                  Huang et al.
+                0   200                      0                    200                             0   200
+          2.5                        2.5                                                    2.5
+
+
+                          rx [deg]
+
+
+
+
+                                                                                 ry [deg]
+tz [mm]
+
+
+
+
+          0.0                        0.0                                                    0.0
+          2.5                        2.5                                                    2.5
+                0   200                      0                    200                             0   200
+
+
+Fig. 7: Motion patterns belonging to example 1 in Fig. 6
+plotted as a function of acquired projections. The upper and
+lower row depicts the motion curves for the in-plane motion
+parameters (tx , ty , and rz ) and out-of-plane motion parameters
+(tz , rx , and ry ), respectively, referring to the plane in which
+the source rotates. The perturbing ground-truth motion pattern
+is parameterized by ten spline nodes, whereas all recovering
+motion patterns are parameterized by 30 nodes. The initial
+motion-affected reconstruction in Fig. 6 corresponds to motion
+curves initialized by zeros.
+
+                                                      60
+                                                                           Gradient descent
+                                                      50                   CMAES
+                                                      40                     38.68
+                                           Runtime [min]
+
+
+
+
+                                                                  32.70                      35.39
+                                                      30
+                                                      20
+                                                      10
+                                                               1.80       1.96          1.86
+                                                           0
+                                                                 TV        Huang            Ours
+
+
+Fig. 8: Comparison of the runtime for the proposed method
+and the alternative quality metrics in a gradient-based and
+gradient-free optimization setting. Each bar depicts the average
+runtime across all test samples for motion estimation excluding                                                                  Fig. 9: Qualitative reconstructions for two example patients
+the final full-resolution motion-compensated reconstruction.                                                                     using real motion-affected clinical cone-beam CT scans. For
+                                                                                                                                 each patient, the upper row shows an axial slice and the lower
+                                                                                                                                 row shows a sagittal slice through the volume. A ×3 zoom of
+   We observe that all three networks trained to predict quality                                                                 a region of interest is inserted.
+maps for MSE, SSIM, and VIF, respectively, result in accurate
+motion estimation and outperform the comparison methods in
+terms of RPE. VIF achieves the smallest RPE with a mean                                                                          to zero. The source-to-isocenter distance is 750 mm and the
+of 0.61 mm, whereas SSIM and MSE both result in a mean                                                                           source-to-detector distance is 1245 mm. Reconstructions are
+RPE of 0.98 mm. As a result, VIF works most accurately in                                                                        computed identically to the other experiments on a grid of
+the given experimental setting, but only with a small margin                                                                     size 128 × 128 × 128 with a 2 mm spacing for motion
+compared to MSE and SSIM.                                                                                                        compensation and on 256 × 256 × 256 pixels with 1 mm
+                                                                                                                                 spacing for visualization. Importantly, we do not retrain or
+D. Clinical validation                                                                                                           change the network for quality metric regression. Compared to
+   For clinical validation, we apply our method to two real                                                                      the other experiments, we adjust the step size for the gradient
+cone-beam CT scans which are noticeably affected by real pa-                                                                     descent to s0 = 10 and we apply a cylindrical mask to the
+tient motion (see Fig. 9, left column). The scans were recorded                                                                  reconstructions before feeding them to the quality network.
+on an Artis Q C-arm interventional angiography system                                                                            Next to the proposed algorithm, we further apply the methods
+(Siemens Healthineers AG, Forchheim, Germany) with 496                                                                           by Huang et al. and Ko et al. to the real data. Optimization
+projection images on a 200 ◦ short scan trajectory. Projection                                                                   with TV is excluded since it already produced unsatisfactory
+images were acquired with an image size of 960×1240 pixels,                                                                      results in the previous experiments.
+an effective pixel size of 0.316 mm × 0.316 mm after 2 × 2                                                                          In Fig. 9, both clinical examples generally exhibit slightly
+binning, preprocessed by a vendor-specific algorithm including                                                                   less pronounced motion artifacts than in the previous ex-
+conversion to line integral domain and a scatter correction, and                                                                 periments using spline-based motion patterns. Nevertheless,
+down-sampled by a factor of four in both dimension for our                                                                       the typical streak artifacts are clearly visible. After motion
+experiments. We further apply cosine weights, Parker weights,                                                                    compensation with our proposed method, these streaks are
+and the ramp filter. Truncation correction is implemented by                                                                     largely reduced as can be seen in the zoomed regions. Fur-
+extending the sinograms by 10% of their width on either                                                                          thermore, the fine structures in the axial view of example
+side and linearly extrapolating the left and right gray values                                                                   1 are more clearly visible after motion compensation. Since
+
+                          © 2024 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.See https://www.ieee.org/publications/rights/index.html for more information.
+                                       This article has been accepted for publication in IEEE Transactions on Medical Imaging. This is the author's version which has not been fully edited and
+                                                                                content may change prior to final publication. Citation information: DOI 10.1109/TMI.2024.3474250
+10                                                                                                                                       IEEE TRANSACTIONS ON MEDICAL IMAGING, VOL. XX, NO. XX, XXXX 2020
+
+
+
+
+in projection images                 Example 1                                                              Example 2                                           V. D ISCUSSION
+
+
+
+
+                                                                  in projection images
+                  940                                                                    70
+   Pixel position
+
+
+
+
+                                                                     Pixel position
+                  920                                                                    75                                                  The experiments demonstrate that by utilizing gradient de-
+                  900
+                                                                                         80                                              scent instead of the gradient-free CMAES for optimization, we
+                                                                                         85                                              speed up the motion estimation by a factor of 19. This reduc-
+                   1.5
+                                           Other                                     0.5
+                                                                                                                                         tion in runtime is relevant in clinical practice, when motion-
+Recovered motion
+
+
+
+
+                                                                  Recovered motion
+                   1.0                     rx
+   [deg / mm]
+
+
+
+
+                                                                     [deg / mm]
+                   0.5
+                                                                                                                                         compensated reconstructions need to be available within few
+                                                                                     0.0
+                   0.0
+                                                                                                  Other
+                                                                                                                                         minutes. For example, in the case of stroke imaging in the
+                   0.5                                                               0.5          tz                                     angio suite, the time to treatment is crucial. Hence, any delay
+                         0   100     200        300   400   500                               0    100      200     300      400   500   caused by image processing is to be avoided. Furthermore, a
+                                   Projection index                                                       Projection index
+                                                                                                                                         fast algorithm like ours can even be imagined in an interven-
+Fig. 10: Comparison of recovered motion patterns for clin-                                                                               tional setting.
+ical example 1 (left) and example 2 (right) in Fig. 9 with                                                                                   While direct image-to-image mappings such as the method
+observable motion in projection images. The upper plots                                                                                  proposed by Ko et al. [40] circumvent the time-intensive opti-
+describe the vertical pixel position of an anatomical landmark                                                                           mization approach, they do not follow the two-step approach
+in the projection images extracted by manual annotation. The                                                                             outlined in Fig. 1. Since they directly manipulate the image
+lower row plots the recovered motion curves (rotations and                                                                               instead of estimating underlying motion curves explicitly, they
+translations). The motion parameter with the highest amplitude                                                                           risk a modification of the image content which is not consistent
+is highlighted in orange (rx for example 1 and tz for example                                                                            with the measured data. We observe this effect particularly
+2). Projected motion of the landmark and recovered motion                                                                                for strong initial motion amplitudes which lead to altered
+curve with highest amplitude exhibit a strong similarity.                                                                                anatomical structures that do not match the image content of
+                                                                                                                                         the ground truth.
+                                                                                                                                             Concerning motion compensation performance, our method
+the ground-truth underlying motion patterns are unknown in                                                                               clearly outperforms the investigated existing methods. Total
+this case, a quantitative analysis is not possible. Instead,                                                                             variation is a simple, non-parametric function which favors
+we manually track an anatomical landmark across the 496                                                                                  volumes with sparse gradients. However, it is agnostic to
+projection images. We choose a highly absorbing tooth implant                                                                            the content of the volume, the anatomy of the head in our
+for example 1 and the top part of the skull for example 2. In                                                                            case. Consequently, it can converge to solutions which rep-
+Fig. 10, we plot the vertical pixel position of this landmark in                                                                         resent implausible anatomy. Furthermore, TV might be more
+the projection images against the motion curves recovered by                                                                             susceptible to the initialization and diverge for large initial
+our method. For clarity, the motion parameter with the highest                                                                           motion patterns. Therefore, research has recently focused on
+maximal amplitude in the recovered signal (rx for example                                                                                learned quality metrics which are trained on examples of the
+1 and tz for example 2) is highlighted in orange while the                                                                               target anatomy, thereby gaining an implicit understanding of
+other five parameters are plotted in gray. For both real scans,                                                                          it. The work by Huang et al. is an example for such method.
+the projected motion pattern of the anatomical landmark is                                                                               We hypothesize that their method does not yield satisfactory
+very similar to the pattern of the strongest recovered motion                                                                            results in our experiments because we fit a comparably large
+parameter. We do not expect identical signals since we omit                                                                              number of free parameters (180 compared to 72 free param-
+the influence of the other five motion parameters as well as                                                                             eters in their original publication). This increases the com-
+the projective nature of the landmark positions. Nevertheless,                                                                           plexity of the search space making the optimization task more
+it confirms the validity of the recovered motion patterns. The                                                                           difficult. Gradient-free optimization algorithms, in particular,
+recovered patterns agree with the impression obtained from the                                                                           exhibit unstable and slow convergence for large numbers of
+projection images that the most prominent motion is a nodding                                                                            free parameters. We therefore think that the gradient-based
+motion in the first 100 projection images for example 1 and a                                                                            optimization is not only advantageous in terms of speed, but
+periodic translation in z for example 2 potentially caused by                                                                            also when increasing the number of free parameters.
+heavy breathing of the patient.                                                                                                              In Fig. 4a, we observe that all methods have a higher MAE
+   The method by Ko et al. also effectively reduces motion                                                                               for both in-plane translations tx and ty than for the remaining
+artifacts. However, since it is a pure image-to-image mapping                                                                            motion parameters. This is, at least partly, due to the definition
+that does not recover the underlying motion pattern, the                                                                                 of the coordinate system with respect to the scanning trajec-
+same analysis as for the proposed algorithm is not possible.                                                                             tory. Both in-plane translations are parallel to the central ray
+Moreover, it predicts an erroneous high-intensity signal for                                                                             for two positions in each full circular scan. The reconstructed
+the caudal region of the head (indicated by orange arrows                                                                                image does not depend heavily on translations that are close
+in Fig. 9) which strongly distorts and overlays the actual                                                                               to parallel to the central ray and, therefore, all investigated
+anatomical structures in that region. The algorithm by Huang                                                                             target functions are not as sensitive to these parameters as to
+et al. performs poorly when transitioning to the real data and                                                                           the other motion parameters. However, since small errors in
+its output appears worse than the initial motion-affected image.                                                                         tx and ty barely influence the final reconstruction as long as
+                                                                                                                                         they are roughly parallel to the measurement rays, we deem
+                                                                                                                                         these deviations acceptable.
+                                                                                                                                             This study shows that our method performs motion com-
+
+                                       © 2024 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.See https://www.ieee.org/publications/rights/index.html for more information.
+                 This article has been accepted for publication in IEEE Transactions on Medical Imaging. This is the author's version which has not been fully edited and
+                                           content may change prior to final publication. Citation information: DOI 10.1109/TMI.2024.3474250
+THIES et al.: PREPARATION OF PAPERS FOR IEEE TRANSACTIONS ON MEDICAL IMAGING                                                                                                           11
+
+
+
+
+pensation in a fast and robust way. Quantifying the effects                                independently moving parts, such as head and stationary head
+on downstream task related to, e.g., stroke diagnosis or final                             rest or head and lower jaw, can not be modelled. Given the
+patient outcome is crucial. First quantitative results have been                           additive contribution of all voxels in the reconstructed volume
+published in prior work [9], but this aspect remains an open                               to the gradient of the motion parameters, the largest region in
+area for future research. We further acknowledge that motion                               volume domain would dominate the recovered motion signal.
+artifacts are not the only source of image degradation in this                             For brain examinations such as stroke imaging, the lower
+context. Motion compensation always needs to go in hand                                    jaw is oftentimes not imaged and the head rest is clinically
+with, e.g., scatter and beam hardening correction to obtain                                irrelevant such that some artifacts in this region are acceptable.
+optimal reconstructed images. Further, the hardware of the                                 Nevertheless, quantifying the influence of such independent
+CBCT scanner needs to be tailored to direct point-of-care                                  rigid movements on a larger clinical data set is relevant for
+imaging [4]. These are important aspects which are outside                                 future research. Potentially, the presented method could be
+the scope of this work.                                                                    extended to multiple sets of projection matrices for different
+   The proposed method is first tested on real MDCT recon-                                 parts of the volume.
+structions from which cone-beam sinograms are simulated.                                      Gradient descent relies on accurate gradient information.
+Realistic motion patterns are informed by existing research on                             We derive and implement an analytic expression to translate
+the characteristics of head motion in an imaging device [8].                               gradients on the reconstructed volume into gradients on the
+While simulated X-ray projections are known to have different                              geometry parameters. In order to obtain precise geometry
+characteristics compared to real ones [42], this difference                                gradients, we require informative volume gradients which
+largely vanishes during the reconstruction step because the                                are obtained by standard backpropagation through the quality
+reconstruction algorithm inverts the idealized image formation                             metric into the reconstructed volume. Since the quality metrics
+assumed during simulation. Furthermore, the constrained                                    are usually trained on the forward mapping only, there is no
+optimization setting of the proposed method might even                                     guarantee that the gradient information from backpropagation
+tolerate slightly sub-optimal quality maps as long as they                                 is informative for motion compensation. For example, in a
+result in correct overall updates for the motion parameters.                               contracting architecture, the learned function could depend
+We prove this effect by applying our method to motion-                                     only on a subset of voxels, leading to missing gradient
+affected clinical CBCT data. Importantly, we do not retrain                                information for those positions that do not contribute to the
+the quality regression network. Nevertheless, motion artifacts                             output. We therefore regress full quality maps resulting in a
+are largely removed and the recovered motion patterns align                                quality metric prediction for every voxel in the volume. As a
+with observable patterns extracted from the projection im-                                 result, the learned mapping is enforced to incorporate all voxel
+ages proving the correctness of the recovered motion in the                                positions and gradients flow back into all parts of the volume,
+absence of a ground truth. These results indicate that the                                 which ensures more evenly distributed gradient information.
+algorithm generalizes from the spline-based motion patterns                                In addition, skip connections in the U-net architecture are
+to those induced by real patient motion. Furthermore, the                                  known to improve gradient flow and alleviate the problem of
+slight differences in image appearance between reconstruc-                                 vanishing gradients [43]. Nevertheless, alternative volume-to-
+tions from direct CBCT measurements and simulations from                                   volume network architectures could be experimented with as
+MDCT data do not disturb the performance of the method.                                    well.
+This is in contrast to the comparison methods by Ko et al.,                                   The analytic formulation used to propagate gradients from
+which produces strong artifacts in the caudal head region,                                 the reconstructed volume to the geometry parameters builds
+and Huang et al., which does not generalize to the real data                               upon previously published work [26]. This prior work was
+at all. A rigorous quantitative evaluation on the real CBCT                                restricted to fan-beam geometries which have limited relevance
+data is challenging because ground-truth information about                                 for clinical applications. Here, the idea is extended to cone-
+the patient’s motion patterns are lacking. Hence, experiments                              beam CT scanners. This extension requires a careful imple-
+on both data sets are required: The first setting uses partly                              mentation of both backprojection and corresponding gradient
+simulated data for a large-scale and quantitative validation.                              computation to keep memory requirements manageable. While
+                                                                                                                                                          dr
+The second part on motion-affected CBCT data demonstrates                                  it is feasible to explicitly compute the entire Jacobian dp
+that results can be transferred to real data, but is limited in                            for fan-beam geometries, this would require approximately
+the number of available scans and quantitative evaluation. In                              290 GB for a volume of size 256 × 256 × 256 with 360
+follow-up work, it would be valuable to record CBCT scans                                  projection matrices. This is not compatible with existing
+along with their corresponding ground-truth motion patterns,                               consumer GPUs. As a result, the Jacobian is never computed
+e.g., using an optical tracking system. This can facilitate                                explicitly in the cone-beam case, but Jacobian-vector products
+large-scale and quantitative studies of the performance across                             are evaluated on-the-fly using the gradient of the quality
+different variations of real motion patterns and their induced                             metric with respect to the reconstructed volume. Moreover,
+artifacts. Moreover, dedicated experiments with controlled                                 our previous work did not incorporate a motion model leading
+levels of noise or scatter can yield a more comprehensive                                  to unrealistically fast and temporally unconstrained simulated
+understanding of the method’s performance when exposed to                                  motion patterns which contradict existing knowledge about
+individual influencing variables.                                                          head motion characteristics.
+   The proposed algorithm fits a single rigid motion pattern                                  Moreover, we would like to highlight that the geometry-
+to the entire reconstructed volume. As a result, multiple                                  differentiable implementation of the backprojection operation
+
+                 © 2024 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.See https://www.ieee.org/publications/rights/index.html for more information.
+                 This article has been accepted for publication in IEEE Transactions on Medical Imaging. This is the author's version which has not been fully edited and
+                                           content may change prior to final publication. Citation information: DOI 10.1109/TMI.2024.3474250
+12                                                                                          IEEE TRANSACTIONS ON MEDICAL IMAGING, VOL. XX, NO. XX, XXXX 2020
+
+
+
+
+is openly available to the community as a ready-to-use PyTorch                             making it applicable to motion compensation in real-world
+function which can be plugged into any existing autofocus-                                 clinical scenarios. Together with an improved quality metric,
+inspired approach to enable gradient-based optimization. It                                we see the full advantage of the proposed gradient-based
+only requires a differentiable quality metric. Since most state-                           method: A substantial reduction of runtime as well as accurate
+of-the-art approaches use neural networks for quality metric                               and robust motion compensation performance. Ultimately, this
+regression, differentiability is ensured through backpropaga-                              method may pave the way toward point-of-care CBCT head
+tion. Consequently, gradient-based optimization is not only                                imaging by correcting for inevitable motion artifacts in a fast
+applicable in the specific context of this work, but has the                               and reliable manner.
+potential to speed up existing autofocus-based works.
+   Some authors prefer gradient-free optimization algorithms                                                                ACKNOWLEDGMENTS
+for image alignment and motion compensation because these
+                                                                                              The research leading to these results has received funding
+problems are typically not convex [19]. They believe gradient-
+                                                                                           from the European Research Council (ERC) under the Euro-
+based algorithms are more likely to terminate in sub-optimal
+                                                                                           pean Union’s Horizon 2020 research and innovation program
+local minima, while gradient-free methods can find more
+                                                                                           (ERC Grant No. 810316). The authors gratefully acknowledge
+accurate solutions. However, both types of algorithms lack
+                                                                                           the scientific support and HPC resources provided by the
+theoretical convergence guarantees for specific motion models
+                                                                                           Erlangen National High Performance Computing Center of
+and target functions. Moreover, our experiments consistently
+                                                                                           the Friedrich-Alexander-Universität Erlangen-Nürnberg. The
+converge to solutions that are very close to the ground truth,
+                                                                                           hardware is funded by the German Research Foundation.
+both quantitatively and qualitatively. We acknowledge that
+gradient descent performs worse than CMAES for the TV
+quality metric, but no systematic difference can be identi-                                                                        D ISCLAIMER
+fied between both optimization strategies for our proposed                                   The concepts and information presented in this paper are
+quality metric and the one proposed by Huang et al. If the                                 based on research and are not commercially available.
+combination of quality metric and motion model leads to a
+strong non-convex optimization landscape, we could imagine                                                                        R EFERENCES
+an approach which uses gradient descent for a fast initial                                  [1] P. Nicholson et al., “Novel flat-panel cone-beam CT compared to multi-
+alignment followed by fine-tuning of the estimated motion                                       detector CT for assessment of acute ischemic stroke: A prospective
+patterns with a gradient-free algorithm such as CMAES that                                      study,” Eur. J. Radiol., vol. 138, 5 2021.
+                                                                                            [2] C. Waydhas, “Equipment review: Intrahospital transport of critically ill
+might overcome some local minima due to its stochastic                                          patients,” Crit. Care, vol. 3, 1999.
+behavior. Moreover, in the deep learning community, research                                [3] Z. Rumboldt, W. Huda, and J. W. All, “Review of portable CT with
+is conducted around gradient-based optimization algorithms                                      assessment of a dedicated head CT scanner,” pp. 1630–1636, 10 2009.
+which work robustly in non-convex optimization landscapes.                                  [4] P. Wu et al., “Cone-beam CT for imaging of the head/brain: De-
+                                                                                                velopment and assessment of scanner prototype and reconstruction
+For example, these algorithms use additional momentum terms                                     algorithms,” Med. Phys., vol. 47, pp. 2392–2407, 6 2020.
+or automatic parameter-dependent learning rate adaptation                                   [5] M. Goyal et al., “Analysis of workflow and time to treatment and
+[44]. Replacing the plain gradient descent by a gradient-based                                  the effects on outcome in endovascular treatment of acute ischemic
+                                                                                                stroke: Results from the SWIFT PRIME randomized controlled trial,”
+optimization algorithm which is tailored toward non-convexity                                   Radiology, vol. 279, pp. 888–897, 6 2016.
+is also promising in strongly non-convex scenarios. Addition-                               [6] H. Huang et al., “Reference-free learning-based similarity metric for
+ally, in non-convex optimization, the choice of the initial guess                               motion compensation in cone-beam CT,” Phys. Med. Biol., vol. 67,
+                                                                                                no. 12, p. 125020, 2022.
+has a direct influence on the result. Since the estimation of                               [7] M. K. Kalra, M. M. Maher, R. D’Souza, and S. Saini, “Multidetector
+motion patterns is patient- and scan-specific, there is usually                                 computed tomography technology: current status and emerging devel-
+no prior knowledge available and an initialization assuming a                                   opments,” J. Comput. Assist. Tomogr., vol. 28, pp. S2–S6, 2004.
+                                                                                            [8] A. Wagner, K. Schicho, F. Kainberger, W. Birkfellner, S. Grampp, and
+motion-free case seems logical. This is the strategy used in                                    R. Ewers, “Quantification and Clinical Relevance of Head Motion during
+this work resulting in convincing results. Alternative ways of                                  Computed Tomography,” Invest. Radiol., vol. 38, pp. 733–741, 2003.
+choosing the initial parameters are conceivable, e.g., a random                             [9] N. Cancelliere et al., “Motion artifact correction for cone beam CT
+                                                                                                stroke imaging: a prospective series,” J. Neurointerv. Surg., vol. 15, pp.
+spline-based motion pattern with small amplitude or an initial                                  223–228, 2023.
+estimate by a separate neural network.                                                     [10] M. Manhart et al., “Denoising and artefact reduction in dynamic
+                                                                                                flat detector CT perfusion imaging using high speed acquisition: first
+   Another valuable direction for follow-up research is the                                     experimental and clinical results,” Phys. Med. Biol., vol. 59, no. 16, p.
+extension of the proposed method to non-circular trajectories                                   4505, 2014.
+using analytic backprojection-type algorithms [45]. Not only                               [11] H. Yu and G. Wang, “Data Consistency Based Rigid Motion Artifact
+                                                                                                Reduction in Fan-Beam CT,” IEEE TMI, vol. 26, no. 2, pp. 249–260,
+would that allow for motion compensation for these types                                        2007.
+of trajectories, but a similar approach can be envisioned                                  [12] M. Berger et al., “Motion compensation for cone-beam CT using Fourier
+for phantom-free, image-based calibration for non-circular                                      consistency conditions,” Phys. Med. Biol., vol. 62, no. 17, p. 7181, 2017.
+trajectories which can not be calibrated in advance.                                       [13] A. Aichert et al., “Epipolar Consistency in Transmission Imaging,” IEEE
+                                                                                                TMI, vol. 34, no. 11, pp. 2205–2219, 2015.
+                                                                                           [14] A. Preuhs, A. Maier, M. Manhart, J. Fotouhi, N. Navab, and M. Un-
+                                                                                                berath, “Double Your Views—Exploiting Symmetry in Transmission
+                        VI. C ONCLUSION                                                         Imaging,” in Proc. MICCAI. Springer, 2018, pp. 356–364.
+                                                                                           [15] M. Berger et al., “Marker-free motion correction in weight-bearing cone-
+  In this paper, the differentiable formulation of CT re-                                       beam CT of the knee joint,” Med. Phys., vol. 43, no. 3, pp. 1235–1248,
+construction is extended to cone-beam geometry parameters                                       2016.
+
+
+                 © 2024 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.See https://www.ieee.org/publications/rights/index.html for more information.
+                     This article has been accepted for publication in IEEE Transactions on Medical Imaging. This is the author's version which has not been fully edited and
+                                               content may change prior to final publication. Citation information: DOI 10.1109/TMI.2024.3474250
+THIES et al.: PREPARATION OF PAPERS FOR IEEE TRANSACTIONS ON MEDICAL IMAGING                                                                                                               13
+
+
+
+
+[16] S. Ouadah, J. Stayman, G. Gang, T. Ehtiati, and J. Siewerdsen, “Self-                     [39] C. Syben, M. Michen, B. Stimpel, S. Seitz, S. Ploner, and A. K. Maier,
+     calibration of cone-beam CT geometry using 3D–2D image registration,”                          “PYRO-NN: Python reconstruction operators in neural networks,” Med.
+     Phys. Med. Biol., vol. 61, no. 7, p. 2613, 2016.                                               Phys., vol. 46, no. 11, pp. 5110–5115, 2019.
+[17] T. Sun, J.-H. Kim, R. Fulton, and J. Nuyts, “An iterative projection-                     [40] Y. Ko, S. Moon, J. Baek, and H. Shim, “Rigid and non-rigid motion
+     based motion estimation and compensation scheme for head x-ray CT,”                            artifact reduction in X-ray CT using attention module,” Medical Image
+     Medical physics, vol. 43, no. 10, pp. 5705–5716, 2016.                                         Analysis, vol. 67, p. 101883, 2021.
+[18] A. Kingston, A. Sakellariou, T. Varslot, G. Myers, and A. Sheppard,                       [41] N. Hansen, “The CMA evolution strategy: a comparing review,” in
+     “Reliable automatic alignment of tomographic projection data by passive                        Towards a New Evolutionary Computation, ser. Studies in Fuzziness
+     auto-focus,” Med. Phys., vol. 38, no. 9, pp. 4934–4945, 2011.                                  and Soft Computing. Springer, 2006, vol. 192, pp. 75–102.
+[19] A. Sisniega, J. W. Stayman, J. Yorkston, J. Siewerdsen, and W. Zbijew-                    [42] C. Gao et al., “Synthetic data accelerates the development of general-
+     ski, “Motion compensation in extremity cone-beam CT using a penalized                          izable learning-based algorithms for X-ray image analysis,” Nat. Mach.
+     image sharpness criterion,” Phys. Med. Biol., vol. 62, no. 9, p. 3712,                         Intell., vol. 5, no. 3, pp. 294–308, 2023.
+     2017.                                                                                     [43] M. Drozdzal, E. Vorontsov, G. Chartrand, S. Kadoury, and C. Pal, “The
+[20] A. Preuhs et al., “Appearance Learning for Image-Based Motion Es-                              importance of skip connections in biomedical image segmentation,” in
+     timation in Tomography,” IEEE TMI, vol. 39, no. 11, pp. 3667–3678,                             Proc. DLMIA, LABELS. Springer, 2016, pp. 179–187.
+     2020.                                                                                     [44] D. P. Kingma and J. Ba, “Adam: A method for stochastic optimization,”
+                                                                                                    arXiv preprint arXiv:1412.6980, 2014.
+[21] S. Capostagno, A. Sisniega, J. Stayman, T. Ehtiati, C. Weiss, and
+                                                                                               [45] M. Defrise and R. Clack, “A cone-beam reconstruction algorithm using
+     J. Siewerdsen, “Deformable motion compensation for interventional
+                                                                                                    shift-variant filtering and cone-beam backprojection,” IEEE TMI, vol. 13,
+     cone-beam CT,” Phys. Med. Biol., vol. 66, no. 5, p. 055010, 2021.
+                                                                                                    no. 1, pp. 186–195, 1994.
+[22] J. Wicklein, H. Kunze, W. A. Kalender, and Y. Kyriakou, “Image features
+     for misalignment correction in medical flat-detector CT,” Med. Phys.,
+     vol. 39, no. 8, pp. 4918–4931, 2012.
+[23] A. Sisniega et al., “Deformable image-based motion compensation for
+     interventional cone-beam CT with a learned autofocus metric,” in Proc.
+     SPIE, vol. 11595, 2021, pp. 241–248.
+[24] J. Wicklein, Y. Kyriakou, W. A. Kalender, and H. Kunze, “An online
+     motion-and misalignment-correction method for medical flat-detector
+     CT,” in Medical Imaging 2013: Physics of Medical Imaging, vol. 8668.
+     SPIE, 2013, pp. 466–472.
+[25] H. Huang, J. H. Siewerdsen, A. Lu, Y. Hu, W. Zbijewski, M. Unberath,
+     C. R. Weiss, and A. Sisniega, “Multi-stage Adaptive Spline Autofocus
+     (MASA) with a learned metric for deformable motion compensation
+     in interventional cone-beam CT,” in Medical Imaging 2023: Physics
+     of Medical Imaging, L. Yu, R. Fahrig, and J. M. Sabol, Eds., vol.
+     12463, International Society for Optics and Photonics. SPIE, 2023, p.
+     1246314. [Online]. Available: https://doi.org/10.1117/12.2654361
+[26] M. Thies et al., “Gradient-based geometry learning for fan-beam CT
+     reconstruction,” Phys. Med. Biol., vol. 68, no. 20, p. 205004, 2023.
+[27] M. Thies et al., “Optimizing CT Scan Geometries With and Without
+     Gradients,” in Proc. Fully3D, 2023.
+[28] H. Huang, J. H. Siewerdsen, W. Zbijewski, C. R. Weiss, M. Unberath,
+     and A. Sisniega, “Context-aware, reference-free local motion metric
+     for CBCT deformable motion compensation,” in 7th International
+     Conference on Image Formation in X-Ray Computed Tomography,
+     J. W. Stayman, Ed., vol. 12304, International Society for Optics
+     and Photonics. SPIE, 2022, p. 1230412. [Online]. Available:
+     https://doi.org/10.1117/12.2646857
+[29] X. Li, D. Zhang, and B. Liu, “A generic geometric calibration method
+     for tomographic imaging systems with flat-panel detectors—A detailed
+     implementation guide,” Med. Phys., vol. 37, no. 7, pp. 3844–3854, 2010.
+[30] A. Maier, S. Steidl, V. Christlein, and J. Hornegger, Medical imaging
+     systems: An introductory guide. Springer, 2018.
+[31] J. Maier et al., “Rigid and Non-Rigid Motion Compensation in Weight-
+     Bearing CBCT of the Knee Using Simulated Inertial Measurements,”
+     IEEE TBE, vol. 69, no. 5, pp. 1608–1619, 2021.
+[32] C. Rohkohl, G. Lauritsch, L. Biller, M. Prümmer, J. Boese, and
+     J. Hornegger, “Interventional 4D motion estimation and reconstruction
+     of cardiac vasculature without motion periodicity assumption,” Med.
+     Image Anal., vol. 14, no. 5, pp. 687–694, 2010.
+[33] H. Wu, A. Maier, R. Fahrig, and J. Hornegger, “Spatial-temporal total
+     variation regularization (STTVR) for 4D-CT reconstruction,” in Proc.
+     SPIE Medical Imaging, vol. 8313. SPIE, 2012, pp. 1018–1024.
+[34] H. R. Sheikh and A. C. Bovik, “Image information and visual quality,”
+     IEEE TIP, vol. 15, pp. 430–444, 2 2006.
+[35] Y. Shao, F. Sun, H. Li, and Y. Liu, “A novel approach for computing
+     quality map of visual information fidelity index,” in Proc ISKE, vol.
+     213. Springer, 2014, pp. 163–173.
+[36] A. Wolny et al., “Accurate and versatile 3d segmentation of plant tissues
+     at cellular resolution,” eLife, vol. 9, p. e57613, jul 2020.
+[37] V. Bacher, C. Syben, A. Maier, and A. Wang, “Learning projection
+     matrices for marker free motion compensation in weight-bearing CT
+     scans,” in Proc. Fully 3D, vol. 16, 2021, pp. 327–330.
+[38] S. Chilamkurthy et al., “Deep learning algorithms for detection of critical
+     findings in head CT scans: a retrospective study,” The Lancet, vol. 392,
+     no. 10162, pp. 2388–2396, 2018.
+
+
+                     © 2024 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.See https://www.ieee.org/publications/rights/index.html for more information.
+

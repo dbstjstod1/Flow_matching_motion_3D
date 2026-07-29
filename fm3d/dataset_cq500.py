@@ -46,6 +46,7 @@ beyond -- unclipped, one such voxel sets the scale for the whole normalization.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 
@@ -55,8 +56,8 @@ import torch
 from .filters import calibrate_scale
 from .geometry_3d import (ConeBeam3DConfig, build_conebeam_orbit, detector_coords_3d,
                           view_angular_weights, view_angular_weights_dot)
-from .projector_3d import (fdk_conebeam_3d_batched, fdk_conebeam_3d_tangent,
-                           forward_project_3d_batched)
+from .projector_3d import (adjoint_project_3d_batched, fdk_conebeam_3d_batched,
+                           fdk_conebeam_3d_tangent, forward_project_3d_batched)
 from .rigid_motion import params_to_Pmot, random_motion
 
 MU_WATER = 0.02
@@ -170,7 +171,7 @@ class CQ500Generator:
     """Loads CQ500 volumes on an isotropic grid and projects them through the standard geometry.
 
     Same operator contract as `AAPMSlabGenerator` -- `volume / to_net / from_net / project / fdk /
-    sample_motion / shape / fbp_scale` -- so `train_fm3d.py` and `run_posterior3d.py` take it as a
+    sample_motion / shape` -- so `train_fm3d.py` and `run_posterior3d.py` take it as a
     drop-in.
     """
 
@@ -178,9 +179,8 @@ class CQ500Generator:
                  split: str = "train", shape=(256, 256, 256), voxel_mm: float = 1.0,
                  hu_norm=(-1000.0, 2000.0), clip: bool = True, mu_water: float = MU_WATER,
                  thin_mm: float = 0.7, count_tol: float = 0.5,
-                 split_counts=(150, 50, 120), n_samples_fwd: int = 256,
-                 angle_weight: bool = True,
-                 fbp_scale: float | None = None,
+                 split_counts=(150, 50, 120),
+                 angle_weight: bool = True, sim_native: bool = True,
                  cache_dir: str | None = None, verbose: bool = True):
         self.device = torch.device(device)
         self.root = root
@@ -192,13 +192,9 @@ class CQ500Generator:
         self.dx = self.dy = self.dz = float(voxel_mm)
         self.mu_water = mu_water
         self.clip = clip
-        # 256 ray-march samples, halved from 512 (2026-07-18). Measured on a real CQ500 volume:
-        # 256 vs 512 forward quadrature changes the FDK reconstruction by 9e-4 rel (~59 dB), which
-        # is ~25 dB BELOW the FDK's own cone-beam floor -- absolute recon-vs-GT is identical
-        # (34.37 vs 34.34 dB in the measured region). It halves the forward projection (1.82->0.95 s
-        # at 256^3/360v), the dominant cost of a bridge draw. Below 256 the time saving shrinks
-        # (grid overhead) while the quadrature margin erodes, so 256 is the sweet spot.
-        self.n_samples_fwd = n_samples_fwd
+        # (There used to be an `n_samples_fwd` ray-march quadrature knob here. The operator has
+        # had no ray samples since the SF switch and has none now that it is LEAP's separable
+        # footprint: the footprint is integrated analytically. Removed 2026-07-29.)
         self.cache_dir = cache_dir or os.path.join(root, "_vol_cache")
 
         lo, hi = hu_norm
@@ -222,13 +218,52 @@ class CQ500Generator:
         self.cfg = cfg or ConeBeam3DConfig.thies()
         self.P_nom = build_conebeam_orbit(self.cfg, device=self.device)
         self.u_coords, self.v_coords = detector_coords_3d(self.cfg, device=self.device)
-        # `fbp_scale` can be INJECTED (e.g. a val/deploy generator reusing the constant the TRAIN
-        # generator calibrated, or the one stored in a checkpoint): _calibrate() fits on volume 0
-        # of this generator's own split, so two splits calibrate on different patients and their
-        # NET normalizations drift slightly apart. Injection keeps the operator constant shared
-        # and skips the calibration projection.
-        self.fbp_scale = float(fbp_scale) if fbp_scale is not None else self._calibrate()
+        # NO CALIBRATION (user, 2026-07-28; the 4DCT sibling deleted the same thing 2026-07-21).
+        # The FDK is SELF-NORMALIZED by the pure geometry constant SOD*SDD/2
+        # (`projector_3d._fdk_physical_norm`, phantom-verified to 0.2%), exactly like RTK --
+        # SOD and SDD are GIVEN, so there is nothing to fit and no scale attribute at all. The old least-squares scale silently absorbed any operator or
+        # level error instead of surfacing it.
         self._anchor_cache: dict[int, torch.Tensor] = {}   # idx -> NET static FDK, on CPU
+
+        # ---- SIMULATION GRID (2026-07-29, user directive: "순결한 LEAP 일대일 대응") ----------
+        # Every measurement y in this project is now simulated by forward-projecting the volume
+        # resampled to the geometry's NATIVE voxel size -- du * SOD/SDD, the detector pitch back-
+        # projected to the isocentre, which is LEAP's own reconstruction-grid convention (their
+        # `set_default_volume`) -- while the INVERSION (FDK, CG, the estimator's dP, the bridge)
+        # keeps running on the coarse `voxel_mm` grid. Same SF operator, same matched pair, same
+        # call path: THE ONLY CHANGE IS THE GRID THE TRUTH IS SAMPLED ON.
+        #
+        # WHY. Simulating on the grid you invert on is the classic inverse crime, and here it had a
+        # visible cost: the SF operator integrates the CUBE voxel basis, whose faces carry real
+        # energy above the voxel Nyquist, and the detector RESOLVES it (0.4187 mm at iso vs 1 mm
+        # voxels = 2.39x finer), so the static FDK came out with a crosshatch texture the user
+        # spotted in the validation montages. MEASURED on p218 (excess sd in a homogeneous brain
+        # ROI, static FDK): 1 mm simulation 21.3 HU under a bare ram-lak / 2.9 HU under the
+        # deployed `shepphann`; NATIVE simulation 1.9 HU / 0.0 HU at equal-or-better sharpness.
+        # The installed LEAP reproduces the same defect end-to-end when driven at 1 mm (9.5 HU with
+        # all their defaults) and is clean at its native grid -- so this is the field's convention,
+        # not a workaround. Thies et al. simulate from the native MDCT volumes for the same reason.
+        # CQ500 is ALREADY scanner-native at ~0.41 mm in-plane, so nothing is invented here: we
+        # simply stop throwing that resolution away before projecting.
+        #
+        # COST. Voxel-driven SF at 612^3 x 360 views is 2.88 s (the installed LEAP's own forward
+        # needs 2.76 s on the same task, i.e. we are at parity) and the DICOM read + resample is
+        # 1.4 s, which is why `volume_fine` keeps only a 1-deep in-RAM cache and NO disk cache:
+        # caching 150 patients as fp32 would cost 131 GB to save 1 s, and fp16 would quantize the
+        # truth by up to 1 HU.
+        self.sim_native = bool(sim_native)
+        du = float(self.u_coords[1] - self.u_coords[0])
+        dv = float(self.v_coords[1] - self.v_coords[0])
+        self.sim_voxel_mm = min(du, dv) * self.cfg.SOD / self.cfg.SDD
+        # the fine box must COVER the coarse one (same physical FOV, centred), hence ceil
+        self.sim_shape_dhw = tuple(
+            int(math.ceil(n * d / self.sim_voxel_mm - 1e-9))
+            for n, d in zip(self.shape_dhw, (self.dz, self.dy, self.dx)))
+        self._fine_cache: tuple[int, np.ndarray] | None = None
+        if verbose and self.sim_native:
+            print(f"[cq500] simulation grid: {'x'.join(map(str, self.sim_shape_dhw))} @ "
+                  f"{self.sim_voxel_mm:.5f} mm (native = du*SOD/SDD) | "
+                  f"inversion grid: {'x'.join(map(str, self.shape_dhw))} @ {self.dx:g} mm")
 
     # -- volumes ------------------------------------------------------------------------
     def volume(self, idx: int = 0) -> torch.Tensor:
@@ -248,18 +283,57 @@ class CQ500Generator:
         mu = (hu / 1000.0 + 1.0) * self.mu_water
         return torch.from_numpy(mu).float()[None, None].to(self.device)
 
-    def _load_hu(self, r: dict) -> np.ndarray:
-        """DICOM series -> HU on an isotropic `voxel_mm` grid, centre-cropped/padded to `shape`."""
+    def _raw_series(self, r: dict):
+        """The DICOM series as an sitk image on ITS OWN grid, disk-cached LOSSLESSLY as int16.
+
+        Reading a CQ500 series costs 1-15 s and it is DECOMPRESSION, not IO (measured: a warm
+        re-read costs the same as a cold one), which the native simulation grid can no longer
+        absorb -- `volume_fine` is called on every bridge draw. So the decoded series is cached
+        once, and every later resample (coarse OR fine) starts from the cache.
+
+        int16 is EXACT here, not an approximation: CQ500's HU are integers after the DICOM
+        rescale (verified max|HU - round(HU)| = 0 across patients) and span [-3024, 3071].
+        ~120-150 MB per patient, vs 874 MB if the fine grid itself were cached."""
         import SimpleITK as sitk
 
+        os.makedirs(self.cache_dir, exist_ok=True)
+        npz = os.path.join(self.cache_dir, f"p{r['patient']:04d}_raw_i16.npz")
+        if os.path.exists(npz):
+            z = np.load(npz)
+            img = sitk.GetImageFromArray(z["hu"].astype(np.float32))
+            img.SetSpacing([float(v) for v in z["spacing"]])
+            img.SetOrigin([float(v) for v in z["origin"]])
+            img.SetDirection([float(v) for v in z["direction"]])
+            return img
         reader = sitk.ImageSeriesReader()
         reader.SetFileNames(reader.GetGDCMSeriesFileNames(r["path"], r["series"]))
         img = reader.Execute()                                    # HU already (rescale applied)
+        hu = sitk.GetArrayFromImage(img).astype(np.float32)
+        if np.abs(hu - np.round(hu)).max() == 0.0 and hu.min() >= -32768 and hu.max() <= 32767:
+            tmp = npz + f".tmp{os.getpid()}"                       # atomic: many jobs share this
+            with open(tmp, "wb") as fh:                             # a path arg would get ".npz"
+                np.savez(fh, hu=hu.astype(np.int16), spacing=np.array(img.GetSpacing()),
+                         origin=np.array(img.GetOrigin()), direction=np.array(img.GetDirection()))
+            os.replace(tmp, npz)
+        return img
+
+    def _load_hu(self, r: dict, voxel_mm: float | None = None,
+                 shape_dhw: tuple[int, int, int] | None = None) -> np.ndarray:
+        """DICOM series -> HU on an isotropic grid, centre-cropped/padded to `shape`.
+
+        Defaults to the INVERSION grid (`voxel_mm`, `shape`); `volume_fine` passes the finer
+        SIMULATION grid instead. Both go through the identical resample, so the two grids differ
+        only in sampling density -- not in interpolation, orientation, origin or air padding."""
+        import SimpleITK as sitk
+
+        vm = self.dx if voxel_mm is None else float(voxel_mm)
+        shp = self.shape_dhw if shape_dhw is None else tuple(shape_dhw)
+        img = self._raw_series(r)
 
         # resample to an isotropic grid -- the whole reason dz stops being an assumption
         sp_in = np.array(img.GetSpacing(), dtype=np.float64)       # (x, y, z)
         sz_in = np.array(img.GetSize(), dtype=np.int64)            # (x, y, z)
-        sp_out = np.array([self.dx, self.dy, self.dz], dtype=np.float64)
+        sp_out = np.array([vm, vm, vm], dtype=np.float64)
         sz_out = np.maximum(np.round(sz_in * sp_in / sp_out).astype(int), 1)
 
         rs = sitk.ResampleImageFilter()
@@ -270,7 +344,49 @@ class CQ500Generator:
         rs.SetInterpolator(sitk.sitkLinear)
         rs.SetDefaultPixelValue(-1000.0)                           # air, not zero (= water)
         vol = sitk.GetArrayFromImage(rs.Execute(img)).astype(np.float32)   # (z, y, x) = (D,H,W)
-        return _centre_fit(vol, self.shape_dhw, pad_value=-1000.0)
+        return _centre_fit(vol, shp, pad_value=-1000.0)
+
+    def volume_fine(self, idx: int = 0) -> torch.Tensor:
+        """(1,1,Ds,Hs,Ws) mu volume of patient `idx` on the NATIVE SIMULATION grid.
+
+        This is the object that gets forward-projected to make y (see `simulate`); the coarse
+        `volume(idx)` remains the reconstruction target and the metric's ground truth. Not
+        disk-cached on purpose -- see the simulation-grid note in `__init__` -- but the last
+        volume is kept in RAM, which is what makes a first visit to a patient (y under motion
+        AND the static anchor's y0) cost one resample instead of two."""
+        key = int(idx) % len(self.records)
+        if self._fine_cache is not None and self._fine_cache[0] == key:
+            hu = self._fine_cache[1]
+        else:
+            hu = self._load_hu(self.records[key], voxel_mm=self.sim_voxel_mm,
+                               shape_dhw=self.sim_shape_dhw)
+            if self.clip:                                  # idempotent, so do it once per load
+                np.clip(hu, self.hu_lo, self.hu_hi, out=hu)
+            self._fine_cache = (key, hu)
+        # HU -> mu ON THE GPU: at 612^3 the same arithmetic on the host costs ~0.5 s per draw.
+        v = torch.from_numpy(hu)[None, None].to(self.device, non_blocking=True)
+        return (v / 1000.0 + 1.0) * self.mu_water
+
+    @torch.no_grad()
+    def simulate(self, idx: int, Pmat: torch.Tensor, **kw) -> torch.Tensor:
+        """THE measurement operator of this project: y = A(patient `idx`; Pmat), simulated on the
+        native grid. (B,V,3,4) or (V,3,4) -> (B,V,nv,nu).
+
+        Every y in training, validation and inference comes from here, so the simulation grid can
+        never drift between them. `sim_native=False` degrades it to the old inverse-crime path
+        (project the coarse volume) -- kept ONLY as a gate/ablation switch.
+
+        No autograd: y is data. The estimator differentiates its OWN forward model of y on the
+        coarse grid, which is the point of the split (see the `__init__` note)."""
+        P = Pmat if Pmat.dim() == 4 else Pmat[None]
+        if not self.sim_native:
+            return self.project(self.volume(idx), P, **kw)
+        vol = self.volume_fine(idx)
+        y = forward_project_3d_batched(
+            vol, P, self.u_coords, self.v_coords,
+            dx=self.sim_voxel_mm, dy=self.sim_voxel_mm, dz=self.sim_voxel_mm, **kw)
+        del vol
+        return y
 
     # -- net <-> mu ---------------------------------------------------------------------
     def to_net(self, mu):
@@ -295,9 +411,16 @@ class CQ500Generator:
     def project(self, vols: torch.Tensor, Pmat: torch.Tensor, **kw) -> torch.Tensor:
         return forward_project_3d_batched(
             vols, Pmat, self.u_coords, self.v_coords,
-            dx=self.dx, dy=self.dy, dz=self.dz,
-            n_samples=kw.pop("n_samples", self.n_samples_fwd),
-            view_chunk=kw.pop("view_chunk", 4), row_chunk=kw.pop("row_chunk", 64), **kw)
+            dx=self.dx, dy=self.dy, dz=self.dz, **kw)
+
+    def adjoint(self, sino: torch.Tensor, Pmat: torch.Tensor, **kw) -> torch.Tensor:
+        """A^T sino -- LEAP's backprojection, NOT the exact transpose of `project`
+        (`leap_projector.ADJOINT_MODE`). (B,V,nv,nu) -> (B,1,D,H,W)."""
+        D, H, W = self.shape_dhw
+        return adjoint_project_3d_batched(
+            sino, Pmat, self.u_coords, self.v_coords,
+            D=D, H=H, W=W, dx=self.dx, dy=self.dy, dz=self.dz, **kw)
+
 
     def fdk(self, sino: torch.Tensor, Pmat: torch.Tensor, *, scale=None,
             angle_weight: bool | None = None, **kw) -> torch.Tensor:
@@ -310,7 +433,7 @@ class CQ500Generator:
         return fdk_conebeam_3d_batched(
             sino, Pmat, self.u_coords, self.v_coords, self.cfg,
             D=D, H=H, W=W, dx=self.dx, dy=self.dy, dz=self.dz,
-            scale=self.fbp_scale if scale is None else scale,
+            scale=scale,
             view_chunk=kw.pop("view_chunk", 8), view_weight=vw, **kw)
 
     def fdk_tangent(self, sino: torch.Tensor, Pmat: torch.Tensor, Pdot: torch.Tensor, *,
@@ -328,21 +451,9 @@ class CQ500Generator:
         return fdk_conebeam_3d_tangent(
             sino, Pmat, Pdot, self.u_coords, self.v_coords, self.cfg,
             D=D, H=H, W=W, dx=self.dx, dy=self.dy, dz=self.dz,
-            scale=self.fbp_scale if scale is None else scale,
+            scale=scale,
             view_weight=vw, view_weight_dot=vwd, **kw)
 
-    def _calibrate(self) -> float:
-        from .geometry_3d import measured_region_mask
-        v = self.volume(0)
-        with torch.no_grad():
-            y = self.project(v, self.P_nom[None])
-            raw = fdk_conebeam_3d_batched(
-                y, self.P_nom[None], self.u_coords, self.v_coords, self.cfg,
-                D=self.shape_dhw[0], H=self.shape_dhw[1], W=self.shape_dhw[2],
-                dx=self.dx, dy=self.dy, dz=self.dz, scale=1.0, view_chunk=8)[0]
-        m = measured_region_mask(self.shape_dhw, (self.dz, self.dy, self.dx), self.cfg,
-                                 device=self.device)
-        return calibrate_scale(raw, v[0, 0], m)
 
     def sample_volumes(self, batch: int = 1, generator=None) -> torch.Tensor:
         idx = torch.randint(len(self.records), (batch,), generator=generator)
@@ -362,24 +473,30 @@ class CQ500Generator:
         key = int(idx) % len(self.records)
         a = self._anchor_cache.get(key)
         if a is None:
-            vol = self.volume(key)
-            y0 = self.project(vol, self.P_nom[None])
+            y0 = self.simulate(key, self.P_nom[None])
             a = self.to_net(self.fdk(y0, self.P_nom[None])[0]).cpu()
             self._anchor_cache[key] = a
         return a.to(self.device)
 
-    def sample_motion(self, batch: int = 1, *, trans_mm: float = 5.0, rot_deg: float = 5.0,
-                      generator=None):
+    def sample_motion(self, batch: int = 1, *, trans_mm: float = 10.0, rot_deg: float = 10.0,
+                      amp_mode: str = "fixed", generator=None):
         """-> (y (B,V,nv,nu), theta (B,V,6), vols (B,1,D,H,W)). Defaults are the literature's
-        evaluation amplitudes (Thies: 5 mm / 5 deg; JRM-ADM: +-5 mm / +-5 deg)."""
-        vols = self.sample_volumes(batch, generator=generator)
+        evaluation amplitudes, PEAK-TO-PEAK (Thies evaluates at 5/5; we run 10/10, i.e. 2x -- see
+        the rigid_motion module header).
+
+        `amp_mode="thies"` switches to the paper's TRAINING amplitude protocol, where those
+        numbers become per-DoF maxima -- see `rigid_motion.akima_motion`."""
+        idx = torch.randint(len(self.records), (batch,), generator=generator)
+        vols = torch.cat([self.volume(int(i)) for i in idx], 0)
         th = torch.stack([
             random_motion(self.cfg.n_views, trans_mm=trans_mm, rot_deg=rot_deg,
-                          device=self.device, generator=generator)
+                          amp_mode=amp_mode, device=self.device, generator=generator)
             for _ in range(batch)], 0)
         P = torch.stack([params_to_Pmot(th[b], self.P_nom) for b in range(batch)], 0)
+        # y comes from the NATIVE grid, one patient at a time (the fine volumes are ~900 MB each,
+        # so they are never batched); the returned `vols` stay on the coarse inversion grid.
         with torch.no_grad():
-            y = self.project(vols, P)
+            y = torch.cat([self.simulate(int(idx[b]), P[b:b + 1]) for b in range(batch)], 0)
         return y, th, vols
 
 

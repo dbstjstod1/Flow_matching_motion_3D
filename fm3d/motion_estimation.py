@@ -25,10 +25,13 @@ independent rigid pose on every view:
     net      MotionNet6DoF, the AI_Geocal architecture, with the 2D project's BAND-LIMITED hash
              settings ("hashbl"). This is the deployed default there.
 
-NOTE ON THE PROJECTOR BACKEND. Motion estimation needs d(loss)/dP. The Triton ray-march now
-carries that adjoint (it used to drop it, which autograd reads as a silent ZERO), so this runs on
-the fast kernel: 4.3x faster and 16x less memory than grid_sample, with an identical gradient
-(cos = 1.000000). See scripts/gate_triton_adjoint.py.
+NOTE ON THE PROJECTOR. Motion estimation needs d(loss)/dP. The forward is LEAP's modular-beam
+projector (`projector_3d.forward_project_3d_batched`, no backend switch) and the geometry
+gradient is branch-aware (`leap_projector.GRAD_MODE = "auto"`): the exact gradient of LEAP's
+own Joseph kernel when that branch runs, the continuous-corner SF surrogate on the SF branch
+(the exact SF-model gradient rides a lattice ripple -- `triton_leap_grad`'s docstring has the
+measurements). Gated by `scripts/gate_leap_projector.py` (FD of the LEAP loss itself, in both
+kernel regimes) and `gate_geometry` G4a.
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .filters import ramp_filter
+from .filters import DEFAULT_RAMP_WINDOW, ramp_filter
 from .motion_net import MotionNet6DoF
 from .projector_3d import forward_project_3d_batched
 from .rigid_motion import params_to_Pmot
@@ -103,8 +106,12 @@ def sinogram_data_loss(pred: torch.Tensor, y: torch.Tensor, kind: str = "l2si", 
         return 1.0 - (p * t).sum() / (p.norm() * t.norm()).clamp_min(1e-12)
     if kind == "ramp":
         V, nv, nu = pred.shape
-        fp = ramp_filter(pred.reshape(V * nv, nu), du, window="hann").reshape(V, nv, nu)
-        fy = ramp_filter(y.reshape(V * nv, nu), du, window="hann").reshape(V, nv, nu)
+        # same window the FDK uses (filters.DEFAULT_RAMP_WINDOW), so the band this loss weights
+        # is the band the reconstruction actually keeps -- one source of truth, no drift.
+        fp = ramp_filter(pred.reshape(V * nv, nu), du,
+                         window=DEFAULT_RAMP_WINDOW).reshape(V, nv, nu)
+        fy = ramp_filter(y.reshape(V * nv, nu), du,
+                         window=DEFAULT_RAMP_WINDOW).reshape(V, nv, nu)
         return ((fp - fy) ** 2).mean()
     if kind == "l1":
         return (pred - y).abs().mean()
@@ -146,14 +153,14 @@ def bspline_basis(V: int, n_ctrl: int, device, degree: int = 3) -> torch.Tensor:
 
 class _BaseEstimator:
     def __init__(self, cfg, P_nom, u_coords, v_coords, device, *, dx=1.0, dy=1.0, dz=1.0,
-                 loss="l2si", lncc_win=9, n_samples=384, view_chunk=8, row_chunk=64,
-                 smooth_w=1e-2, views_per_iter: int | None = None):
+                 loss="l2si", lncc_win=9,
+                 smooth_w=1e-2, views_per_iter: int | None = None, opt="adam",
+                 decay: float = 1.0, decay_reset: str = "call", view_seed: int | None = 0):
         self.cfg, self.P_nom = cfg, P_nom
         self.u, self.v = u_coords, v_coords
         self.device = device
         self.dx, self.dy, self.dz = dx, dy, dz
         self.loss_kind, self.lncc_win = loss, lncc_win
-        self.n_samples, self.view_chunk, self.row_chunk = n_samples, view_chunk, row_chunk
         self.smooth_w = smooth_w
         # Stochastic view subsampling. A cone-beam view is nv*nu rays -- ~200x a fan-beam view --
         # so unlike the 2D project we cannot afford every view on every inner iteration. None =
@@ -161,6 +168,33 @@ class _BaseEstimator:
         # estimate of the same gradient, and what makes PER~10 inner iters affordable).
         self.views_per_iter = views_per_iter
         self.V = cfg.n_views
+        # (`n_samples` / `view_chunk` / `row_chunk` / `fp16_vol` / `backend` all lived here and
+        # were all ray-march knobs. The operator is LEAP's now -- it has no ray samples, does
+        # its own chunking, and there is nothing to select. Removed 2026-07-29. The forward
+        # VALUE is LEAP's; the d/dP this class optimizes through is branch-aware, wired in
+        # `leap_projector.LEAPProject` (GRAD_MODE ledger there).)
+        # OPTIMIZER. "adam" is ours; "gd" is Thies' (plain gradient descent, step size s0 with an
+        # exponential decay t per iteration, TMI 2025 II-C). Subclasses build the optimizer, so
+        # they read these.
+        self.opt_kind, self.decay, self.decay_reset = opt, decay, decay_reset
+        self._it = 0                       # iterations since the last decay reset
+        # REPRODUCIBILITY. The random view subset used to be drawn from the global CUDA RNG, which
+        # made two identically-configured runs diverge (measured: rot traces differing 15-20%
+        # relative, e.g. 2.33/0.47/0.36/0.29 vs 2.47/0.55/0.42/0.34 at steps 0/5/10/15). That is
+        # larger than several of the differences this project ranks configs by. A dedicated seeded
+        # generator makes the view schedule identical across runs; what remains is the
+        # atomic-add ordering in the gradient kernel's backward, which is far smaller.
+        self._vgen = None
+        if view_seed is not None:
+            self._vgen = torch.Generator(device=device)
+            self._vgen.manual_seed(int(view_seed))
+
+    def _make_opt(self, params, lr):
+        if self.opt_kind == "gd":
+            return torch.optim.SGD(params, lr=lr)
+        if self.opt_kind == "adam":
+            return torch.optim.Adam(params, lr=lr)
+        raise ValueError(f"unknown optimizer '{self.opt_kind}' (adam | gd)")
 
     # -- subclasses provide these ------------------------------------------------------
     def _theta(self) -> torch.Tensor:               # (V, 6), differentiable
@@ -179,8 +213,7 @@ class _BaseEstimator:
         P = params_to_Pmot(th, P_nom)
         return forward_project_3d_batched(
             image[None, None], P[None], self.u, self.v,
-            dx=self.dx, dy=self.dy, dz=self.dz, n_samples=self.n_samples,
-            view_chunk=self.view_chunk, row_chunk=self.row_chunk)[0]
+            dx=self.dx, dy=self.dy, dz=self.dz)[0]
 
     def _smooth(self, theta):
         """2nd-difference penalty on the trajectory. Zero for `basis`/`net`, whose smoothness is
@@ -192,15 +225,25 @@ class _BaseEstimator:
 
     def refine_global(self, image, y_meas, iters=30, *, prox_anchor=None, prox_lam=0.0) -> float:
         opt = self._opt()
-        last = float("nan")
+        last = None
+        # Thies restarts his optimization (and therefore his step-size decay) from scratch; ours
+        # warm-starts down the ODE. `decay_reset="call"` reproduces his within each refine_global,
+        # "global" lets the step size keep shrinking across the whole run.
+        if self.decay != 1.0 and self.decay_reset == "call":
+            self._it = 0
         for _ in range(iters):
+            if self.decay != 1.0:
+                for g in opt.param_groups:
+                    g["lr"] = self.lr0 * (self.decay ** self._it)
+                self._it += 1
             opt.zero_grad(set_to_none=True)
             theta = self._theta()
             if self.views_per_iter is None or self.views_per_iter >= self.V:
                 views = None
                 pred, tgt = self._project(image, theta), y_meas
             else:
-                views = torch.randperm(self.V, device=self.device)[:self.views_per_iter]
+                views = torch.randperm(self.V, device=self.device, generator=self._vgen)[
+                    :self.views_per_iter]
                 pred, tgt = self._project(image, theta, views), y_meas[views]
             loss = sinogram_data_loss(pred, tgt, self.loss_kind,
                                       lncc_win=self.lncc_win, du=self.cfg.du)
@@ -209,8 +252,10 @@ class _BaseEstimator:
                 loss = loss + prox_lam * ((theta - prox_anchor) ** 2).mean()
             loss.backward()
             opt.step()
-            last = float(loss.detach())
-        return last
+            # keep the scalar ON DEVICE: float() here forces a host sync EVERY iteration
+            # (~1 ms x PER=400 x 50 steps); only the final value is ever read.
+            last = loss.detach()
+        return float(last) if last is not None else float("nan")
 
     @torch.no_grad()
     def current_params(self) -> torch.Tensor:
@@ -227,7 +272,8 @@ class DirectMotionEstimator(_BaseEstimator):
     def __init__(self, *a, lr=0.3, **kw):
         super().__init__(*a, **kw)
         self.params = torch.zeros(self.V, 6, device=self.device, requires_grad=True)
-        self._optim = torch.optim.Adam([self.params], lr=lr)
+        self.lr0 = lr
+        self._optim = self._make_opt([self.params], lr)
 
     def _theta(self):
         return self.params
@@ -240,7 +286,8 @@ class BasisMotionEstimator(_BaseEstimator):
         super().__init__(*a, **kw)
         self.B = bspline_basis(self.V, n_ctrl, self.device)          # (V, n_ctrl)
         self.c = torch.zeros(n_ctrl, 6, device=self.device, requires_grad=True)
-        self._optim = torch.optim.Adam([self.c], lr=lr)
+        self.lr0 = lr
+        self._optim = self._make_opt([self.c], lr)
         self.smooth_w = 0.0            # the basis IS the smoothness prior; do not charge twice
 
     def _theta(self):
@@ -257,7 +304,8 @@ class NetMotionEstimator(_BaseEstimator):
             self.V, enc=enc, n_levels=n_levels, base_resolution=base_resolution,
             per_level_scale=per_level_scale, fourier_m=fourier_m,
             trans_max_mm=trans_max_mm, rot_max_deg=rot_max_deg).to(self.device)
-        self._optim = torch.optim.Adam(self.net.parameters(), lr=lr)
+        self.lr0 = lr
+        self._optim = self._make_opt(self.net.parameters(), lr)
         self.smooth_w = 0.0            # bandwidth is structural; see motion_net.py
 
     def _theta(self):

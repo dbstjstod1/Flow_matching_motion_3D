@@ -69,10 +69,7 @@ class Gen:
         self.mu_lo, self.mu_hi = 0.0, (2000 / 1000 + 1) * 0.02
         self.vol = head_phantom(self.shape, (self.dz, self.dy, self.dx), device=dev)[None, None]
         self.meas = measured_region_mask(self.shape, (self.dz,) * 3, self.cfg, device=dev)
-        self.fbp_scale = 1.0
-        y0 = self.project(self.vol, self.P_nom[None])
-        self.fbp_scale = calibrate_scale(self.fdk(y0, self.P_nom[None])[0], self.vol[0, 0],
-                                         self.meas)
+        # no fitted scale: the FDK self-normalizes (projector_3d._fdk_physical_norm)
 
     def to_net(self, mu):
         return 2.0 * (mu - self.mu_lo) / (self.mu_hi - self.mu_lo) - 1.0
@@ -85,24 +82,24 @@ class Gen:
         vw, vwd = view_angular_weights_dot(P, Pdot)
         return fdk_conebeam_3d_tangent(
             y, P, Pdot, self.uc, self.vc, self.cfg, D=self.shape[0], H=self.shape[1],
-            W=self.shape[2], dx=self.dx, dy=self.dy, dz=self.dz, scale=self.fbp_scale,
+            W=self.shape[2], dx=self.dx, dy=self.dy, dz=self.dz, scale=None,
             view_chunk=8, view_weight=vw, view_weight_dot=vwd)
 
     def project(self, v, P):
         return forward_project_3d_batched(v, P, self.uc, self.vc, dx=self.dx, dy=self.dy,
-                                          dz=self.dz, n_samples=384, view_chunk=8)
+                                          dz=self.dz)
 
-    def fdk(self, y, P):
+    def fdk(self, y, P, **kw):
         return fdk_conebeam_3d_batched(y, P, self.uc, self.vc, self.cfg, D=self.shape[0],
                                        H=self.shape[1], W=self.shape[2], dx=self.dx, dy=self.dy,
-                                       dz=self.dz, scale=self.fbp_scale, view_chunk=8,
-                                       view_weight=view_angular_weights(P))
+                                       dz=self.dz, scale=None, view_chunk=8,
+                                       view_weight=view_angular_weights(P), **kw)
 
 
 def main():
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     g = Gen(dev)
-    th = akima_motion(g.V, n_nodes=10, trans_mm=5.0, rot_deg=5.0, device=dev, seed=0)
+    th = akima_motion(g.V, n_nodes=10, trans_mm=10.0, rot_deg=10.0, device=dev, seed=0)
 
     with torch.no_grad():
         y = g.project(g.vol, params_to_Pmot(th, g.P_nom)[None])       # the motion-corrupted scan
@@ -162,22 +159,32 @@ def main():
     check(3, "... and the fd-mode velocity IS the FD of the anchored path", rel < 1e-3,
           f"rel {rel:.1e} at h={h}")
 
-    # The ANALYTIC velocity (the default the trainer uses) must NOT match FD(0.02) to 1e-3 --
-    # the bilinear interpolant is C0, so the coarse FD carries O(h) kink error at cell-crossing
-    # voxels: measured ~1.8e-2 rel rms (scripts/gate_fdk_tangent.py T3b/T5; its full-scale T6
-    # gates the same comparison at 5e-2). So consistency, at the tolerance the FD deserves, and
-    # in the SAME metric those numbers are quoted in: rms normalized by max|ref| (a tangent
-    # field is edge-concentrated, max/rms ~ 14 here, so an rms/rms ratio reads ~14x larger --
-    # measured 1.1e-2 vs 1.6e-1 on this very phantom). A semantic error (wrong dP, dropped
-    # weight derivative) shows at O(1e-1..1) here and still fails loudly. Delta is common to
-    # both velocities and cancels in the numerator.
-    d = d_anc - d_fd
-    rel = float(d.pow(2).mean().sqrt() / d_fd.abs().amax().clamp_min(1e-30))
-    cosv = float((d_anc * d_fd).sum() / (d_anc.norm() * d_fd.norm()))
-    check(3, "... and the ANALYTIC velocity is FD-consistent (kink-limited)",
-          rel < 5e-2 and cosv > 0.98,
-          f"rel rms/max {rel:.1e} vs fd(h={h}), cos {cosv:.4f} -- "
-          f"exact-vs-FD floor is ~1.8e-2, not 0")
+    # The ANALYTIC velocity (the default the trainer uses) cannot be checked against a FD at
+    # ONE step size: the bilinear interpolant is C0, so a central difference converges only at
+    # O(h) across cell-crossing voxels, and the size of that floor depends on how kinky the
+    # sinogram is -- i.e. ON THE FORWARD OPERATOR. Fixing a threshold at h=0.02 therefore
+    # measured the operator, not the tangent: the ray-march era read cos 0.9875 and SF reads
+    # 0.9734 at the same h, with NOTHING wrong in either (user's diagnosis, 2026-07-28).
+    #
+    # So assert the property that actually defines "exact derivative": CONVERGENCE. Measured
+    # h-sweep on SF (scratchpad hsweep, 2026-07-28) -- cos 0.863 / 0.944 / 0.973 / 0.987 /
+    # 0.993 / 0.997 and rel 4.7e-2 -> 6.3e-3 as h goes 0.08 -> 0.0025, textbook O(h). A WRONG
+    # analytic tangent (wrong dP, dropped weight derivative) plateaus instead, which is what
+    # this now catches -- and it catches it independently of which projector is installed.
+    hs = (0.04, 0.01)
+    rels, coss = [], []
+    for hh in hs:
+        with torch.no_grad():
+            xa2, _ = bridge_pair(g, T(0.5 - hh), y, th, dlt)
+            xb2, _ = bridge_pair(g, T(0.5 + hh), y, th, dlt)
+        fd2 = (xb2 - xa2) / (2 * hh)
+        rels.append(float((d_anc - fd2).pow(2).mean().sqrt() / fd2.abs().amax().clamp_min(1e-30)))
+        coss.append(float((d_anc * fd2).sum() / (d_anc.norm() * fd2.norm())))
+    ratio = rels[0] / max(rels[1], 1e-30)                 # 4x smaller h should ~halve O(h) error
+    check(3, "... and the ANALYTIC velocity is the EXACT derivative (FD converges to it)",
+          ratio > 1.5 and coss[1] > coss[0] and rels[1] < 3e-2,
+          f"rel {rels[0]:.2e}(h={hs[0]}) -> {rels[1]:.2e}(h={hs[1]}), x{ratio:.1f} smaller; "
+          f"cos {coss[0]:.4f} -> {coss[1]:.4f}")
 
     # ---- [4] anchor=none restores the bare bridge bit-for-bit ---------------------------
     with torch.no_grad():
@@ -217,9 +224,24 @@ def main():
     # over 144 mm of z, so its cone artefact is mild. On a real CQ500 head over 256 mm the gap is
     # +9.9 dB (midplane 44.26 vs whole-volume 34.34), and quadrupling the views buys 0.1 dB --
     # i.e. it is the cone, not angular sampling. The gate only has to see the SIGN.
-    check(5, "... and that floor is a CONE effect (midplane is better)", p_mid - p_st > 0.5,
-          f"midplane-only {p_mid:.2f} dB  vs  whole volume {p_st:.2f} dB "
-          f"(+{p_mid - p_st:.2f}; on a real head this gap is +9.9)")
+    # MEASURE THIS SUB-CHECK WITH AN UNAPODIZED RAMP. It is an ATTRIBUTION claim -- "the
+    # static-vs-GT deficit is the cone" -- and since 2026-07-29 the pipeline's FDK apodizes
+    # (filters.DEFAULT_RAMP_WINDOW, see projector_3d._RAMP_WINDOW_NOTE) to band-limit the SF
+    # cube basis. That
+    # apodization is a SECOND, deliberate contributor to the deficit, and it is spatially uniform,
+    # so it swamps the midplane's cone advantage and the comparison stops measuring the cone
+    # (measured: the gap flips from +2.13 dB under ramlak to -0.41 dB under hann). Isolating the
+    # cone therefore requires the sharp filter, even though the pipeline no longer uses it.
+    with torch.no_grad():
+        st_sharp = g.to_net(g.fdk(g.project(g.vol, g.P_nom[None]), g.P_nom[None],
+                                  window="ramlak")[0])
+    e_all_s, e_mid_s = (st_sharp - b)[g.meas], (st_sharp - b)[mid]
+    p_st_s = float(20 * np.log10(rng / (e_all_s.pow(2).mean().sqrt().item() + 1e-12)))
+    p_mid_s = float(20 * np.log10(rng / (e_mid_s.pow(2).mean().sqrt().item() + 1e-12)))
+    check(5, "... and that floor is a CONE effect (midplane is better, ramlak)",
+          p_mid_s - p_st_s > 0.5,
+          f"midplane-only {p_mid_s:.2f} dB  vs  whole volume {p_st_s:.2f} dB "
+          f"({p_mid_s - p_st_s:+.2f}; on a real head this gap is +9.9)")
     check(5, "the GT anchor reaches the GT", psnr(x1g) > 100.0, f"{psnr(x1g):.0f} dB")
 
     n = len(FAIL)

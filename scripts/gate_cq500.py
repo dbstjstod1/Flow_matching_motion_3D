@@ -229,8 +229,18 @@ def main():
         psnr = 20 * np.log10(rng / float(err.pow(2).mean().sqrt()) + 1e-12)
         check(6, "project -> FDK reconstructs the phantom (in the measured region)",
               torch.isfinite(rec).all() and psnr > 20.0, f"{psnr:.1f} dB (90 views)")
-        check(6, "fbp_scale calibrated finite", np.isfinite(gen.fbp_scale) and gen.fbp_scale > 0,
-              f"{gen.fbp_scale:.5g}")
+        # The FDK is self-normalized by SOD*SDD/2, so a least-squares fit of FDK(A(v)) against
+        # v must land at 1.0 -- that is the whole claim, and it is what a units/pitch/voxel bug
+        # would break. `calibrate_scale` is a DIAGNOSTIC here, never a correction.
+        from fm3d.filters import calibrate_scale
+        from fm3d.geometry_3d import measured_region_mask
+        _v = gen.volume(0)
+        with torch.no_grad():
+            _rec = gen.fdk(gen.project(_v, gen.P_nom[None]), gen.P_nom[None])[0]
+        _m = measured_region_mask(gen.shape, (gen.dz, gen.dy, gen.dx), gen.cfg, device=_v.device)
+        _k = calibrate_scale(_rec, _v[0, 0], _m)
+        check(6, "FDK self-normalized (residual fit ~ 1.0)", abs(_k - 1.0) < 0.05,
+              f"calibrate_scale = {_k:.4f} (1.0 = absolute mu with no fitting)")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

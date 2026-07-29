@@ -71,8 +71,8 @@ def main():
     ap.add_argument("--views", type=int, default=360)
     ap.add_argument("--motion_kind", default="akima")     # the literature's model (Thies et al.)
     ap.add_argument("--anchor", default="static", choices=["static", "gt", "none"])
-    ap.add_argument("--trans_mm", type=float, default=5.0)     # Thies / JRM-ADM eval amplitude
-    ap.add_argument("--rot_deg", type=float, default=5.0)
+    ap.add_argument("--trans_mm", type=float, default=10.0)    # PEAK-TO-PEAK (Thies evals at 5)
+    ap.add_argument("--rot_deg", type=float, default=10.0)     # PEAK-TO-PEAK
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -84,7 +84,7 @@ def main():
     print(f"geometry: SOD {cfg.SOD} SDD {cfg.SDD} | {cfg.nu}x{cfg.nv} @ {cfg.du} mm | "
           f"{cfg.n_views} views | FOV {cfg.fov_diameter_mm():.0f} mm, "
           f"axial {cfg.axial_coverage_mm():.0f} mm")
-    print(f"grid {gen.shape} @ 1 mm | fdk_scale {gen.fbp_scale:.5g}", flush=True)
+    print(f"grid {gen.shape} @ 1 mm | self-normalized FDK", flush=True)
 
     meas = measured_region_mask(gen.shape, (gen.dz, gen.dy, gen.dx), cfg, device=dev)
 

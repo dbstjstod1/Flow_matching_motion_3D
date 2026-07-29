@@ -126,7 +126,8 @@ def ssim(a: torch.Tensor, b: torch.Tensor, *, data_range: float, win: int = 7,
 
 def aligned_metrics(recon: torch.Tensor, gt: torch.Tensor, spacing, *,
                     mask: torch.Tensor | None = None, iters: int = 300,
-                    init: torch.Tensor | None = None, return_theta: bool = False):
+                    init: torch.Tensor | None = None, return_theta: bool = False,
+                    return_aligned: bool = False):
     """THE headline metric. Rigidly align `recon` to `gt`, then score. See the module docstring.
 
     Both the raw and the aligned numbers are returned, deliberately: the gap between them IS the
@@ -136,6 +137,13 @@ def aligned_metrics(recon: torch.Tensor, gt: torch.Tensor, spacing, *,
     `init` warm-starts the alignment (see `rigid_align`); `return_theta=True` additionally
     returns the fitted gauge theta, so a caller evaluating a slowly-moving reconstruction can
     chain the warm starts.
+
+    `return_aligned=True` also hands back the RESAMPLED volume that was scored. Anything that
+    DISPLAYS a reconstruction next to the GT must use it: the gauge is a real 3D pose offset
+    (a few mm and a couple of degrees is typical here), so at 1 mm voxels the recon's z = D//2
+    slice is several slices -- and a rotation -- away from the GT's z = D//2. Showing the raw
+    volume next to the GT compares DIFFERENT ANATOMICAL PLANES while the title quotes an aligned
+    metric. Returning it is free; the alignment was computed either way.
     """
     peak = float(gt[mask].max()) if mask is not None else float(gt.max())
     dr = peak
@@ -148,6 +156,10 @@ def aligned_metrics(recon: torch.Tensor, gt: torch.Tensor, spacing, *,
     out["ssim_aligned"] = ssim(al, gt, data_range=dr, mask=mask)
     out["gauge_shift_mm"] = float(th[:3].norm())
     out["gauge_rot_deg"] = float(torch.rad2deg(th[3:].norm()))
+    if return_theta and return_aligned:
+        return out, th, al
+    if return_aligned:
+        return out, al
     if return_theta:
         return out, th
     return out

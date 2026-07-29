@@ -44,7 +44,8 @@ from fm3d.dataset_cq500 import CQ500Generator
 from fm3d.dataset_slab import AAPMSlabGenerator
 from fm3d.geometry_3d import ConeBeam3DConfig, measured_region_mask
 from fm3d.prior_patch import make_tile_inputs, volume_context
-from fm3d.rigid_motion import bridge_P_and_dP, params_to_Pmot, random_motion
+from fm3d.rigid_motion import (AMP_UNITS, bridge_P_and_dP, params_to_Pmot,
+                               random_motion)
 from fm3d.unet_3d import UNet3D
 from val_fm3d import run_validation
 
@@ -171,8 +172,39 @@ def main():
     ap.add_argument("--no-amp", dest="amp", action="store_false")
     ap.add_argument("--amp_dtype", default="float16", choices=["float16", "bfloat16"],
                     help="float16 matches the 2D sibling; bfloat16 is safer but not what it used")
-    ap.add_argument("--trans_mm", type=float, default=5.0)
-    ap.add_argument("--rot_deg", type=float, default=5.0)   # the literature's amplitude
+    # ALL AMPLITUDES IN THIS FILE ARE PEAK-TO-PEAK (see fm3d/rigid_motion's module header):
+    # the spline nodes are drawn from uniform(-amp/2, +amp/2), which is Thies' own convention.
+    #
+    # THE EVALUATION amplitude -- fed to `run_validation` only, so the val curve stays comparable
+    # to our own history. Thies IV evaluates at 5 / 5; WE DELIBERATELY EVALUATE AT 10 / 10, i.e.
+    # 2x his amplitude (uncompensated median RPE 6.10 mm against his 3.05), because every result
+    # we have is on that harder point and we keep it as evidence the method holds there.
+    ap.add_argument("--trans_mm", type=float, default=10.0,
+                    help="EVALUATION translation amplitude, peak-to-peak [mm]")
+    ap.add_argument("--rot_deg", type=float, default=10.0,
+                    help="EVALUATION rotation amplitude, peak-to-peak [deg]")
+
+    # THE TRAINING amplitude protocol -- Thies II-B: "10 nodes per spline ... with a maximal
+    # amplitude of 10 mm for translation and 15 deg for rotation ... we include motion patterns
+    # with unequal amplitude across the different motion parameters". In "thies" mode the numbers
+    # below are per-DoF MAXIMA, not the amplitude every DoF gets: a_d = A_d * u_d, u_d ~ U(0,1).
+    #
+    # The defaults 15 / 20 reproduce his train/eval RELATIONSHIP at OUR (2x harder) eval point
+    # rather than copying his absolute 10 / 15: P(a_dof >= eval amplitude) comes out 0.33 / 0.50
+    # against his own 0.29 / 0.42. Copying 10 / 15 literally would drop translation coverage to
+    # 0.035 -- training BELOW the test point, because a_d = A_d*u_d halves the mean.
+    ap.add_argument("--motion_amp", default="thies", choices=["fixed", "thies"],
+                    help="how training motion amplitudes are drawn. thies (DEFAULT) = per-DoF "
+                         "u~U(0,1) fraction of the --train_* maxima; this is what the paper "
+                         "trains on and it is the only way the prior ever sees the ANISOTROPIC "
+                         "residual our posterior loop actually lives in (~92%% of it sits in the "
+                         "unobservable beam-axis translation, so five DoFs are nearly right and "
+                         "one is badly wrong). fixed = every DoF at --trans_mm/--rot_deg.")
+    ap.add_argument("--train_trans_mm", type=float, default=15.0,
+                    help="max TRAINING translation, peak-to-peak [mm]. motion_amp=thies only")
+    ap.add_argument("--train_rot_deg", type=float, default=20.0,
+                    help="max TRAINING rotation, peak-to-peak [deg]. motion_amp=thies only")
+
     ap.add_argument("--anchor", default="static", choices=["static", "gt", "none"],
                     help="what the bridge's t=1 endpoint IS. static (DEFAULT) = the MOTION-FREE "
                          "FDK -- the same reconstruction operator, the same scan, no motion. It "
@@ -182,6 +214,15 @@ def main():
                          "prior would learn FDK's residual MOTION artefact as its target. "
                          "gt = the volume itself (also removes FDK's cone-beam floor, but asks "
                          "the net to invert the operator's own defect). none = the bare bridge.")
+    ap.add_argument("--sim_grid", default="native", choices=["native", "coarse"],
+                    help="WHICH GRID THE MEASUREMENT y IS SIMULATED ON (cq500 only). native "
+                         "(DEFAULT) = the geometry's own voxel size du*SOD/SDD, LEAP's convention: "
+                         "the truth is projected at 612^3/0.4187 mm while everything is still "
+                         "INVERTED on the coarse grid, so y no longer carries the reconstruction "
+                         "grid's own aliasing (static-FDK crosshatch 13-16 HU -> 0 HU, and the "
+                         "prior stops being trained to reproduce it). coarse = simulate on the "
+                         "reconstruction grid, i.e. the inverse crime -- pre-2026-07-29 behaviour, "
+                         "kept for ablation. See dataset_cq500's simulation-grid note.")
     ap.add_argument("--tangent", default="analytic", choices=["analytic", "fd"],
                     help="how bridge_pair gets the velocity target dx_t. analytic (DEFAULT) = "
                          "the exact d/ds FDK(y, P(s*theta)) in one fused pass "
@@ -227,15 +268,16 @@ def main():
     if args.dataset == "cq500":
         cfg = ConeBeam3DConfig.thies(n_views=args.views)
         gen = CQ500Generator(args.root, cfg, device=dev, split=args.split,
-                             shape=tuple(args.shape), voxel_mm=1.0)
+                             shape=tuple(args.shape), voxel_mm=1.0,
+                             sim_native=(args.sim_grid == "native"))
         print(f"CQ500 '{args.split}': {gen.n_slabs} patients | grid {gen.shape} @ 1 mm | "
-              f"fdk_scale {gen.fbp_scale:.5g}")
+              f"self-normalized FDK (SOD*SDD/2)")
     else:
         cfg = ConeBeam3DConfig(det_bin=2, n_views=args.views)
         gen = AAPMSlabGenerator(args.data, cfg, device=dev, slab=args.slab,
                                 in_plane=args.in_plane)
         print(f"slabs: {gen.n_slabs} from {len(gen.runs)} runs | grid {gen.shape} @ "
-              f"({gen.dz}, {gen.dy}, {gen.dx}) mm | fdk_scale {gen.fbp_scale:.5g}")
+              f"({gen.dz}, {gen.dy}, {gen.dx}) mm | self-normalized FDK (SOD*SDD/2)")
     print(f"detector {cfg.nv}x{cfg.nu} @ {cfg.du:.3f} mm | FOV {cfg.fov_diameter_mm():.0f} mm | "
           f"{cfg.n_views} views")
 
@@ -310,7 +352,8 @@ def main():
             return tuple(v) if isinstance(v, (list, tuple)) else v
 
         for k in ("base", "patch", "context", "anchor", "shape", "views", "dataset",
-                  "tangent", "trans_mm", "rot_deg"):
+                  "tangent", "trans_mm", "rot_deg", "sim_grid",
+                  "motion_amp", "train_trans_mm", "train_rot_deg"):
             if k in prev and k in vars(args) and _cmp(prev[k]) != _cmp(vars(args)[k]):
                 raise SystemExit(f"--resume mismatch on '{k}': checkpoint has {prev[k]!r}, "
                                  f"this run asks for {vars(args)[k]!r}")
@@ -343,6 +386,17 @@ def main():
     else:
         loss_log_prev = []
 
+    # TRAIN vs EVAL motion amplitudes are deliberately different objects (Thies II-B vs IV).
+    # `mot_*` feeds `draw()`; `args.trans_mm/rot_deg` feed `run_validation` untouched, so the
+    # val curve keeps measuring the 5 mm / 5 deg evaluation protocol whatever training samples.
+    mot_trans = args.train_trans_mm if args.motion_amp == "thies" else args.trans_mm
+    mot_rot = args.train_rot_deg if args.motion_amp == "thies" else args.rot_deg
+    # Print BOTH conventions: ours is the node half-range, Thies quotes peak-to-peak (2x).
+    _mx = "max " if args.motion_amp == "thies" else ""
+    print(f"motion (ALL PEAK-TO-PEAK): train={args.motion_amp} {_mx}{mot_trans:g} mm / "
+          f"{mot_rot:g} deg  |  val=fixed {args.trans_mm:g} mm / {args.rot_deg:g} deg"
+          f"   [Thies: train max 10/15, eval 5/5]")
+
     def draw():
         """One bridge sample, held whole-volume: (x_t (1,1,D,H,W), dx (D,H,W), t, ctx).
 
@@ -362,13 +416,14 @@ def main():
         if args.dataset == "cq500":
             idx = int(torch.randint(gen.n_slabs, (1,)).item())
             vol = gen.volume(idx)
-            th = random_motion(gen.cfg.n_views, trans_mm=args.trans_mm, rot_deg=args.rot_deg,
-                               device=dev, generator=motion_gen)[None]
-            with torch.no_grad():
-                y = gen.project(vol, params_to_Pmot(th[0], gen.P_nom)[None])
+            th = random_motion(gen.cfg.n_views, trans_mm=mot_trans, rot_deg=mot_rot,
+                               amp_mode=args.motion_amp, device=dev, generator=motion_gen)[None]
+            # y is simulated on the NATIVE grid (`gen.simulate`, see the simulation-grid note in
+            # dataset_cq500.__init__); `vol` above is the coarse inversion-grid target/anchor.
+            y = gen.simulate(idx, params_to_Pmot(th[0], gen.P_nom)[None])
         else:
-            y, th, vol = gen.sample_motion(1, trans_mm=args.trans_mm, rot_deg=args.rot_deg,
-                                           generator=motion_gen)
+            y, th, vol = gen.sample_motion(1, trans_mm=mot_trans, rot_deg=mot_rot,
+                                           amp_mode=args.motion_amp, generator=motion_gen)
         dlt = None
         if args.anchor != "none":
             if args.anchor == "gt":
@@ -401,13 +456,9 @@ def main():
     # Standalone `val_fm3d.py` runs the identical `run_validation`; the montages land in out/val.
     val_gen = None
     if args.dataset == "cq500" and args.val_every > 0:
-        # fbp_scale is INJECTED from the train generator: _calibrate() fits it on volume 0 of the
-        # generator's own split, so letting the val generator recalibrate (on val patient 0) would
-        # hand validation a slightly different NET normalization than training saw. Injecting also
-        # skips the calibration projection at startup.
         val_gen = CQ500Generator(args.root, cfg, device=dev, split="val",
                                  shape=tuple(args.shape), voxel_mm=1.0, verbose=False,
-                                 fbp_scale=gen.fbp_scale)
+                                 sim_native=(args.sim_grid == "native"))
     val_dir = os.path.join(args.out, "val")
     os.makedirs(val_dir, exist_ok=True)
     writer = None
@@ -516,7 +567,7 @@ def main():
             # "rng" makes --resume continue the exact sampling streams (older ckpts lack it).
             ck = {"model": model.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
                   "scaler": scaler.state_dict() if args.amp else None,
-                  "iter": it, "args": vars(args), "fbp_scale": gen.fbp_scale,
+                  "iter": it, "args": {**vars(args), "amp_units": AMP_UNITS},
                   "rng": {"torch": torch.get_rng_state(),
                           "cuda": torch.cuda.get_rng_state_all(),
                           "numpy": np.random.get_state(),

@@ -6,17 +6,23 @@ are dimension-free: the ramp filters along the DETECTOR u axis, which in 3D mean
 applied row by row -- `fdk_conebeam_3d_batched` reshapes (V,nv,nu) -> (V*nv, nu) and calls
 straight into `ramp_filter`. Nothing here knows about the cone.
 
-`calibrate_scale` fits ONE least-squares scalar that folds together du, dbeta, pi and
-SDD/SOD. It is an operator constant -- a property of the geometry and the filter, not of the
-image -- so it is calibrated once against a reference reconstruction and then reused for every
-subsequent recon (including the motion-corrupted ones, which must share the intensity scale
-with the clean ones or the flow-matching prior sees a brightness shift that is not physics).
+The FDK is SELF-NORMALIZED: the deterministic geometry constant SOD*SDD (x1/2 for a full-fan
+2pi orbit) is applied inside `fdk_conebeam_3d_batched` (`_fdk_physical_norm`), so it returns
+absolute mu [1/mm] like RTK. `calibrate_scale` remains ONLY as a gate diagnostic, where it must
+fit ~1.0. NOTHING in the pipeline is normalized by a fitted constant (2026-07-28).
 """
 
 from __future__ import annotations
 
 import torch
 
+
+# THE ONE PLACE THE PIPELINE'S RAMP WINDOW IS DECIDED. Everything that ramp-filters -- both FDK
+# entry points in `projector_3d` and the estimator's `ramp` sinogram loss -- takes its default from
+# here, so the choice cannot drift between training and inference. See `ramp_filter`'s docstring
+# for what `shepphann` is (LEAP's default ramp + LEAP's minimum low-pass) and
+# `projector_3d._RAMP_WINDOW_NOTE` for why an apodized default is required by the SF cube basis.
+DEFAULT_RAMP_WINDOW = "shepphann"
 
 _RTK_RAMP_CACHE: dict = {}
 
@@ -58,23 +64,40 @@ def _rtk_ramp_spectrum(N: int, du: float, device, hann_cut: float = 0.0) -> torc
     return spec
 
 
-def ramp_filter(proj: torch.Tensor, du: float, window: str = "hann",
+def ramp_filter(proj: torch.Tensor, du: float, window: str = DEFAULT_RAMP_WINDOW,
                 cutoff: float = 1.0) -> torch.Tensor:
     """Apply a ramp (Ram-Lak) filter along the last axis. proj: (V, nu).
 
     `window` apodizes the ramp; `cutoff` (in [0,1]) is the fraction of the Nyquist
     frequency above which the filter is zeroed.
 
-      ramlak  : |f|, no apodization                -- sharpest, noisiest
-      shepp   : |f| * sinc(f / (2 fc))             -- mild, the usual FBP/FDK default
-      cosine  : |f| * cos(pi f / (2 fc))
-      hann    : |f| * 0.5 (1 + cos(pi f / fc))     -- strongest smoothing
-      rtk     : RTK's ram-lak (see below)          -- what SPARE's FDKRecon was made with
-      rtkhann : RTK's ram-lak * RTK's Hann         -- rtkfdk --hann <cutoff>
+      ramlak    : |f|, no apodization                -- sharpest, noisiest
+      shepp     : |f| * sinc(f / (2 fc))             -- mild; == LEAP's DEFAULT ramp (order 2)
+      cosine    : |f| * cos(pi f / (2 fc))
+      hann      : |f| * 0.5 (1 + cos(pi f / fc))     -- == LEAP's set_FBPlowpass(2.0)
+      shepphann : |f| * sinc(...) * 0.5(1 + cos ...) -- THE DEFAULT, see below
+      rtk       : RTK's ram-lak (see below)          -- what SPARE's FDKRecon was made with
+      rtkhann   : RTK's ram-lak * RTK's Hann         -- rtkfdk --hann <cutoff>
 
-    NOTE: `hann` (the old hard-coded behaviour) costs real resolution -- it halves the
-    ramp at fc/2 and kills everything near Nyquist. Use `shepp` (or `ramlak` on noiseless
-    simulated data) when the reconstruction looks blurred.
+    `shepphann` IS THE PIPELINE DEFAULT and is not an ad-hoc product: it is exactly LEAP's
+    `set_rampFilter(2)` (their default, = our `shepp`) composed with `set_FBPlowpass(2.0)` (their
+    low-pass at the minimum FWHM their docs recommend, = our `hann`). Both equivalences were
+    verified against the installed toolkit by measuring its delta response -- `shepp` vs LEAP
+    order-2 agrees to max 4e-4 over the band, and `hann` vs LEAP's isolated low-pass to **1.3e-5**,
+    i.e. they are the same function (LEAP's FWHM-2-pixel low-pass is the 3-tap binomial
+    [1/4, 1/2, 1/4], whose response is 0.5(1 + cos(2 pi f du)) = our Hann at cutoff 1).
+
+    WHY A DEFAULT WITH APODIZATION AT ALL: see `projector_3d._RAMP_WINDOW_NOTE`. Short version --
+    the SF projector integrates the CUBE voxel basis, which carries real energy above the voxel
+    Nyquist, and our detector RESOLVES it (0.64 mm pitch is 0.4187 mm at isocenter against 1 mm
+    voxels, i.e. 2.39x finer), so an unapodized ramp reconstructs the voxel grid as a crosshatch
+    texture. `shepphann` removes it (13.2 -> 0.0 HU excess sd in homogeneous brain) at the same
+    90% bone-edge sharpness that the retired trilinear-basis operator gave.
+
+    `cutoff` is a HARD zero above `cutoff * f_Nyquist`. Do NOT reach for it to fight the cube-basis
+    texture: cutting at the voxel Nyquist (cutoff 0.419 here) was measured and costs 15 more points
+    of bone-edge sharpness than `shepphann` while removing no more texture -- the texture lives in a
+    narrow near-Nyquist band, not uniformly above it.
 
     `rtk`/`rtkhann` REPRODUCE RTK's FILTER DISCRETIZATION, and the difference from `ramlak`
     is NOT cosmetic. RTK (`rtkFFTRampImageFilter::UpdateFFTConvolutionKernel`) does not
@@ -115,8 +138,12 @@ def ramp_filter(proj: torch.Tensor, du: float, window: str = "hann",
         ramp = ramp * torch.cos(0.5 * torch.pi * r.clamp(max=1.0))
     elif window == "hann":
         ramp = ramp * 0.5 * (1.0 + torch.cos(torch.pi * r.clamp(max=1.0)))
+    elif window == "shepphann":                       # = LEAP ord2 + set_FBPlowpass(2.0)
+        ramp = (ramp * torch.sinc(0.5 * r)
+                * 0.5 * (1.0 + torch.cos(torch.pi * r.clamp(max=1.0))))
     else:
-        raise ValueError(f"unknown ramp window '{window}' (ramlak|shepp|cosine|hann)")
+        raise ValueError(f"unknown ramp window '{window}' "
+                         f"(ramlak|shepp|cosine|hann|shepphann|rtk|rtkhann)")
     ramp = torch.where(r > 1.0, torch.zeros_like(ramp), ramp)
     P = P * ramp[None, :].to(P.dtype)
     out = torch.fft.irfft(P, n=N, dim=-1)[:, :nu]
@@ -124,7 +151,16 @@ def ramp_filter(proj: torch.Tensor, du: float, window: str = "hann",
 
 
 def calibrate_scale(recon_raw: torch.Tensor, reference: torch.Tensor, mask: torch.Tensor | None = None) -> float:
-    """Least-squares scalar so that scale*recon_raw best matches reference."""
+    """Least-squares scalar so that scale*recon_raw best matches reference.
+
+    DIAGNOSTIC ONLY (2026-07-28). This used to produce the pipeline's normalization constant.
+    That is gone: the FDK self-normalizes from the GIVEN geometry
+    (`projector_3d._fdk_physical_norm` = SOD*SDD/2), so there is nothing to fit -- and fitting
+    was harmful, because a scalar regressed on FDK(A(v)) vs v absorbs any operator or level
+    error (units, voxel size, detector pitch, and in the 4DCT sibling's case scatter/bowtie/air
+    constants) and leaves the pipeline self-consistent and wrong. The 4DCT sibling deleted its
+    own copy on 2026-07-21 for exactly this reason. Keep using this in GATES, where the claim is
+    that it comes out 1.0 (gate_cq500 check 6)."""
     r = recon_raw
     ref = reference.to(r.device, r.dtype)
     if mask is not None:

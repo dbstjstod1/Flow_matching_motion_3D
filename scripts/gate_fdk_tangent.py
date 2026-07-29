@@ -107,7 +107,7 @@ def main():
     # ---- small config for the math gates ----------------------------------------------------
     cfg = ConeBeam3DConfig.thies(n_views=30)
     P_nom = build_conebeam_orbit(cfg, device=dev, dtype=torch.float64)
-    theta = random_motion(cfg.n_views, trans_mm=5.0, rot_deg=5.0, device=dev,
+    theta = random_motion(cfg.n_views, trans_mm=10.0, rot_deg=10.0, device=dev,
                           dtype=torch.float64)
     s0 = 0.37
 
@@ -190,7 +190,7 @@ def main():
     cfgF = ConeBeam3DConfig.thies(n_views=360)
     P_nomF = build_conebeam_orbit(cfgF, device=dev)
     uF, vF = detector_coords_3d(cfgF, device=dev)
-    thF = random_motion(cfgF.n_views, trans_mm=5.0, rot_deg=5.0, device=dev)
+    thF = random_motion(cfgF.n_views, trans_mm=10.0, rot_deg=10.0, device=dev)
     sF = smooth_sino(1, cfgF.n_views, cfgF.nv, cfgF.nu, seed=4)
     voxF = dict(D=256, H=256, W=256, dx=1.0, dy=1.0, dz=1.0)
     s_mid = 0.5

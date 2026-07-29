@@ -1,28 +1,39 @@
-"""Differentiable 3D cone-beam ray-marching forward projector + FDK (prompt 6).
+"""The FDK, and the two entry points that route the projector pair to LEAP.
 
-Torch-native 3D extension of `forward_projector_2d.py` / `recon_2d.py` (the
-allowed alternative to LEAP: same math, one codebase, and it shares the exact
-pixel-center / align_corners=False conventions with warp.py, which is what
-makes the MC-FBP "phi=Id == static FDK" identity hold to float precision).
+THE PROJECTOR PAIR IS LEAP'S (user decision 2026-07-29). `forward_project_3d_batched` and
+`adjoint_project_3d_batched` are thin wrappers over `fm3d/leap_projector.py` -- read that
+module for the model, the measured agreement, the VD-vs-SF adjoint choice and the LEAP API
+traps. There is no backend switch and no environment variable: one operator, one path.
 
-Forward: for each detector element the ray is recovered from the projection
-matrix (source C = -A^{-1} b, direction d = A^{-1} [u; v; 1]), then the volume
-is line-integrated by ray-marching with trilinear `grid_sample`. Everything is
-torch, so gradients flow back to the volume (and through warp.py to the DVF).
+WHAT STAYS OURS, AND WHY:
+  * THE FDK, below. LEAP's `fbp` reproduces our static reconstruction to 5e-3 but has no
+    equivalent of `disp` (the motion-compensated backprojection coordinates), the Voronoi
+    per-view angular weight read out of `Pmat`, the Wang half-fan weight, or the Ohnesorge
+    padding -- and those are the whole reason this FDK exists.
+  * `d(loss)/dP`. LEAP has no geometry derivative at all (`leaptorch`'s backward returns the
+    volume gradient and `None` for everything else), so the motion estimator could never run
+    on it. `LEAPProject` takes its value and its volume gradient from LEAP and its geometry
+    gradient from our kernels, branch-aware (`leap_projector.GRAD_MODE = "auto"`): the exact
+    LEAP-model gradient (`triton_leap_grad`) on the Joseph branch, the continuous-corner
+    surrogate (`triton_sf.sf_grad_P`) on the SF branch -- the ripple ledger in
+    `triton_leap_grad`'s docstring is why that split is deliberate.
+  * The ray-march `grid_sample` REFERENCE, `reference_project_3d_batched` below. It is not a
+    backend any more -- nothing in production can reach it -- but it is the gates' independent
+    oracle: exact autograd by construction, in a third codebase, which is what lets a gate
+    catch LEAP and our SF kernel being wrong in the same way.
 
-FDK (Feldkamp) reconstruction, kept geometrically consistent with the forward:
+FDK (Feldkamp) reconstruction, kept geometrically consistent with the forward model:
   1. cosine pre-weight   g~ = g * SDD / sqrt(SDD^2 + u^2 + v^2)
   2. ramp filter along the detector u-axis (FFT, optional Hann apodization)
   3. distance-weighted backprojection  += g_filt(u*, v*) / w^2
 using the SAME P matrices (u = u_h/w, v = v_h/w, w = along-axis source
-distance) — the exact transpose of the forward model, no convention drift.
-A single global scale is calibrated once by least squares (calibrate_scale)
-against the clean recon and re-used for motion recons, exactly as in 2D.
+distance), no convention drift.
+The FDK is SELF-NORMALIZED by the geometry constant SOD*SDD/2 (`_fdk_physical_norm`),
+so it returns absolute mu [1/mm]; no constant is ever fitted (2026-07-28).
 
-Memory note (prompt 6, problem #1 of 2): everything is view-chunked
-(`view_chunk`) and the FDK additionally voxel-chunked (`vox_chunk`); this is
-the "view chunking" half of the 3D memory strategy. The FM prior's volume-size
-problem is the OTHER half and is solved by 3D patches (prior_patch.py), not here.
+Memory note (prompt 6, problem #1 of 2): the FDK is view-chunked (`view_chunk`) and
+voxel-chunked (`vox_chunk`); this is the "view chunking" half of the 3D memory strategy. The
+FM prior's volume-size problem is the OTHER half and is solved by 3D patches (prior_patch.py).
 """
 
 from __future__ import annotations
@@ -34,10 +45,15 @@ import torch.nn.functional as F
 
 from . import triton_backproject
 from .geometry_3d import ConeBeam3DConfig
-from .filters import ramp_filter, calibrate_scale  # 1D-along-u filter + scalar fit; see filters.py
+from .filters import DEFAULT_RAMP_WINDOW, ramp_filter, calibrate_scale  # ramp; calibrate_scale is gate-only now
+from .leap_projector import leap_backproject_3d_batched, leap_project_3d_batched
 
 __all__ = [
     "forward_project_3d_batched",
+    "adjoint_project_3d_batched",
+    "reference_project_3d_batched",
+    "reference_adjoint_3d_batched",
+    "_fdk_physical_norm",
     "fdk_conebeam_3d_batched",
     "fdk_conebeam_3d_tangent",
     "wang_weight",
@@ -57,6 +73,60 @@ def _ray_box_intersect_3d(o, d, box_min, box_max, eps_dir: float = 1e-8):
     tmax = torch.min(t_big, dim=-1).values
     hit = tmax > tmin
     return tmin, tmax, hit
+
+
+# ---------------------------------------------------------------------------------------
+_RAMP_WINDOW_NOTE = """WHY THE FDK RAMP IS APODIZED (`filters.DEFAULT_RAMP_WINDOW =
+"shepphann"`), CHANGED FROM "ramlak" 2026-07-29.
+
+The forward operator's VOXEL BASIS decides how much of the ramp is safe to use, and ours changed
+when the projector did. The retired ray-march/gridsample forward integrated a TRILINEAR-TENT
+object (grid_sample bilinear), which is band-limited near the voxel Nyquist -- so an unapodized
+ramlak ramp had nothing spurious left to amplify, and "noiseless simulated data, so use the
+sharpest filter" was a sound argument. The SF pair integrates the CUBE (piecewise-constant) basis
+that separable-footprint is defined for. A piecewise-constant object carries real spectral energy
+ABOVE the sampling Nyquist -- the voxel faces -- and our detector resolves it (0.64 mm pitch is
+0.42 mm at isocenter against 1 mm voxels), so ramlak reconstructs the voxel grid itself as a
+crosshatch texture.
+
+MEASURED on CQ500 val p216, static FDK, excess sd over the GT in a homogeneous brain ROI plus
+bone-edge gradient magnitude as the sharpness proxy (scripts/diag_static_fdk.py):
+
+    forward / filter                     excess sd     bone-edge sharpness   LEAP equivalent
+    SF   1mm   + ramlak                    13.2 HU          99% of GT         ord12
+    SF   1mm   + shepp                     10.3 HU          97%               ord2 (LEAP DEFAULT)
+    SF   1mm   + hann                       1.4 HU          90%               ord12 + lowpass 2.0
+    SF   1mm   + shepphann  (DEPLOYED)      0.0 HU          90%               ord2  + lowpass 2.0
+    SF   1mm   + hann @ cutoff 0.419        0.0 HU          75%               (voxel-Nyquist cut)
+    SF   0.5mm upsampled + ramlak           0.0 HU          82%   (4x cost)
+    tent(ray)  + ramlak                     3.4 HU          90%               <- the old regime
+
+`shepphann` DOMINATES every alternative examined: 0 texture at the same 90% sharpness the retired
+trilinear-basis operator gave, for free. Three routes were measured and rejected:
+  * LEAP's own default (`shepp` / ord2) alone leaves 10.3 HU -- it does not fix this. LEAP does not
+    enable its low-pass by default because at ITS native voxel (du*SOD/SDD, here 0.4187 mm) the
+    detector does not over-resolve the grid; our 1 mm grid is 2.39x coarser, which is what creates
+    the problem.
+  * cutting exactly at the voxel Nyquist (cutoff 0.419) costs 15 more points of sharpness and buys
+    nothing -- the texture lives in a narrow near-Nyquist band, not uniformly above it.
+  * FORWARD-PROJECTING A FINER GRID (upsample to 0.5 mm, project, reconstruct at 1 mm) -- the
+    "match the voxel to the data sampling" route -- is 4x the cost AND blurrier (82%), because our
+    object is only KNOWN at 1 mm: upsampling adds no information and trilinear interpolation is a
+    broad-band low-pass (sinc^2 per axis), so it attenuates mid frequencies a designed filter keeps.
+
+CAVEAT ON THE SHARPNESS COLUMN: the denominator is the GT volume, and that GT is itself aliased --
+CQ500 is resampled 0.53 -> 1 mm with `sitkLinear` and no anti-alias filter, leaving 7-13x excess
+energy in the top decile of its own band (measured against a Gaussian-prefiltered downsample). So
+"99% of GT" for ramlak partly rewards REPRODUCING GT aliasing. The GT is taken as given (user's
+call); quote this column with the caveat attached.
+
+`ramlak` remains available and is still the right choice if the forward is ever put back on a
+band-limited basis.
+
+REFUTED alternative, do not retry: widening the SF footprint to the tent's SUPPORT. Non-integer
+widths beat against the voxel pitch (443 HU), and the exact double width only reaches 9.2 HU
+while costing 30% of the edge sharpness -- it is the tent's piecewise-CUBIC shape that matters,
+not its support."""
 
 
 def _world_to_grid_norm_3d(pts, *, W, H, D, dx, dy, dz, X0, Y0, Z0,
@@ -82,38 +152,6 @@ def _world_to_grid_norm_3d(pts, *, W, H, D, dx, dy, dz, X0, Y0, Z0,
         y_norm = (2.0 * iy + 1.0) / float(H) - 1.0
         z_norm = (2.0 * iz + 1.0) / float(D) - 1.0
     return torch.stack([x_norm, y_norm, z_norm], dim=-1)
-
-
-def _use_triton(backend: str, vol: torch.Tensor, align_corners: bool,
-                pmat: torch.Tensor | None = None) -> bool:
-    """Triton is used when available, on CUDA, in fp32, align_corners=False.
-
-    The kernel hard-codes the align_corners=False voxel-centre convention (it is the one the
-    whole project uses -- see `warp.py`), so align_corners=True falls back to grid_sample.
-
-    `pmat` is accepted for symmetry with the grad-safety check that USED to live here. The
-    Triton kernel inherited from the 4DCT project had no adjoint w.r.t. the ray constants, and
-    since autograd reads a Function's `None` as a ZERO, that silently zeroed d(loss)/d(theta) --
-    a motion estimator that never moves and never complains. `_RayMarch` now carries that adjoint
-    (see triton_raymarch._bwd_kernel), so the fast path is safe for motion estimation too and
-    there is nothing left to refuse. `scripts/gate_triton_adjoint.py` is what holds that claim up.
-
-    ENV SWITCHES (this project has TWO independent Triton kill switches; they do not alias):
-      * FM3D_PROJECTOR=gridsample|triton|auto  -- THIS one, the forward projector's backend
-        (FDCT_PROJECTOR, the name inherited from the 4DCT sibling, is honoured as a
-        deprecated alias when FM3D_PROJECTOR is unset);
-      * FM3D_FDK_TRITON=0                      -- the FDK backprojector's (triton_backproject.py).
-    """
-    import os
-    from .triton_raymarch import HAVE_TRITON
-    backend = os.environ.get("FM3D_PROJECTOR",
-                             os.environ.get("FDCT_PROJECTOR", backend))
-    if backend == "gridsample":
-        return False
-    ok = HAVE_TRITON and vol.is_cuda and vol.dtype == torch.float32 and not align_corners
-    if backend == "triton" and not ok:
-        raise RuntimeError("backend='triton' needs triton + CUDA + fp32 + align_corners=False")
-    return ok
 
 
 def _grid_affine_3d(*, W, H, D, dx, dy, dz, X0, Y0, Z0, align_corners: bool, device):
@@ -159,6 +197,32 @@ def forward_project_3d_batched(
     dx: float,
     dy: float,
     dz: float,
+) -> torch.Tensor:
+    """THE forward operator: LEAP modular-beam. (B,V,nv,nu) [mm * mu].
+
+    Differentiable in the volume (LEAP's backprojection) and in `Pmat` (branch-aware, see
+    `leap_projector.GRAD_MODE`); `fm3d/leap_projector.py` is where both decisions are argued
+    and gated. There is
+    no backend argument: the volume box is the centred grid the whole repo uses, the tensors
+    must be on a GPU, and that is the only configuration that exists.
+    """
+    if volumes.ndim != 5:
+        raise ValueError("volumes must be (B, 1, D, H, W)")
+    if not volumes.is_cuda:
+        raise ValueError("the projector pair is LEAP's and runs on the GPU only; "
+                         "`reference_project_3d_batched` serves CPU tensors, for gates")
+    return leap_project_3d_batched(volumes, Pmat, u_coords, v_coords, dx=dx, dy=dy, dz=dz)
+
+
+def reference_project_3d_batched(
+    volumes: torch.Tensor,    # (B, 1, D, H, W)
+    Pmat: torch.Tensor,       # (B, V, 3, 4)
+    u_coords: torch.Tensor,
+    v_coords: torch.Tensor,
+    *,
+    dx: float,
+    dy: float,
+    dz: float,
     X0: float | None = None,
     Y0: float | None = None,
     Z0: float | None = None,
@@ -167,26 +231,16 @@ def forward_project_3d_batched(
     row_chunk: int | None = None,
     align_corners: bool = False,
     reg: float = 1e-8,
-    backend: str = "auto",
 ) -> torch.Tensor:
-    """Batched cone-beam forward projection. Returns (B, V, nv, nu) [mm * mu].
+    """GATE-ONLY reference: torch `grid_sample` ray march, trilinear basis, exact autograd.
 
-    `backend`: "auto" (Triton if importable, on CUDA, align_corners=False), "triton", or
-    "gridsample". The Triton path generates every sample coordinate in-register (no
-    (rays, n_samples, 3) tensor at all), so autograd retains 2.4 MB of per-ray constants
-    instead of a 432 MiB coordinate grid per block, and its backward is the exact matched
-    adjoint. See `fm3d/triton_raymarch.py`. Set FM3D_PROJECTOR=gridsample to force the
-    reference path (FDCT_PROJECTOR is a deprecated alias; the FDK backprojection's separate
-    switch is FM3D_FDK_TRITON=0).
-
-    3D twin of `forward_project_2d_batched`: vectorized over the batch and over
-    chunks of views (one big 5D grid_sample per chunk). Differentiable in
-    `volumes` (and, through warp.py upstream, in the DVF).
-
-    `row_chunk` additionally splits the DETECTOR ROWS. At a realistic panel size
-    (768 rows x 1024 cols x n_samples) a single view's sample-point tensor is
-    ~3.6 GB in fp32, so row chunking (not just view chunking) is mandatory there.
-    None = all rows at once (fine for small sanity detectors)."""
+    NOT a backend and NOT reachable from any production path (that was removed 2026-07-29 with
+    the switch to LEAP). Its whole job is to be a THIRD, independent implementation so a gate
+    can tell "LEAP and our SF kernel agree" apart from "LEAP and our SF kernel are wrong the
+    same way". It also serves CPU tensors, `align_corners=True` and non-centred boxes, none of
+    which the deployed operator covers. `n_samples`/`view_chunk`/`row_chunk` parameterize this
+    path and nothing else.
+    """
     if volumes.ndim != 5:
         raise ValueError("volumes must be (B, 1, D, H, W)")
     vol = volumes.to(torch.float32)
@@ -221,17 +275,9 @@ def forward_project_3d_batched(
 
     rc = nv if row_chunk is None else int(row_chunk)
     outs_v = []
-    use_triton = _use_triton(backend, vol, align_corners, pmat=Pmat)
-    if use_triton:
-        from .triton_raymarch import raymarch
-        # continuous VOXEL-INDEX coords: i = (p - P0)/d - 0.5  (align_corners=False centres)
-        v_scale = torch.tensor([1.0 / dx, 1.0 / dy, 1.0 / dz], device=device)
-        v_shift = torch.tensor([X0 / dx + 0.5, Y0 / dy + 0.5, Z0 / dz + 0.5], device=device)
-        vol_t = vol[:, 0].contiguous()                        # (B,D,H,W)
-    else:
-        g_scale, g_shift = _grid_affine_3d(W=W, H=H, D=D, dx=dx, dy=dy, dz=dz,
-                                           X0=X0, Y0=Y0, Z0=Z0,
-                                           align_corners=align_corners, device=device)
+    g_scale, g_shift = _grid_affine_3d(W=W, H=H, D=D, dx=dx, dy=dy, dz=dz,
+                                       X0=X0, Y0=Y0, Z0=Z0,
+                                       align_corners=align_corners, device=device)
 
     for v0 in range(0, V, view_chunk):
         v1 = min(v0 + view_chunk, V)
@@ -263,19 +309,6 @@ def forward_project_3d_batched(
 
             step = (tmax - tmin).clamp_min(0.0) / float(n_samples)
 
-            if use_triton:
-                # p_k = A + Bk*(k+0.5) in voxel index; coordinates never leave registers.
-                # A misses the box => step == 0 => the integral is 0, so `hit` is implicit.
-                Bd = dirs * v_scale                                   # (B,vc,nr,nu,3)
-                A = torch.addcmul(o * v_scale - v_shift, Bd, tmin[..., None])
-                Bk = Bd * step[..., None]
-                R = B * vc * nr * nu
-                out = raymarch(vol_t,
-                               A.reshape(R, 3).t(), Bk.reshape(R, 3).t(),
-                               step.reshape(R), vc * nr * nu, n_samples)
-                rows.append(out.view(B, vc, nr, nu))
-                continue
-
             # Fused sample grid: grid_norm(k) = A + Bk*k, both per-RAY (see _grid_affine_3d).
             # A = (o + d*tmin) * scale - shift ;  Bk = (d * scale) * step
             Bd = dirs * g_scale                                       # (B,vc,nr,nu,3)
@@ -293,6 +326,69 @@ def forward_project_3d_batched(
         outs_v.append(torch.cat(rows, dim=2))                        # (B, vc, nv, nu)
 
     return torch.cat(outs_v, dim=1)                                  # (B, V, nv, nu)
+
+
+def adjoint_project_3d_batched(
+    sino: torch.Tensor,       # (B, V, nv, nu)
+    Pmat: torch.Tensor,       # (B, V, 3, 4)
+    u_coords: torch.Tensor,
+    v_coords: torch.Tensor,
+    *,
+    D: int,
+    H: int,
+    W: int,
+    dx: float,
+    dy: float,
+    dz: float,
+) -> torch.Tensor:
+    """A^T sino: LEAP's backprojection. (B,1,D,H,W).
+
+    NOT the exact transpose of `forward_project_3d_batched` any more, and that is a deliberate
+    trade the whole repo now lives with: `leap_projector.ADJOINT_MODE` selects LEAP's
+    voxel-driven backprojector (self-adjointness 1.9e-4; 'SF' would buy 1.9e-7 at ~2.8x the
+    cost, the retired matched pair had 0.0). Every `A^T` in the loop -- the CG data step
+    included -- goes through here.
+    """
+    if sino.ndim != 4:
+        raise ValueError("sino must be (B, V, nv, nu)")
+    if not sino.is_cuda:
+        raise ValueError("the projector pair is LEAP's and runs on the GPU only; "
+                         "`reference_adjoint_3d_batched` serves CPU tensors, for gates")
+    return leap_backproject_3d_batched(sino, Pmat, u_coords, v_coords,
+                                       D=D, H=H, W=W, dx=dx, dy=dy, dz=dz)
+
+
+def reference_adjoint_3d_batched(
+    sino: torch.Tensor,
+    Pmat: torch.Tensor,
+    u_coords: torch.Tensor,
+    v_coords: torch.Tensor,
+    *,
+    D: int,
+    H: int,
+    W: int,
+    dx: float,
+    dy: float,
+    dz: float,
+    X0: float | None = None,
+    Y0: float | None = None,
+    Z0: float | None = None,
+    n_samples: int = 256,
+    view_chunk: int = 4,
+    row_chunk: int | None = None,
+    reg: float = 1e-8,
+) -> torch.Tensor:
+    """GATE-ONLY: the EXACT transpose of `reference_project_3d_batched`, by autograd
+    (differentiate `<A(x), s>` at `x = 0`). Exact by construction, which is the point."""
+    s = sino.to(torch.float32)
+    B = s.shape[0]
+    x = torch.zeros((B, 1, D, H, W), device=s.device, dtype=torch.float32,
+                    requires_grad=True)
+    out = reference_project_3d_batched(
+        x, Pmat, u_coords, v_coords, dx=dx, dy=dy, dz=dz, X0=X0, Y0=Y0, Z0=Z0,
+        n_samples=n_samples, view_chunk=view_chunk, row_chunk=row_chunk, reg=reg)
+    (out * s).sum().backward()
+    return x.grad
 
 
 def wang_weight(u_coords: torch.Tensor, cfg) -> torch.Tensor | None:
@@ -397,6 +493,31 @@ def ohnesorge_pad(g: torch.Tensor, npad: int, left: bool = True,
     return torch.cat(out, dim=-1)
 
 
+def _fdk_physical_norm(cfg) -> float:
+    """The FDK unit constant. SELF-NORMALIZING: it is fixed by the GEOMETRY, which is given.
+
+        SOD * SDD * (1.0 if half-fan else 0.5)
+
+    With the cosine pre-weight, a ramp on the PHYSICAL detector frequency axis
+    (rfftfreq(N, d=du)) and the projective 1/w^2 weight, this is the textbook Feldkamp
+    constant that turns the angle-weighted view sum into absolute mu [1/mm]. SOD^2/2 is the
+    (SOD/w)^2 magnification; the extra SDD/SOD is because the ramp is convolved on the
+    detector axis (pitch du at SDD) rather than on the virtual iso-plane detector, where
+    frequencies are M = SDD/SOD times larger. Full-fan 2pi measures every line twice -> 1/2;
+    the half-fan Wang weight already de-duplicates conjugate rays, so it takes none.
+
+    NO LEAST-SQUARES SCALE ANYWHERE (user, 2026-07-28, following the 4DCT sibling's
+    2026-07-21 deletion of the same thing -- `fdct/projector_3d._fdk_physical_norm`). SOD and
+    SDD are GIVEN, so there is nothing to fit, and fitting was actively harmful: a scalar
+    regressed on FDK(A(v)) vs v silently absorbs any operator or physics-level error (units,
+    voxel size, detector pitch, and -- in the sibling's case -- scatter/bowtie/air constants),
+    leaving the whole pipeline self-consistent and wrong. `calibrate_scale` survives only as a
+    gate diagnostic, where it must now come out ~1.0.
+
+    VERIFIED on this geometry (uniform water cylinder, no fitting): mu = 0.01996 vs 0.02."""
+    return float(cfg.SOD) * float(cfg.SDD) * (1.0 if getattr(cfg, "is_half_fan", False) else 0.5)
+
+
 def fdk_conebeam_3d_batched(
     sino: torch.Tensor,       # (B, V, nv, nu)
     Pmat: torch.Tensor,       # (B, V, 3, 4) nominal geometry used for recon
@@ -410,7 +531,7 @@ def fdk_conebeam_3d_batched(
     dx: float = 1.0,
     dy: float = 1.0,
     dz: float = 1.0,
-    window: str = "ramlak",
+    window: str = DEFAULT_RAMP_WINDOW,   # filters.py is the ONE source of truth
     cutoff: float = 1.0,
     scale: float | None = None,
     view_chunk: int = 8,
@@ -619,13 +740,15 @@ def fdk_conebeam_3d_batched(
 
     recon = recon * (float(cfg.angle_span) / float(V))
     recon = recon.view(B, D, H, W)
-    if scale is not None:
-        recon = recon * scale
-    return recon
+    # scale=None => the deterministic geometry constant (self-normalized, absolute mu).
+    # An explicit float overrides it; scale=1.0 gets the RAW sum, which is what
+    # `calibrate_scale` diagnostics want.
+    return recon * (_fdk_physical_norm(cfg) if scale is None else scale)
 
 
 def _backproject_static_torch(g, Pmat, disp, *, D, H, W, dx, dy, dz, du, dv,
-                              u0, v_off, half_u, half_v, eps, view_chunk, vox_chunk):
+                              u0, v_off, half_u, half_v, eps, view_chunk, vox_chunk,
+                              w2=True):
     """The original torch backprojection loop, chunked over views AND voxels. (B, Npix).
 
     Kept verbatim as (a) the `disp` MC path, which the Triton kernel does not cover, and
@@ -684,7 +807,8 @@ def _backproject_static_torch(g, Pmat, disp, *, D, H, W, dx, dy, dz, du, dv,
             val = val.view(B, vc, p1 - p0)
 
             mask = (w > 0) & ((u - u0).abs() <= half_u) & ((v - v_off).abs() <= half_v)
-            contrib = torch.where(mask, val / (w_safe ** 2), torch.zeros_like(val))
+            wv = val / (w_safe ** 2) if w2 else val   # w2=False: plain (unmatched-A^T) accumulate
+            contrib = torch.where(mask, wv, torch.zeros_like(val))
             recon[:, p0:p1] += contrib.sum(dim=1)
     return recon
 
@@ -798,7 +922,7 @@ def fdk_conebeam_3d_tangent(
     dx: float = 1.0,
     dy: float = 1.0,
     dz: float = 1.0,
-    window: str = "ramlak",
+    window: str = DEFAULT_RAMP_WINDOW,   # filters.py is the ONE source of truth
     cutoff: float = 1.0,
     scale: float | None = None,
     view_weight: torch.Tensor | None = None,       # (B,V) or (V,) [rad], w(s)
@@ -887,7 +1011,7 @@ def fdk_conebeam_3d_tangent(
         x = x.view(B, D, H, W)
         dxds = dxds.view(B, D, H, W)
 
-    if scale is not None:
-        x = x * scale
-        dxds = dxds * scale
+    s = _fdk_physical_norm(cfg) if scale is None else scale
+    x = x * s
+    dxds = dxds * s          # the tangent carries the same constant (it is s-independent)
     return x, dxds

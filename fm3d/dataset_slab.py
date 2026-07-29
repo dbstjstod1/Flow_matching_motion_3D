@@ -45,8 +45,8 @@ import torch
 
 from .geometry_3d import ConeBeam3DConfig, build_conebeam_orbit, detector_coords_3d
 from .filters import calibrate_scale
-from .projector_3d import (fdk_conebeam_3d_batched, fdk_conebeam_3d_tangent,
-                           forward_project_3d_batched)
+from .projector_3d import (adjoint_project_3d_batched, fdk_conebeam_3d_batched,
+                           fdk_conebeam_3d_tangent, forward_project_3d_batched)
 from .rigid_motion import params_to_Pmot, random_motion
 
 MU_WATER = 0.02
@@ -88,14 +88,13 @@ class AAPMSlabGenerator:
 
     def __init__(self, data_dir: str, cfg: ConeBeam3DConfig | None = None, *,
                  device="cuda", slab: int = 64, in_plane: int = 256, dz: float = 1.0,
-                 pixel_mm: float = 0.5, n_samples_fwd: int = 512,
+                 pixel_mm: float = 0.5,
                  mu_water: float = MU_WATER, hu_norm=(-1000.0, 2000.0),
                  min_run: int = 64, break_hu: float = 400.0, interloper_hu: float = 300.0,
                  cache: str | None = None):
         self.device = torch.device(device)
         self.slab, self.size = slab, in_plane
         self.mu_water = mu_water
-        self.n_samples_fwd = n_samples_fwd
 
         # 512 px at ~0.5 mm -> `in_plane` px; keep the physical extent, change only the sampling.
         self.dx = self.dy = pixel_mm * 512.0 / in_plane
@@ -139,7 +138,11 @@ class AAPMSlabGenerator:
             raise RuntimeError(f"no contiguous run of >= {max(min_run, slab)} slices")
         self.n_slabs = sum((b - a) - slab + 1 for a, b in self.runs)
 
-        self.fbp_scale = self._calibrate()
+        # NO CALIBRATION (user, 2026-07-28; the 4DCT sibling deleted the same thing 2026-07-21).
+        # The FDK is SELF-NORMALIZED by the pure geometry constant SOD*SDD/2
+        # (`projector_3d._fdk_physical_norm`, phantom-verified to 0.2%), exactly like RTK --
+        # SOD and SDD are GIVEN, so there is nothing to fit and no scale attribute at all. The old least-squares scale silently absorbed any operator or
+        # level error instead of surfacing it.
 
     # -- volumes -----------------------------------------------------------------------
     def volume(self, run: int = 0, z0: int = 0) -> torch.Tensor:
@@ -178,16 +181,23 @@ class AAPMSlabGenerator:
     def project(self, vols: torch.Tensor, Pmat: torch.Tensor, **kw) -> torch.Tensor:
         return forward_project_3d_batched(
             vols, Pmat, self.u_coords, self.v_coords,
-            dx=self.dx, dy=self.dy, dz=self.dz,
-            n_samples=kw.pop("n_samples", self.n_samples_fwd),
-            view_chunk=kw.pop("view_chunk", 4), row_chunk=kw.pop("row_chunk", 64), **kw)
+            dx=self.dx, dy=self.dy, dz=self.dz, **kw)
+
+    def adjoint(self, sino: torch.Tensor, Pmat: torch.Tensor, **kw) -> torch.Tensor:
+        """A^T sino -- LEAP's backprojection, NOT the exact transpose of `project`
+        (`leap_projector.ADJOINT_MODE`). (B,V,nv,nu) -> (B,1,D,H,W)."""
+        D, H, W = self.shape
+        return adjoint_project_3d_batched(
+            sino, Pmat, self.u_coords, self.v_coords,
+            D=D, H=H, W=W, dx=self.dx, dy=self.dy, dz=self.dz, **kw)
+
 
     def fdk(self, sino: torch.Tensor, Pmat: torch.Tensor, *, scale=None, **kw) -> torch.Tensor:
         D, H, W = self.shape
         return fdk_conebeam_3d_batched(
             sino, Pmat, self.u_coords, self.v_coords, self.cfg,
             D=D, H=H, W=W, dx=self.dx, dy=self.dy, dz=self.dz,
-            scale=self.fbp_scale if scale is None else scale,
+            scale=scale,
             view_chunk=kw.pop("view_chunk", 8), **kw)
 
     def fdk_tangent(self, sino: torch.Tensor, Pmat: torch.Tensor, Pdot: torch.Tensor, *,
@@ -198,34 +208,24 @@ class AAPMSlabGenerator:
         return fdk_conebeam_3d_tangent(
             sino, Pmat, Pdot, self.u_coords, self.v_coords, self.cfg,
             D=D, H=H, W=W, dx=self.dx, dy=self.dy, dz=self.dz,
-            scale=self.fbp_scale if scale is None else scale, **kw)
+            scale=scale, **kw)
 
-    def _calibrate(self) -> float:
-        """One least-squares scalar for the FDK, fit once on run 0. Operator constant."""
-        from .geometry_3d import measured_region_mask
-        v = self.volume(0, 0)
-        with torch.no_grad():
-            y = self.project(v, self.P_nom[None])
-            raw = fdk_conebeam_3d_batched(
-                y, self.P_nom[None], self.u_coords, self.v_coords, self.cfg,
-                D=self.slab, H=self.size, W=self.size,
-                dx=self.dx, dy=self.dy, dz=self.dz, scale=1.0, view_chunk=8)[0]
-        m = measured_region_mask(self.shape, (self.dz, self.dy, self.dx), self.cfg,
-                                 device=self.device)
-        return calibrate_scale(raw, v[0, 0], m)
 
-    def sample_motion(self, batch: int = 1, *, trans_mm: float = 5.0, rot_deg: float = 3.0,
-                      generator=None):
+    def sample_motion(self, batch: int = 1, *, trans_mm: float = 10.0, rot_deg: float = 6.0,
+                      amp_mode: str = "fixed", generator=None):
         """-> (y (B,V,nv,nu), theta (B,V,6), vols (B,1,D,H,W)) with independent random motion.
 
         Returns the SINOGRAM and the MOTION, not an image pair: the geometry bridge synthesizes
         every x_t on the fly as FDK(y, P_nom @ T(t*theta)), so a precomputed x0/x1 pair would be
         both redundant and wrong (it would fix the path).
+
+        `amp_mode="thies"` switches to the paper's TRAINING amplitude protocol, where the
+        amplitudes become per-DoF maxima -- see `rigid_motion.akima_motion`.
         """
         vols = self.sample_volumes(batch, generator=generator)
         th = torch.stack([
             random_motion(self.cfg.n_views, trans_mm=trans_mm, rot_deg=rot_deg,
-                          device=self.device, generator=generator)
+                          amp_mode=amp_mode, device=self.device, generator=generator)
             for _ in range(batch)], 0)                                        # (B,V,6)
         P = torch.stack([params_to_Pmot(th[b], self.P_nom) for b in range(batch)], 0)
         with torch.no_grad():

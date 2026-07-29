@@ -5,8 +5,8 @@ put the torch FDK at 14.5 s/call and 70% of a bridge draw -- and INSENSITIVE to 
 it is not launch-bound. The torch path materializes, per (view_chunk x vox_chunk) block, the
 einsum coordinate tensor plus ~a dozen elementwise intermediates (u, v, w, ju, jv, the
 normalized grid, the mask ...), each a full read+write of a (vc, Np) tensor: the same
-coordinate-bandwidth disease `triton_raymarch` cured in the forward projector (there, 92% of
-the block). This kernel fuses the whole chain -- P @ x, perspective divide, detector index,
+coordinate-bandwidth disease the retired Triton ray-march projector cured in the forward
+(module deleted 2026-07-28 with the SF switch; there, 92% of the block). This kernel fuses the whole chain -- P @ x, perspective divide, detector index,
 bilinear gather, 1/w^2 mask-accumulate -- so per (voxel, view) the only memory traffic is the
 4 detector taps; coordinates never leave registers. Measured there: 24x on the backprojection.
 
@@ -25,7 +25,7 @@ The filtered sinogram is s-independent (filtering is per-view linear, see
                         d[val/w^2] = (g_u*judot + g_v*jvdot)/w^2 - 2*val*dw/w^3
 
 where (g_u, g_v) is the bilinear interpolant's own spatial derivative, read from the SAME
-four taps as the value (the trick `triton_raymarch`'s NEED_RAY adjoint already uses in 3D).
+four taps as the value (the trick the retired ray-march kernel's NEED_RAY adjoint used in 3D).
 Per-view scalars (wgt, dwgt) fold in the Voronoi angular weight and ITS s-derivative
 (`geometry_3d.view_angular_weights_dot`). The mask and the interpolation cell are FROZEN at
 the evaluation point -- their moving edges are measure-zero, the same a.e.-Jacobian argument
@@ -65,8 +65,8 @@ except ImportError:                                             # pragma: no cov
 def enabled() -> bool:
     """Kill switch: FM3D_FDK_TRITON=0 forces the torch path.
 
-    Independent of the FORWARD projector's switch (FM3D_PROJECTOR=gridsample, with
-    FDCT_PROJECTOR as a deprecated alias -- see projector_3d._use_triton); neither
+    Independent of the FORWARD projector (LEAP, `leap_projector`) and of the gates
+    reference `projector_3d.reference_project_3d_batched`; neither
     implies the other."""
     return HAVE_TRITON and os.environ.get("FM3D_FDK_TRITON", "1") != "0"
 
@@ -101,7 +101,11 @@ if HAVE_TRITON:
                    V, nv, nu, Npix, W, H, D,
                    dx, dy, dz, du, dv, u0, v_off,
                    half_u, half_v, eps,
-                   BLOCK: tl.constexpr):
+                   BLOCK: tl.constexpr, W2: tl.constexpr):
+        # W2: apply FDK's 1/w^2 distance weight (the Feldkamp backprojection). W2=False is the
+        # plain voxel-driven accumulation the open-source iterative solvers use as their
+        # (unmatched) A^T -- RTK's BackProjectionImageFilter and TIGRE's Atb('matched') both
+        # backproject WITHOUT the FDK weight. See projector_3d.backproject_3d_batched.
         pid_b = tl.program_id(1)
         p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         mask = p < Npix
@@ -140,7 +144,9 @@ if HAVE_TRITON:
             base = ((pid_b * V + view) * nv).to(tl.int64) * nu
             val = _bilinear2d(g_ptr, base, ju, jv, nu, nv, mask)
             ok = mask & (w > 0) & (tl.abs(u - u0) <= half_u) & (tl.abs(v - v_off) <= half_v)
-            acc += tl.where(ok, val / (w_safe * w_safe), 0.0)
+            if W2:
+                val = val / (w_safe * w_safe)
+            acc += tl.where(ok, val, 0.0)
         tl.store(out_ptr + pid_b.to(tl.int64) * Npix + p, acc, mask=mask)
 
     @triton.jit
@@ -157,7 +163,7 @@ if HAVE_TRITON:
 
         The value/derivative pair reads the SAME four detector taps: the bilinear value uses
         corner weights (wx*wy) and its ju/jv-derivative uses (sx*wy)/(wx*sy) with sx,sy = +-1
-        -- exactly the trilinear trick in `triton_raymarch._bwd_kernel`, one dimension down.
+        -- the retired ray-march backward kernel's trilinear trick, one dimension down.
         """
         pid_b = tl.program_id(1)
         p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -255,8 +261,10 @@ if HAVE_TRITON:
 def backproject_static(g: torch.Tensor, Pmat: torch.Tensor, D: int, H: int, W: int, *,
                        dx: float, dy: float, dz: float, du: float, dv: float,
                        u0: float, v_off: float, half_u: float, half_v: float,
-                       eps: float, block: int = 256) -> torch.Tensor:
-    """Distance-weighted static cone-beam backprojection of a FILTERED sinogram.
+                       eps: float, block: int = 256, w2: bool = True) -> torch.Tensor:
+    """Static cone-beam voxel-driven backprojection. `w2=True` (default) applies FDK's 1/w^2
+    distance weight (a FILTERED sinogram makes this the Feldkamp step); `w2=False` is the plain
+    accumulation the open-source iterative solvers use as their unmatched A^T.
 
     g (B,V,nv,nu) fp32, Pmat (B,V,3,4) fp32 -> (B,D,H,W). The caller applies the
     angle_span/V weight and `scale` afterwards, exactly as the torch path does."""
@@ -271,7 +279,7 @@ def backproject_static(g: torch.Tensor, Pmat: torch.Tensor, D: int, H: int, W: i
     _bp_kernel[grid](g, P, out, V, nv, nu, Npix, W, H, D,
                      float(dx), float(dy), float(dz), float(du), float(dv),
                      float(u0), float(v_off), float(half_u), float(half_v), float(eps),
-                     BLOCK=block)
+                     BLOCK=block, W2=bool(w2))
     return out.view(B, D, H, W)
 
 

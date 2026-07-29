@@ -129,7 +129,7 @@ def gate_semantics(P_nom, u, v, vol) -> None:
     print("\nG3  object-space semantics  (P @ T projects the MOVED object)")
     dz, dy, dx = SPACING
     V = P_nom.shape[0]
-    kw = dict(dx=dx, dy=dy, dz=dz, n_samples=192, view_chunk=8)
+    kw = dict(dx=dx, dy=dy, dz=dz)
 
     def fp(x, P):
         return forward_project_3d_batched(x[None, None], P[None], u, v, **kw)[0]
@@ -187,39 +187,52 @@ def _gauss_blur3(x: torch.Tensor, sigma_vox: float) -> torch.Tensor:
 def gate_grad(P_nom, u, v, vol) -> None:
     """d(loss)/d(theta) -- the motion estimator IS this gradient, so it gets two gates.
 
-    G4a  CORRECTNESS, on a Gaussian-smoothed phantom. Trilinear interpolation makes the
-         projection only C0 in the sample coordinates: its derivative jumps at every voxel
-         face. On a SHARP phantom the analytic gradient (which autograd computes exactly, for
-         the DISCRETIZED operator) and a finite difference (which secants across many of those
-         jumps, i.e. approximates the CONTINUOUS operator's derivative) legitimately differ,
-         and the size of the gap depends on the ray sampling rate, not on the code being wrong.
-         Smoothing the phantom removes the kinks and the two must then agree to well under 1%.
-         That is the real invariant, and it is the one that would break if the chain
-         theta -> T -> P -> A_inv -> rays -> grid_sample were mis-wired.
+    G4a  CORRECTNESS of the chain theta -> T -> P -> A, on a Gaussian-smoothed phantom.
+         Interpolation makes the projection only C0 in the sample coordinates: its derivative
+         jumps at every voxel face, so on a SHARP phantom a finite difference secants across
+         those kinks and legitimately disagrees with the analytic gradient. Smoothing removes
+         them, and what is left must agree.
 
-    G4b  ADEQUACY of the ray sampling, on the sharp phantom: does the descent DIRECTION stop
-         moving when the rays are sampled twice as finely? MEASURED here, and the answer is
-         reassuring: from n_samples 384 -> 768 the translation block moves 0.1% and the
-         rotation block 0.6%, so 192 already resolves the direction the estimator descends.
+         WHAT "AGREE" MEANS CHANGED ON 2026-07-29, and the bar moved with it. This used to be
+         an AUTOGRAD IDENTITY: one operator, differentiated exactly, so <1% was the right bar.
+         It is now a CROSS-OPERATOR consistency check -- the forward VALUE is LEAP's and the
+         analytic d/dP is ours (branch-aware via `leap_projector.GRAD_MODE = "auto"`; on this
+         gate's SF-branch geometry that is the continuous-corner surrogate `sf_grad_P`,
+         two models that differ by ~3e-3 in value). The finite difference divides that gap by
+         eps, so a step calibrated for the old identity reads as a failure: MEASURED here, the
+         (view 0, tx) probe reads rel 6.0e-1 at eps 1e-2 mm and converges to 1.7e-2 at 0.3 mm
+         as the FD climbs out of the float32 noise floor. Hence the larger steps below, a 6e-2
+         bar, and -- the invariant that actually matters for an estimator -- the DIRECTION
+         check on the probe vector.
 
-         What is NOT stable is any single SMALL component. The (view 2, wz) entry shifts ~17%
-         between n_samples 192 and 768 -- but it is only ~2% of the rotation block's norm, so
-         it perturbs the direction by ~0.4% and does not matter. That is worth knowing mainly
-         as a warning about how to test: probing one small component with finite differences on
-         a sharp phantom will look like a failed gradient when nothing is wrong. Hence G4a.
+    G4b RETIRED 2026-07-29. It measured whether the descent direction stopped moving as the
+        RAY SAMPLING was refined -- a property of the ray-march operator, which no longer
+        exists: the operator is LEAP's separable footprint and integrates the footprint
+        analytically, with no quadrature to converge. Its warning survives as a note, because
+        it is about how to TEST, not about the retired kernel: probing one SMALL gradient
+        component with finite differences on a SHARP phantom looks like a failed gradient when
+        nothing is wrong (the (view 2, wz) entry used to move ~17% while perturbing the
+        direction by ~0.4%). That is why G4a smooths the phantom and reports whole blocks.
+
+        Note what G4a enforces beyond correctness: it is THE RIPPLE GATE. The exact gradient
+        of LEAP's rounded-centre SF model reads +4e-5 on the (view 2, rz) probe while this
+        FD (and the loss trend) reads -3.4e-4 -- opposite signs -- so G4a FAILS if anyone
+        flips `GRAD_MODE` to 'leap' on the SF branch (tried 2026-07-30; the measurement
+        ledger is in `triton_leap_grad`'s docstring). `gate_leap_projector.py` pins the
+        Joseph-branch gradient, where exact and trend coincide.
     """
     print("\nG4  d(loss)/d(theta)")
     dz, dy, dx = SPACING
     Vs = 8                                     # a few views is enough and keeps FD cheap
     P = P_nom[:Vs]
     probes = [(0, 0), (3, 1), (5, 3), (2, 5)]                # (view, dof)
-    eps = {0: 1e-2, 1: 1e-2, 2: 1e-2, 3: 1e-3, 4: 1e-3, 5: 1e-3}
+    eps = {0: 3e-1, 1: 3e-1, 2: 3e-1, 3: 1e-2, 4: 1e-2, 5: 1e-2}   # see G4a's note
 
     torch.manual_seed(0)
     th_true = torch.randn(Vs, 6, device=DEV) * torch.tensor([2., 2., 2., .02, .02, .02], device=DEV)
 
-    def grad_and_fd(x, n_samples, do_fd=True):
-        kw = dict(dx=dx, dy=dy, dz=dz, n_samples=n_samples, view_chunk=8, row_chunk=64)
+    def grad_and_fd(x, do_fd=True):
+        kw = dict(dx=dx, dy=dy, dz=dz)
         with torch.no_grad():
             y = forward_project_3d_batched(
                 x[None, None], params_to_Pmot(th_true, P)[None], u, v, **kw)
@@ -243,39 +256,17 @@ def gate_grad(P_nom, u, v, vol) -> None:
         return g_auto, g_fd
 
     # --- G4a: correctness, kink-free phantom
-    print("     G4a  autograd vs central differences on a C1 (smoothed) phantom")
-    g_auto, g_fd = grad_and_fd(_gauss_blur3(vol, 2.0), 384)
+    print("     G4a  our analytic d/dP vs central differences OF THE LEAP LOSS (C1 phantom)")
+    g_auto, g_fd = grad_and_fd(_gauss_blur3(vol, 2.0))
     for (iv, d) in probes:
         a, f = g_auto[iv, d].item(), g_fd[iv, d].item()
         rel = abs(a - f) / max(abs(f), 1e-12)
-        check(f"grad view{iv} dof{d}", rel < 2e-2, f"autograd {a:+.4e}  fd {f:+.4e}  rel {rel:.1e}")
-
-    # --- G4b: ray-sampling adequacy on the sharp phantom
-    # Translation and rotation are reported SEPARATELY because they carry different units
-    # (1/mm vs 1/rad) and differ by ~an order of magnitude in size, so a single whole-tensor
-    # norm just reports whichever block is bigger and tells you nothing about the other.
-    print("     G4b  gradient stability vs ray sampling (sharp edges)")
-    prev, drifts = None, {}
-    for ns in [192, 384, 768]:
-        g, _ = grad_and_fd(vol, ns, do_fd=False)
-        if prev is not None:
-            drifts[ns] = (
-                float((g[:, :3] - prev[:, :3]).norm() / prev[:, :3].norm()),
-                float((g[:, 3:] - prev[:, 3:]).norm() / prev[:, 3:].norm()),
-            )
-            d = f"trans {drifts[ns][0]:5.1%}  rot {drifts[ns][1]:5.1%}"
-        else:
-            d = "     -"
-        print(f"          n_samples={ns:4d}   |g_trans| = {g[:, :3].norm().item():.3e}"
-              f"   |g_rot| = {g[:, 3:].norm().item():.3e}   drift: {d}")
-        prev = g
-    # A converged descent direction is one that stops moving when the ray sampling is refined.
-    # If 384 -> 768 still shifts the rotation gradient by >10%, the estimator is descending on
-    # an aliasing artefact: raise n_samples (or coarsen the voxels).
-    worst = max(drifts[768])
-    check("ray sampling converged", worst < 0.10,
-          f"384 -> 768: trans {drifts[768][0]:.1%}, rot {drifts[768][1]:.1%}"
-          f"   (estimator n_samples: use >= 384 here)")
+        check(f"grad view{iv} dof{d}", rel < 6e-2,
+              f"analytic {a:+.4e}  fd(LEAP) {f:+.4e}  rel {rel:.1e}")
+    a = torch.stack([g_auto[iv, d] for iv, d in probes])
+    f = torch.stack([g_fd[iv, d] for iv, d in probes])
+    c = float((a @ f) / (a.norm() * f.norm() + 1e-30))
+    check("probe direction", c > 0.99, f"cos = {c:.5f}   (the estimator descends on THIS)")
 
 
 # ======================================================================================
@@ -285,7 +276,7 @@ def gate_recon(P_nom, u, v, vol):
     print("\nG5  reconstruction: static / corrupted / corrected")
     D, H, W = SHAPE
     dz, dy, dx = SPACING
-    fp_kw = dict(dx=dx, dy=dy, dz=dz, n_samples=256, view_chunk=4, row_chunk=64)
+    fp_kw = dict(dx=dx, dy=dy, dz=dz)
     fdk_kw = dict(D=D, H=H, W=W, dx=dx, dy=dy, dz=dz, view_chunk=8)
 
     mask = measured_region_mask(SHAPE, SPACING, CFG, device=DEV)
@@ -301,14 +292,15 @@ def gate_recon(P_nom, u, v, vol):
         y_moved = forward_project_3d_batched(
             vol[None, None], params_to_Pmot(theta, P_nom)[None], u, v, **fp_kw)
 
-        # one scalar, calibrated once against the static case; it is an operator constant
-        # (geometry + filter), not an image-dependent fudge -- reused for every recon below.
-        raw = fdk_conebeam_3d_batched(y_static, P_nom[None], u, v, CFG, scale=1.0, **fdk_kw)[0]
-        scale = calibrate_scale(raw, vol, mask)
-        print(f"     FDK scale calibrated: {scale:.6g}")
-
+        # NO FITTING (2026-07-28): the FDK self-normalizes from the given geometry. What used
+        # to be a calibration is now an ASSERTION -- a residual least-squares fit against the
+        # phantom must come out ~1.0, which is precisely what a units/pitch/voxel error breaks.
         def fdk(y, P):
-            return fdk_conebeam_3d_batched(y, P[None], u, v, CFG, scale=scale, **fdk_kw)[0]
+            return fdk_conebeam_3d_batched(y, P[None], u, v, CFG, **fdk_kw)[0]
+
+        k = calibrate_scale(fdk(y_static, P_nom), vol, mask)
+        print(f"     FDK self-normalization residual fit: {k:.4f} (must be ~1.0)")
+        assert abs(k - 1.0) < 0.05, f"FDK is not self-normalized: residual fit {k:.4f}"
 
         x_static = fdk(y_static, P_nom)                            # no motion at all
         x_uncorr = fdk(y_moved, P_nom)                             # motion, uncorrected  = t=0

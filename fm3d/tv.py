@@ -44,7 +44,13 @@ def sidky_dtv_grad(x: torch.Tensor, wx: float = 1.0, wy: float = 1.0,
 def sidky_dtv_denoise(x: torch.Tensor, iters: int, step: float,
                       wx: float = 1.0, wy: float = 1.0) -> torch.Tensor:
     """Denoise (1,1,H,W) with the Sidky separable directional TV: `iters` normalized
-    steps of size `step`*||z|| along -unit(grad). Winner: iters=15, step=0.1-ish."""
+    steps of size `step`*||z|| along -unit(grad).
+
+    2D BY-EYE SWEET SPOT (do not paraphrase this from memory -- the numbers are small and an
+    order-of-magnitude slip here is invisible): step = 0.03 with kappa 0.3, or step = 0.015 with
+    kappa 0.5. In 2D the by-eye K=1 pick used iters = 15; on our 3D volume the user judged that TV
+    too strong (bone washed out), so 3D runs iters = 5 -- the sharp end of the 2D metric sweep,
+    where the ceiling was flat over 4-8 and x_t got sharper as iters fell. Never below 4."""
     z = x.detach().clone()
     for _ in range(iters):
         g = sidky_dtv_grad(z, wx, wy)
@@ -82,3 +88,55 @@ def sidky_dtv_denoise_3d(x: torch.Tensor, iters: int, step: float, wx: float = 1
         g = sidky_dtv_grad_3d(z, wx, wy, wz)
         z = (z - step * z.norm() * g / (g.norm() + 1e-12)).detach()
     return z
+
+
+# ---------------------------------------------------------------------------------------------
+# The finite-difference operator D and its EXACT adjoint D^T, as separate maps.
+#
+# `sidky_dtv_grad_3d` above computes D^T s(D x) fused -- the TV gradient -- which is all a
+# gradient-descent denoiser needs. ADMM-TV (Boyd et al. 2011, Found. & Trends ML 3(1), Sec. 6.4.1)
+# needs the two halves SEPARATELY: the split variable d lives on the gradient field D x, and the
+# x-subproblem's operator is A^T A + rho D^T D. See `admm_dc_step` in scripts/run_posterior3d.py.
+#
+# ADJOINTNESS IS THE WHOLE POINT and it is easy to get subtly wrong at the boundary. With the
+# forward difference (D x)_i = x_{i+1} - x_i defined on i = 0 .. N-2, the adjoint is
+#     (D^T p)_0     = -p_0
+#     (D^T p)_i     =  p_{i-1} - p_i          0 < i < N-1
+#     (D^T p)_{N-1} =  p_{N-2}
+# which is exactly the "+= on the shifted slice, -= on the unshifted slice" accumulation used
+# below (and, not by accident, the same pattern sidky_dtv_grad_3d already uses). Gated by
+# scripts/gate_tv_adjoint.py -- <D x, p> == <x, D^T p> to float tolerance on random inputs.
+# ---------------------------------------------------------------------------------------------
+
+def grad_forward_3d(x: torch.Tensor):
+    """D x for (1,1,D,H,W) -> (dz, dy, dx), each one voxel shorter along its own axis."""
+    dz = x[..., 1:, :, :] - x[..., :-1, :, :]        # +z (SI)
+    dy = x[..., :, 1:, :] - x[..., :, :-1, :]        # +y
+    dx = x[..., :, :, 1:] - x[..., :, :, :-1]        # +x
+    return dz, dy, dx
+
+
+def div_adjoint_3d(dz: torch.Tensor, dy: torch.Tensor, dx: torch.Tensor,
+                   shape, device=None, dtype=None) -> torch.Tensor:
+    """D^T (dz, dy, dx) -> (1,1,D,H,W). The exact adjoint of `grad_forward_3d` (= -divergence)."""
+    g = torch.zeros(shape, device=device if device is not None else dz.device,
+                    dtype=dtype if dtype is not None else dz.dtype)
+    g[..., 1:, :, :] += dz
+    g[..., :-1, :, :] -= dz
+    g[..., :, 1:, :] += dy
+    g[..., :, :-1, :] -= dy
+    g[..., :, :, 1:] += dx
+    g[..., :, :, :-1] -= dx
+    return g
+
+
+def shrink(a: torch.Tensor, k: float) -> torch.Tensor:
+    """Elementwise soft-threshold S_k(a) = sign(a) * max(|a| - k, 0).
+
+    This is the EXACT prox of k*||.||_1, i.e. the z-update of ADMM for ANISOTROPIC TV (Boyd
+    Sec. 6.4.1). Our TV is separable/anisotropic already (see sidky_dtv_grad_3d, which treats the
+    three axes independently), so the closed form applies directly and no inner Chambolle/FGP
+    loop is needed -- the single strongest practical argument for ADMM over FISTA here.
+    Isotropic TV would instead need the BLOCK shrink (Boyd Sec. 6.4.2), grouping the three
+    components at each voxel; that is NOT what this does."""
+    return torch.sign(a) * torch.clamp(a.abs() - k, min=0.0)
