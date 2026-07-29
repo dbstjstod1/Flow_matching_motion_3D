@@ -57,8 +57,9 @@ continuous centre is a point on the pixel's own ray and its projection is the pi
 and jittering the eval point does not help (the literal gradient is biased, not oscillating:
 jittered mean +3.4e-5, std 3.3e-5). The JOSEPH kernel is bilinear in CONTINUOUS coordinates
 -- no rounding, no ripple -- so ITS exact gradient is the trend (FD parity 4e-4, 100x tighter
-than any SF-branch check). Hence `leap_projector.GRAD_MODE = "auto"`: JOSEPH branch -> this
-module, SF branch -> the surrogate.
+than any SF-branch check). This first shipped as `GRAD_MODE = "auto"` (JOSEPH branch -> this
+module, SF branch -> the surrogate); since the 2026-07-30 `FORCE_JOSEPH` pin there is no SF
+branch left, so the deployed setting is `GRAD_MODE = "leap"` and this module is THE gradient.
 
 The P chain happens OUTSIDE, in torch: `modular_arrays_torch` is the differentiable
 P -> (src, mod, rowv, colv) decomposition and `leap_grad_P` runs the vjp through it, so

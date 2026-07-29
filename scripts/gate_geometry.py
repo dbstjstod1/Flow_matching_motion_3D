@@ -196,8 +196,10 @@ def gate_grad(P_nom, u, v, vol) -> None:
          WHAT "AGREE" MEANS CHANGED ON 2026-07-29, and the bar moved with it. This used to be
          an AUTOGRAD IDENTITY: one operator, differentiated exactly, so <1% was the right bar.
          It is now a CROSS-OPERATOR consistency check -- the forward VALUE is LEAP's and the
-         analytic d/dP is ours (branch-aware via `leap_projector.GRAD_MODE = "auto"`; on this
-         gate's SF-branch geometry that is the continuous-corner surrogate `sf_grad_P`,
+         analytic d/dP is ours (when this was written the dispatch was the branch-aware
+         `GRAD_MODE = "auto"`; the 2026-07-30 `FORCE_JOSEPH` pin removed the SF branch, so
+         the deployed setting is `GRAD_MODE = "leap"` -- but the history matters because on
+         the old SF-branch geometry the gradient was the continuous-corner surrogate `sf_grad_P`,
          two models that differ by ~3e-3 in value). The finite difference divides that gap by
          eps, so a step calibrated for the old identity reads as a failure: MEASURED here, the
          (view 0, tx) probe reads rel 6.0e-1 at eps 1e-2 mm and converges to 1.7e-2 at 0.3 mm
