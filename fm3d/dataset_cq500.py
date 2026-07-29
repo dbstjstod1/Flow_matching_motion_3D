@@ -230,8 +230,8 @@ class CQ500Generator:
         # resampled to the geometry's NATIVE voxel size -- du * SOD/SDD, the detector pitch back-
         # projected to the isocentre, which is LEAP's own reconstruction-grid convention (their
         # `set_default_volume`) -- while the INVERSION (FDK, CG, the estimator's dP, the bridge)
-        # keeps running on the coarse `voxel_mm` grid. Same SF operator, same matched pair, same
-        # call path: THE ONLY CHANGE IS THE GRID THE TRUTH IS SAMPLED ON.
+        # keeps running on the coarse `voxel_mm` grid. Same operator, same call path:
+        # THE ONLY CHANGE IS THE GRID THE TRUTH IS SAMPLED ON.
         #
         # WHY. Simulating on the grid you invert on is the classic inverse crime, and here it had a
         # visible cost: the SF operator integrates the CUBE voxel basis, whose faces carry real

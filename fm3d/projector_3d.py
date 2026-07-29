@@ -90,8 +90,13 @@ The forward operator's VOXEL BASIS decides how much of the ramp is safe to use, 
 when the projector did. The retired ray-march/gridsample forward integrated a TRILINEAR-TENT
 object (grid_sample bilinear), which is band-limited near the voxel Nyquist -- so an unapodized
 ramlak ramp had nothing spurious left to amplify, and "noiseless simulated data, so use the
-sharpest filter" was a sound argument. The SF pair integrates the CUBE (piecewise-constant) basis
-that separable-footprint is defined for. A piecewise-constant object carries real spectral energy
+sharpest filter" was a sound argument. Its successor, our SF pair, integrated the CUBE
+(piecewise-constant) basis that separable-footprint is defined for -- and so does LEAP's own SF
+kernel, which is why this section was written. (Since the 2026-07-30 Joseph pin the deployed
+forward is a ray-driven TENT-basis model again, so the cube-basis texture below is history, not
+a live constraint: measured, the 1 mm ram-lak texture fell 18-21 -> 3.5-5.0 HU. The apodization
+argument is kept because it is what the ramp default rests on.)
+A piecewise-constant object carries real spectral energy
 ABOVE the sampling Nyquist -- the voxel faces -- and our detector resolves it (0.64 mm pitch is
 0.42 mm at isocenter against 1 mm voxels), so ramlak reconstructs the voxel grid itself as a
 crosshatch texture.

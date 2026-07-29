@@ -125,8 +125,10 @@ def data_grad(x_mu, theta, y, gen, views=None):
 
 
 def _adjoint(s, P, gen):
-    """A_P^T s -- the SF pair's exact transpose (gen.adjoint routes to triton_sf.sf_backproject;
-    same weight code as the forward, gathered per voxel, identity ~1e-6 in gate_sf_projector).
+    """A_P^T s -- LEAP's modular VD backprojector (gen.adjoint -> leap_backproject, mode
+    'VD'). NOT the exact transpose of the forward: with the forward pinned to LEAP's Joseph
+    kernel neither of LEAP's backprojectors is, and the defect is MEASURED, not asserted
+    (gate_leap_projector T2: 3.5e-4 on a real sinogram, 1.3e-2 on white noise).
 
     HISTORY, because three regimes preceded this one and their lessons are in the memories: the
     autograd-of-a-zero-forward route (wasted a full march per call), the direct ray-march
@@ -347,7 +349,7 @@ def admm_dc_step(x_mu, theta, y, gen, state, *, rho, thresh, iters=5, views=None
             return gen.project(v[None, None], P[None])[0]
 
     def AT(s):
-        # the SF matched transpose, exactly as in cg_dc_step
+        # LEAP's VD backprojector, exactly as in cg_dc_step
         return _adjoint(s, P, gen)
 
     def DtD(v):
@@ -751,21 +753,25 @@ def main():
                     help="CG iterations per data step (early stopping IS the regularizer)")
     ap.add_argument("--cg_lam", type=float, default=0.0,
                     help="proximal pull toward the warm start; 0 = truncated-Krylov only (DDS)")
-    # ---- THE OPERATOR (2026-07-28, user decision, retraining accepted) --------------------
-    # There is no operator knob anymore: forward_project_3d_batched and gen.adjoint route every
-    # call -- estimator (d/dP included), CG/ADMM pair, y simulation, trainer bridge -- to the SF
-    # matched pair (fm3d/triton_sf). The retired flavors and why, so nobody reinvents them:
+    # ---- THE OPERATOR (2026-07-29/30, user decisions, retraining accepted) ----------------
+    # There is no operator knob anymore. forward_project_3d_batched and gen.adjoint route every
+    # call -- estimator (d/dP included), CG/ADMM pair, y simulation, trainer bridge, FDK -- to
+    # LEAP modular-beam: forward = LEAP's JOSEPH kernel, PINNED (leap_projector.FORCE_JOSEPH,
+    # via our patch to the vendored library, refs/LEAP/FM3D_PATCH.md, so the geometry can no
+    # longer flip the model mid-run); backward = LEAP's VD backprojector, which also carries
+    # our FDK (leap_fdk_backproject folds LEAP's ray weight back to our 1/w^2 convention).
+    # The retired flavors and why, so nobody reinvents them:
     #   ray-march + scatter transpose   exact pair, but the scatter was 3.9 s/application
     #                                   (L2-footprint-bound floor; kernel-launch-retune memory);
     #   unmatched voxel gather          the RTK/ASTRA/TIGRE standard, 35x cheaper -- and -0.5 dB
     #                                   in the A/B (B A nonsymmetric; unmatched-cg memory);
-    #   SF matched pair (KEPT)          gather speed in BOTH directions, matched to ~1e-6, and
-    #                                   the geometry gradient nobody ships (sf-projector memory).
-    #   LEAP modular-beam (DEPLOYED)   their optimized kernels, 2.6x the SF pair's round trip
-    #                                   at the simulation grid; adjoint 'VD', self-adjointness
-    #                                   1.9e-4 (leap-crosscheck memory, diag_leap_crosscheck).
-    # `projector_3d.reference_project_3d_batched` is the gates' reference pair; nothing in
-    # production can reach it.
+    #   our SF matched pair             matched to ~1e-6 and the only one with a geometry
+    #                                   gradient at the time -- now gates-only (triton_sf);
+    #                                   LEAP's own SF kernel is what the Joseph pin excludes.
+    # The ONE operator in production that is not LEAP's: triton_backproject.backproject_tangent,
+    # the bridge's analytic ds-derivative, because LEAP ships no tangent (trainer only; the
+    # value alongside it comes from LEAP). `reference_project_3d_batched` is the gates'
+    # independent pair; nothing in production can reach it.
     # ---- ADMM-TV (the STANDARD form; see admm_dc_step) -----------------------------------
     # NOTE rho is NOT cg_lam: rho multiplies D^T D, cg_lam multiplies I. Different operators.
     # Only lam/rho sets the soft threshold; rho alone conditions the CG system.
