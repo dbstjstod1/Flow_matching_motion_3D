@@ -142,62 +142,6 @@ def _adjoint(s, P, gen):
         return gen.adjoint(s[None], P[None])[0, 0]
 
 
-def sart_step(x_mu, theta, y, gen, beta, views=None, eps=1e-3):
-    """One SART update (Andersen & Kak 1984), the algebraic-reconstruction data step:
-
-        x_j <- x_j + beta * [ sum_i a_ij (y_i - [Ax]_i) / sum_l a_il ] / sum_i a_ij
-
-    i.e.  x <- x + beta * V^-1 A^T [ W (y - A x) ],  W = diag(1/sum_l a_il),  V = A^T 1.
-
-    NOTE V = A^T(1), NOT A^T(W 1). Using the weighted version shrinks the denominator by roughly
-    the mean ray length (~150 mm here) and the update overshoots by that same factor: measured,
-    x_t ran 0.9 -> -44 -> -90 -> -135 dB, a steady ~180x per step that matches 1/mean(rowsum).
-
-    WHY THIS AND NOT THE RAW ADJOINT. `data_grad` returns A^T(Ax - y) with NO normalization, and
-    A^T A has a ~1/|f| kernel, so the raw direction is dominated by low frequencies: MEASURED with
-    the TRUE theta on val 0, a normalized raw-adjoint step buys +0.09 dB (alpha 0.02) while the
-    same theta put through a filtered reconstruction buys +10.07 dB. SART's two diagonal weights
-    are the cheap, classical preconditioner for exactly that ill-conditioning:
-
-      W (row / ray normalization)   divides each ray's residual by its path length through the
-                                    volume, so long and short rays contribute comparably;
-      V^-1 (column / voxel normalization) divides each voxel's correction by the total ray weight
-                                    that reached it. On a cone beam this matters a lot -- axial
-                                    coverage is very uneven (the reason `measured_region_mask`
-                                    exists), so the raw adjoint over-corrects the centre and
-                                    under-corrects the periphery.
-
-    It sits BETWEEN the two extremes: better conditioned than the raw adjoint, but still a
-    relaxed algebraic step rather than a full filtered reconstruction, so a still-wrong theta is
-    not stamped into the image the way 2D's DDNM did ("consistency != quality when theta is
-    wrong", see the 2D memory).
-
-    W and V depend on the geometry, which moves with theta, so both are recomputed per call.
-
-    BOTH WEIGHTS NEED A SUPPORT MASK, and skipping it makes SART explode rather than degrade.
-    On a cone beam a large part of a 256^3 box is outside the FOV, so:
-      * rays that miss the object have row sum ~0, and a bare 1/row hands them a ~1e6 weight;
-      * voxels no ray reaches have V ~0, and corr/V is then unbounded.
-    A `clamp_min(1e-6)` does NOT save either case -- it just sets the blow-up scale. Measured with
-    a plain clamp: x_t ran 0.61 -> -42 -> -88 dB in three steps. So both weights are thresholded
-    RELATIVE to their own maxima and the update is written only on the supported voxels.
-    """
-    P = params_to_Pmot(theta, gen.P_nom)
-    if views is not None:
-        P, y = P[views], y[views]
-    with torch.no_grad():
-        ones = torch.ones_like(x_mu)
-        row = gen.project(ones[None, None], P[None])[0]      # sum_l a_il
-        W = torch.where(row > eps * row.max(), 1.0 / row.clamp_min(eps), torch.zeros_like(row))
-        resid = y - gen.project(x_mu[None, None], P[None])[0]
-    V = _adjoint(torch.ones_like(row), P, gen)                              # A^T 1 = sum_i a_ij
-    corr = _adjoint(W * resid, P, gen)
-    good = V > eps * V.max()                       # voxels any ray actually reached
-    upd = torch.zeros_like(corr)
-    upd[good] = corr[good] / V[good]
-    return x_mu + beta * upd
-
-
 def fdk_dc_step(x_mu, theta, y, gen, eta, meas, views=None):
     """Filtered-residual (FDK-preconditioned) soft data step:
 
@@ -218,7 +162,7 @@ def fdk_dc_step(x_mu, theta, y, gen, eta, meas, views=None):
     Because the FDK is self-normalized so FDK(A x) ~= x inside the barrel, the update is ~
     (1-eta) x + eta FDK(y) there -- but the RESIDUAL form (not a blend) is what leaves null-space
     and never-measured content to the prior. Outside `meas` the FDK of the residual is built from
-    partial coverage, so the update is gated to the barrel, like sart_step's support mask.
+    partial coverage, so the update is gated to the barrel (the `measured_region_mask` support).
 
     Two cautions, and the knobs that answer them:
       * FDK is NOT A^T (an unmatched projector/backprojector pair, Zeng & Gullberg 2000): eta = 1
@@ -770,20 +714,17 @@ def main():
     # HIGH -- and SART's row/column weights are a SPATIAL correction that cannot flatten a
     # spectrum. Confirmed by eye too (data/dcop_zoom_xt3.png): adj's x_t is waxy with a blunted
     # inner table, cg reproduces the GT's irregular one.
-    ap.add_argument("--dc_op", default="cg", choices=["adj", "sart", "fdk", "cg", "admm"],
+    # `sart` (and its --sart_beta / --sart_beta_red knobs) was REMOVED 2026-08-06: it lost the
+    # 5-way A/B above on every axis and the old drivers that exercised it (drive_dcop_compare,
+    # drive_dc_fair3, drive_isocost_dc, drive_day3) are archival records, not rerun targets.
+    ap.add_argument("--dc_op", default="cg", choices=["adj", "fdk", "cg", "admm"],
                     help="cg (DEFAULT, winner) = DDS-style short CG solve with the matched "
                          "adjoint (see cg_dc_step). admm = the STANDARD ADMM-TV form (Boyd "
                          "Sec. 6.4.1; = DDS's own 3D solver) -- CG x-update + exact TV prox + "
                          "dual; it SUBSUMES the TV corrector, so --kappa is ignored with it. "
                          "fdk = filtered-residual FDK-preconditioned step, 2nd place, ~2x cheaper "
                          "(see fdk_dc_step). adj = normalized raw-adjoint soft step (the 2D "
-                         "recipe; only +0.09 dB even at the TRUE theta). sart = SART's "
-                         "row/column-normalized algebraic update (its weights are diagonal, not "
-                         "spectral).")
-    ap.add_argument("--sart_beta", type=float, default=1.0,
-                    help="SART relaxation beta (TIGRE default 1.0)")
-    ap.add_argument("--sart_beta_red", type=float, default=0.99,
-                    help="beta *= this each ODE step (TIGRE's beta_red)")
+                         "recipe; only +0.09 dB even at the TRUE theta).")
     # ---- fdk / cg data steps (the SPECTRAL preconditioners) ------------------------------
     # eta ramps UP with t -- eta_min + (eta - eta_min) * t^p -- because a filtered step stamps a
     # still-wrong theta into x_t (2D's DDNM lesson), and theta converges as t grows. This is the
@@ -1191,7 +1132,6 @@ def main():
     # theta is refit every step -- so u accumulates residuals against a drifting operator, a
     # situation no source addresses. If it misbehaves, damp or reset u once theta has settled.
     admm_state = {}
-    sart_beta = args.sart_beta             # decays by sart_beta_red each step
     ng = args.asd_ng or args.tv_iters
     N = args.n_steps
     x_cold = x.clone()                     # the uncorrected FDK -- where every pass starts
@@ -1214,7 +1154,7 @@ def main():
         if kk == 0 and k > 0:
             x = x_cold.clone()
             admm_state.clear()
-            sart_beta, dtvg = args.sart_beta, None
+            dtvg = None
             gtile = torch.Generator(device=dev).manual_seed(args.seed + k)
             print(f"---- pass {k // N + 1}/{args.passes}: ODE restarts from the cold FDK, "
                   f"estimator carries over (rot {motion_error(est.current_params(), theta_true, cfg=cfg)['rot_rmse_deg']:.3f} deg)",
@@ -1258,9 +1198,7 @@ def main():
                 dc_v = torch.randperm(cfg.n_views, device=dev)[:args.dc_views]
             # ---- DATA STEP ------------------------------------------------------------
             z_pre = z
-            if args.dc_op == "sart":
-                z = sart_step(z, theta, y[0], gen, sart_beta, views=dc_v)
-            elif args.dc_op == "fdk":
+            if args.dc_op == "fdk":
                 eta = args.fdk_eta_min + (args.fdk_eta - args.fdk_eta_min) * (t ** args.fdk_eta_p)
                 z = fdk_dc_step(z, theta, y[0], gen, eta, meas, views=dc_v)
             elif args.dc_op == "cg":
@@ -1295,7 +1233,6 @@ def main():
                 # every other dc_op.
                 z = z + args.kappa * (sidky_dtv_denoise_3d(
                     z[None, None], args.tv_iters, args.tv_step)[0, 0] - z)
-        sart_beta *= args.sart_beta_red
         # Per-step movement budget: how far the FM prior moved the volume, how far the data step
         # then moved it, how far TV did. `cg` is not a small nudge but a SOLVE (every iteration
         # takes the optimal step along its residual direction), so dc/fm grows with --cg_iters.

@@ -321,34 +321,6 @@ class ConeBeam3DConfig:
                 f"  -> FOV diam {self.fov_diameter_mm():.1f}mm | axial cov "
                 f"{self.axial_coverage_mm():.1f}mm | det pitch @iso {self.iso_pitch_mm():.3f}mm")
 
-    # ---- where FDK is actually defined -------------------------------------------
-    def valid_recon_shape(self, spacing, *, fov_frac: float = 1.0,
-                          axial_frac: float = 1.0, max_shape=None) -> tuple[int, int, int]:
-        """Largest (D,H,W) box, centred on the isocentre at `spacing` mm, that stays inside
-        the measured region: the transaxial FOV cylinder and the axial cone coverage.
-
-        The RECON grid and the OBJECT grid are DIFFERENT choices and want opposite things.
-        The object fed to the forward projector must hold the WHOLE patient, or its line
-        integrals are wrong (a diverging cone still sees tissue past the nominal coverage --
-        223.3 mm of z at the exit surface vs 198.7 mm at the isocentre). The reconstruction
-        grid must stay INSIDE the measured region, because outside it FDK has no data and
-        produces cone-angle and truncation artifacts that have nothing to do with motion.
-        Conflating the two (one `--grid` for both) is what inflated the recon floor to 0.12-0.44
-        NET RMSE and made a laterally-cropped patient's motion compensation diverge.
-
-        The box CIRCUMSCRIBES the FOV cylinder, so its corners still fall outside; pair it with
-        `fov_cylinder_mask` for metrics and patch sampling. `fov_frac`/`axial_frac` < 1 back off
-        from the exact boundary, where FDK is defined but Feldkamp's approximation is weakest.
-        """
-        dx, dy, dz = spacing
-        r = 0.5 * self.fov_diameter_mm() * float(fov_frac)
-        hz = 0.5 * self.axial_coverage_mm() * float(axial_frac)
-        shp = (max(2, 2 * int(hz / dz)), max(2, 2 * int(r / dy)), max(2, 2 * int(r / dx)))
-        if max_shape is not None:
-            shp = tuple(min(a, b) for a, b in zip(shp, max_shape))
-        return shp
-
-
 def measured_region_mask(shape, spacing, cfg: ConeBeam3DConfig, *, fov_frac: float = 1.0,
                          axial_frac: float = 1.0, device="cpu") -> "torch.Tensor":
     """(D,H,W) bool: voxels that every view actually measures. A BARREL, not a cylinder.
@@ -387,10 +359,6 @@ def measured_region_mask(shape, spacing, cfg: ConeBeam3DConfig, *, fov_frac: flo
     mag = (cfg.SOD - r).clamp_min(1e-6) / cfg.SDD
     a = float(axial_frac)
     return (r <= R) & (zz >= a * v_lo * mag) & (zz <= a * v_hi * mag)
-
-
-# back-compat alias; the cylinder was wrong at the corners (see above)
-fov_cylinder_mask = measured_region_mask
 
 
 def build_conebeam_orbit(
