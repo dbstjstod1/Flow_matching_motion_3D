@@ -78,12 +78,14 @@ class Gen:
         """to_net is affine, so a DERIVATIVE maps with the gain only (no -1 shift)."""
         return 2.0 * dmu / (self.mu_hi - self.mu_lo)
 
-    def fdk_tangent(self, y, P, Pdot):
+    def fdk_tangent(self, y, P, Pdot, filtered=None):
+        # `filtered` is the trainer's one-ramp-per-draw reuse (dataset_cq500.Gen.fdk_filtered);
+        # this stub only has to accept and forward it -- `bridge_pair` passes it through.
         vw, vwd = view_angular_weights_dot(P, Pdot)
         return fdk_conebeam_3d_tangent(
             y, P, Pdot, self.uc, self.vc, self.cfg, D=self.shape[0], H=self.shape[1],
             W=self.shape[2], dx=self.dx, dy=self.dy, dz=self.dz, scale=None,
-            view_chunk=8, view_weight=vw, view_weight_dot=vwd)
+            view_chunk=8, view_weight=vw, view_weight_dot=vwd, filtered=filtered)
 
     def project(self, v, P):
         return forward_project_3d_batched(v, P, self.uc, self.vc, dx=self.dx, dy=self.dy,

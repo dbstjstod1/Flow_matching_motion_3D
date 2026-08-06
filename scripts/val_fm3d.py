@@ -71,7 +71,7 @@ _VAL_CACHE: dict[tuple, dict] = {}
 
 
 def run_validation(model, gen, meas, out_dir, *, it=0, patients=3, patch=64, ode_steps=50,
-                   anchor="static", trans_mm=10.0, rot_deg=10.0, blend="hann", n_offsets=1,
+                   anchor="static", trans_mm=10.0, rot_deg=10.0, blend="uniform", n_offsets=2,
                    tile_batch=64, writer=None, dev="cuda"):
     """Prior-ONLY ODE from the cold start, on `patients` fixed val cases. Returns the per-patient
     metrics AND the montage paths, and (if given) logs scalars + images to a tensorboard writer.
@@ -81,11 +81,29 @@ def run_validation(model, gen, meas, out_dir, *, it=0, patients=3, patch=64, ode
     The fixed seed (1000 + i) means the SAME motion is scored at every checkpoint, so the curve
     tracks the prior improving and not the luck of the draw.
 
+    THE PATCH->VOLUME SCHEME IS THE DEPLOYED ONE (uniform K=2, changed from hann K=1 on
+    2026-07-31, user's call): the archive paper's non-overlapping random tilings
+    (arXiv:2512.18161), which is exactly what `run_posterior3d.fm_predict` runs at inference.
+    Validating in a scheme the deployed loop does not use measured a quantity nothing consumes.
+    It is also 2.5x cheaper, which is what makes the inline val affordable at a shorter
+    --val_every. The A/B that justifies BOTH halves (500k prior, 3 val patients, data/blend_cmp/):
+
+        uniform K=2   25.35 dB / SSIM 0.765   11.2 min      <- deployed, and now validated
+        hann    K=1   25.42 dB / SSIM 0.765   27.5 min      <- what this used to run
+        uniform K=1   24.96 dB / SSIM 0.749                 <- seams intact; never use
+
+    So the historical val curve stays comparable to the new one to within 0.07 dB (well under
+    the run-to-run noise), and no checkpoint needs re-scoring. K=1 with `uniform` is REFUSED
+    below rather than silently run, exactly as run_posterior3d refuses it.
+
     The REFERENCE is the static FDK for anchor in ("static", "none") -- for "none" too, because
     the scanner-achievable still image is the only honest yardstick a bare-bridge prior has (it
     was previously scored against the GT, silently) -- and the GT volume only for anchor="gt".
     `tile_batch` is the patch batch of the blended prior evaluation; 64 (the training batch)
     rather than prior_patch's tiny default 8, which left the GPU mostly idle."""
+    if blend == "uniform" and n_offsets < 2:
+        raise ValueError("blend='uniform' needs n_offsets >= 2 (a single non-overlapping pass "
+                         "leaves tile seams, -0.4 dB; see data/blend_cmp/)")
     spacing = (gen.dz, gen.dy, gen.dx)
     rows, paths = [], []
     for i in range(patients):
@@ -114,10 +132,17 @@ def run_validation(model, gen, meas, out_dir, *, it=0, patients=3, patch=64, ode
         m0 = ent["m0"]
         with torch.no_grad():
             gtor = torch.Generator(device=dev).manual_seed(1000 + i) if n_offsets > 1 else None
+            # amp=True is EXPLICIT here because it changes the number this function reports.
+            # The deployed loop's prior forward is fp16 (`run_posterior3d --prior_amp`, on by
+            # default since 2026-07-25) and so is the regime the 500k weights were trained in;
+            # this path silently stayed fp32 until 2026-08-04, costing 1.6x for a precision
+            # nothing ships. The val curve therefore shifts slightly at that date -- by well
+            # under the 0.07 dB the blend A/B already treats as noise, but it is a shift, so
+            # pass amp=False to reproduce a pre-2026-08-04 val number exactly.
             x1_mu = gen.from_net(prior_ode(model, gen.to_net(x0_mu)[None, None], n_steps=ode_steps,
                                            patch=patch, stride=patch // 2, batch=tile_batch,
                                            context="auto", blend=blend, n_offsets=n_offsets,
-                                           generator=gtor)[0, 0])
+                                           generator=gtor, amp=True)[0, 0])
         # GAUGE-AWARE: rigidly align to the target before scoring. Raw PSNR penalises the
         # unobservable global pose the prior is free to shift; the aligned number is the honest
         # one (see fm3d/reg_metric.py, and the SE(3) gauge in memory).
@@ -132,7 +157,8 @@ def run_validation(model, gen, meas, out_dir, *, it=0, patients=3, patch=64, ode
         montage(p, [(x0_mu, f"x_t=0 cold FDK\n{m0['psnr_aligned']:.2f} dB"),
                     (x1_mu, f"prior ODE {ode_steps} -> t=1\n{m1['psnr_aligned']:.2f} dB"),
                     (ref_mu, f"target (ref={ref_kind})")],
-                f"fm3d it {it} | CQ500 patient {pid} | prior-only ODE (aligned, ref={ref_kind}) | "
+                f"fm3d it {it} | CQ500 patient {pid} | prior-only ODE (aligned, ref={ref_kind}, "
+                f"blend={blend} K={n_offsets}) | "
                 f"cold {m0['psnr_aligned']:.2f} -> {m1['psnr_aligned']:.2f} dB")
         paths.append(p)
         if writer is not None:
@@ -148,6 +174,11 @@ def run_validation(model, gen, meas, out_dir, *, it=0, patients=3, patch=64, ode
             img = mpimg.imread(p)                                   # (H,W,4) float
             writer.add_image(f"val/p{i}", torch.from_numpy(img[..., :3]).permute(2, 0, 1), it)
     return it, mean, rows
+
+
+def resolve_ckpt(p):
+    """A .pth path, or a run dir (-> its ckpt_last.pth)."""
+    return os.path.join(p, "ckpt_last.pth") if os.path.isdir(p) else p
 
 
 def evaluate(ckpt, gen, meas, args, dev):
@@ -180,33 +211,50 @@ def main():
                     help="which target to SCORE against -- must match how the ckpt was trained")
     ap.add_argument("--trans_mm", type=float, default=10.0)   # PEAK-TO-PEAK
     ap.add_argument("--rot_deg", type=float, default=10.0)    # PEAK-TO-PEAK
-    ap.add_argument("--blend", default="hann", choices=["hann", "uniform"],
-                    help="hann = overlapping Hann-window blend (family A, ours); uniform = "
-                         "non-overlapping random tilings averaged (family B, arXiv:2512.18161 -- "
-                         "pass --n_offsets>=2)")
-    ap.add_argument("--n_offsets", type=int, default=1,
-                    help="tile grids blended per ODE step (family B's K; K=2 optimal there)")
+    ap.add_argument("--blend", default="uniform", choices=["hann", "uniform"],
+                    help="uniform (DEFAULT) = the DEPLOYED scheme: non-overlapping random "
+                         "tilings averaged (family B, arXiv:2512.18161), i.e. what "
+                         "run_posterior3d actually runs, and 2.5x cheaper. hann = overlapping "
+                         "Hann-window blend (family A, ours) -- what the val curve used before "
+                         "2026-07-31; the two agree to 0.07 dB (see run_validation).")
+    ap.add_argument("--n_offsets", type=int, default=2,
+                    help="tile grids blended per ODE step (family B's K; K=2 is optimal and is "
+                         "the deployed value). MUST be >=2 with --blend uniform.")
     ap.add_argument("--watch", action="store_true",
                     help="re-evaluate ckpt_last.pth whenever its iter advances")
     ap.add_argument("--poll", type=int, default=600)
     args = ap.parse_args()
 
     dev = "cuda"
-    cfg = ConeBeam3DConfig.thies()
+    ck_path = resolve_ckpt(args.ckpt)
+    if args.watch:
+        # --watch is meant to be launchable BEFORE the trainer writes its first checkpoint, so
+        # the args read below must WAIT for the file rather than crash on it. resolve_ckpt is
+        # re-run each poll because the run DIRECTORY itself may not exist yet either (a path
+        # that is not a dir resolves to itself, then becomes dir/ckpt_last.pth once it appears).
+        while not os.path.exists(ck_path):
+            print(f"[watch] waiting for {ck_path} (poll every {args.poll}s)", flush=True)
+            time.sleep(args.poll)
+            ck_path = resolve_ckpt(args.ckpt)
+    # GEOMETRY AND SIMULATION GRID COME OFF THE CHECKPOINT, not off this script's defaults --
+    # the same contract build_world enforces in run_posterior3d. Reading them here matters
+    # because `evaluate` below rebuilds only the MODEL from the ckpt: a ckpt trained at a
+    # different --views, or with --sim_grid coarse, would otherwise be scored against a
+    # silently different scan and the curve would not be comparable to the trainer's inline val.
+    _ca = torch.load(ck_path, map_location="cpu", weights_only=False).get("args", {})
+    cfg = ConeBeam3DConfig.thies(n_views=_ca.get("views", 360))
     gen = CQ500Generator(args.root, cfg=cfg, device=dev, split=args.split,
-                         shape=tuple(args.shape), voxel_mm=1.0, verbose=True)
+                         shape=tuple(args.shape), voxel_mm=1.0, verbose=True,
+                         sim_native=(_ca.get("sim_grid", "native") == "native"))
     meas = measured_region_mask(gen.shape, (1.0, 1.0, 1.0), cfg, device=dev)
 
-    def resolve(p):
-        return os.path.join(p, "ckpt_last.pth") if os.path.isdir(p) else p
-
     if not args.watch:
-        evaluate(resolve(args.ckpt), gen, meas, args, dev)
+        evaluate(ck_path, gen, meas, args, dev)
         return
 
     seen = -1
     while True:
-        ck = resolve(args.ckpt)
+        ck = resolve_ckpt(args.ckpt)
         if os.path.exists(ck):
             it = torch.load(ck, map_location="cpu", weights_only=False).get("iter", 0)
             if it > seen:

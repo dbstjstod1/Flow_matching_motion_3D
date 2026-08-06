@@ -129,34 +129,24 @@ def modular_arrays(P: torch.Tensor, u0: float, v_off: float):
             out[2].copy(order="C"), out[3].copy(order="C"))
 
 
-_WARNED: set = set()
+# ---------------------------------------------------------------------------------------
+# GATE / DIAGNOSTIC ONLY, below: the COUNTERFACTUAL "which kernel would STOCK LEAP have run
+# here?". Production never asks -- our patched libleapct sets `useSF = false` for modular
+# geometry in `_model`, so the answer is unconditionally JOSEPH and there is no branch left
+# to take. These two survive so `gate_leap_projector` can prove the pin is doing work: on the
+# NOMINAL orbit stock LEAP would have picked SF, and the deployed library must not.
 
 
-FORCE_JOSEPH = True          # our patched libleapct pins the modular forward (see _model)
+def stock_kernel_kind(P, *, nv, du, dv, dx, dz, D, H, W) -> str:
+    """What UNPATCHED LEAP would pick for this geometry: 'SF' or 'JOSEPH'. Gates only.
 
-
-def kernel_kind(P, *, nv, du, dv, dx, dz, D, H, W) -> str:
-    """Which modular kernel LEAP ACTUALLY runs for this geometry: 'SF' or 'JOSEPH'.
-
-    With `FORCE_JOSEPH` (the deployed state since 2026-07-30) the answer is always 'JOSEPH':
-    our patched libleapct sets `useSF = false` for modular geometry, so the branch below is
-    dead in production and survives only to document what STOCK LEAP would do -- and to let
-    the gates ask the counterfactual ("would this geometry have been SF?").
-
-    STOCK behaviour, replicated below from `projectors_Joseph.cu`: SF runs only when
+    Replicated from `projectors_Joseph.cu`: SF runs only when
     `modularbeamIsAxiallyAligned() && useSF`. The first condition (`set_sourcesAndModules`) is
     the one `sf_branch` does NOT cover and the one MOTION trips: every view's unit rowVector
     must keep z >= 0.9961 (a 5.06-degree panel tilt) and the source z-span must stay under
     half the panel height. One view past the bar flipped the WHOLE geometry, silently and
     mid-estimation -- which is what the patch removes (refs/LEAP/FM3D_PATCH.md).
     """
-    if FORCE_JOSEPH:
-        return "JOSEPH"
-    return stock_kernel_kind(P, nv=nv, du=du, dv=dv, dx=dx, dz=dz, D=D, H=H, W=W)
-
-
-def stock_kernel_kind(P, *, nv, du, dv, dx, dz, D, H, W) -> str:
-    """What UNPATCHED LEAP would pick for this geometry. Gates/diagnostics only."""
     C, _, e_v, _, _ = decompose_P(P)
     axial = bool((e_v[:, 2] >= 0.9961).all()) and \
         float(C[:, 2].max() - C[:, 2].min()) <= 0.5 * nv * dv
@@ -167,7 +157,7 @@ def stock_kernel_kind(P, *, nv, du, dv, dx, dz, D, H, W) -> str:
 
 
 def sf_branch(P, *, du, dv, dx, dz, D, H, W):
-    """Does LEAP take its SEPARABLE-FOOTPRINT kernel for this configuration, or fall back?
+    """GATE-ONLY: would STOCK LEAP take its SEPARABLE-FOOTPRINT kernel here, or fall back?
 
     `projectors_Joseph.cu` picks the modular projector like this:
 
@@ -201,15 +191,9 @@ def sf_branch(P, *, du, dv, dx, dz, D, H, W):
 def _set_geometry(leap, P, *, nv, nu, du, dv, u0, v_off, D, H, W, dx, dy, dz):
     if abs(dx - dy) > 1e-9:
         raise ValueError(f"LEAP wants a square in-plane voxel (dx == dy), got {dx} vs {dy}")
-    key = (nv, nu, round(du, 6), round(dv, 6), D, H, W, round(dx, 6), round(dz, 6))
-    if key not in _WARNED:
-        _WARNED.add(key)
-        ok, detail = sf_branch(P, du=du, dv=dv, dx=dx, dz=dz, D=D, H=H, W=W)
-        if not ok:
-            import warnings
-            warnings.warn("LEAP is falling back to its Joseph ray-driven projector for this "
-                          f"configuration -- a DIFFERENT operator model: {detail}. See "
-                          "`leap_projector.sf_branch`.", RuntimeWarning, stacklevel=3)
+    # NO kernel-selection check here any more: `_model` pins the modular forward to Joseph, so
+    # there is nothing to fall back to and nothing to warn about (the pre-pin version warned
+    # per geometry key and cost a `decompose_P` to do it).
     src, mod, rowv, colv = modular_arrays(P, u0, v_off)
     if not leap.set_modularbeam(P.shape[0], nv, nu, dv, du, src, mod, rowv, colv):
         raise RuntimeError("LEAP rejected the modular geometry")
@@ -218,17 +202,63 @@ def _set_geometry(leap, P, *, nv, nu, du, dv, u0, v_off, D, H, W, dx, dy, dz):
     leap.set_diameterFOV(_FOV_MM)
 
 
+_ALLOC_NOTE = """WHY EVERY LEAP CALL IS CHECKED FOR ALL-ZERO VIEWS (added 2026-08-03).
+
+LEAP allocates its own CUDA memory (`cudaMalloc3DArray` for the volume texture) OUTSIDE torch's
+caching allocator. Torch does not return freed blocks to the driver, so on a memory-hungry
+caller LEAP can fail to allocate on a GPU that torch reports as half empty -- observed exactly
+once at iteration ~25 of the Thies quality-metric training, which holds sixteen 128^3 volumes
+plus float64 VIF temporaries:
+
+    cudaMalloc3DArray Error: out of memory
+
+AND NOTHING RAISED. `leapctype.project_gpu` sets `restype = c_bool` and then **discards the
+return value**, handing back the output tensor it was given -- which we pre-fill with
+`torch.zeros`. So an allocation failure produces a SILENTLY ALL-ZERO sinogram. Downstream that
+is a blank reconstruction, a VIF* target computed against a blank volume, and a training pair
+that is pure noise, with no error anywhere. On a 56-hour run that is unacceptable.
+
+A real head projection has no all-zero view, so the check below is unambiguous. On a hit we
+`empty_cache()` (which returns torch's unused blocks to the driver, the actual fix for this
+class of failure) and retry ONCE; a second failure raises rather than corrupting the caller.
+This costs one `amax` reduction per call (~1 ms on a 504 MB sinogram)."""
+
+
+def _zero_views(g: torch.Tensor) -> torch.Tensor:
+    """(B,V) mask of views that came back identically zero."""
+    return g.reshape(g.shape[0], g.shape[1], -1).abs().amax(-1) == 0
+
+
 def leap_project(vol, P, *, nv, nu, dx, dy, dz, du, dv, u0=0.0, v_off=0.0):
-    """Forward projection. vol (B,D,H,W) fp32 cuda -> sinogram (B,V,nv,nu). No autograd."""
+    """Forward projection. vol (B,D,H,W) fp32 cuda -> sinogram (B,V,nv,nu). No autograd.
+
+    Raises if LEAP silently returned zeros -- see `_ALLOC_NOTE`."""
     B, D, H, W = vol.shape
     V = P.shape[1]
     vol = vol.contiguous()
     leap = _model(vol.device)
-    g = torch.zeros((B, V, nv, nu), device=vol.device, dtype=torch.float32)
-    for b in range(B):
-        _set_geometry(leap, P[b], nv=nv, nu=nu, du=du, dv=dv, u0=u0, v_off=v_off,
-                      D=D, H=H, W=W, dx=dx, dy=dy, dz=dz)
-        leap.project_gpu(g[b], vol[b])
+
+    def _run():
+        g = torch.zeros((B, V, nv, nu), device=vol.device, dtype=torch.float32)
+        for b in range(B):
+            _set_geometry(leap, P[b], nv=nv, nu=nu, du=du, dv=dv, u0=u0, v_off=v_off,
+                          D=D, H=H, W=W, dx=dx, dy=dy, dz=dz)
+            leap.project_gpu(g[b], vol[b])
+        return g
+
+    g = _run()
+    bad = _zero_views(g)
+    if bad.any() and vol.abs().amax() > 0:
+        torch.cuda.empty_cache()
+        g = _run()
+        bad = _zero_views(g)
+        if bad.any():
+            raise RuntimeError(
+                f"LEAP forward returned {int(bad.sum())}/{B * V} ALL-ZERO views even after "
+                f"empty_cache(). Look for 'cudaMalloc3DArray Error: out of memory' above -- "
+                f"leapctype discards LEAP's success flag, so this check is the only signal. "
+                f"Volume {tuple(vol.shape)}, sinogram {(B, V, nv, nu)}. Reduce the caller's "
+                f"resident torch memory or its batch size.")
     return g
 
 
@@ -249,13 +279,6 @@ def leap_backproject(g, P, *, D, H, W, dx, dy, dz, du, dv, u0=0.0, v_off=0.0,
         leap.set_projector(mode or ADJOINT_MODE)
         leap.backproject_gpu(g[b], f[b])
     return f
-
-
-GRAD_MODE = "leap"           # 'leap': the EXACT gradient of LEAP's own kernel -- THE DEFAULT,
-                             #         and with FORCE_JOSEPH there is only one kernel to be
-                             #         exact about. 'sf': the retired-SF surrogate (A/B only;
-                             #         it is the gradient of an operator we no longer run).
-                             # 'auto' (branch-aware) is GONE with the branch itself.
 
 
 def leap_fdk_backproject(g, Pmat, *, D, H, W, dx, dy, dz, du, dv, u0=0.0, v_off=0.0):
@@ -321,7 +344,7 @@ class LEAPProject(torch.autograd.Function):
     """Differentiable `(vol, P) -> sinogram`.
 
     `grad_vol` is LEAP's backprojection. `grad_P` is `triton_leap_grad.leap_grad_P`: the
-    EXACT analytic gradient of the Joseph kernel LEAP now always runs (`FORCE_JOSEPH`). The
+    EXACT analytic gradient of the Joseph kernel LEAP now always runs (the `_model` pin). The
     Joseph model is bilinear in CONTINUOUS coordinates, so its exact gradient is also the
     slope of the physical loss surface -- FD parity 4e-4 against the LEAP loss itself.
 
@@ -357,13 +380,9 @@ class LEAPProject(torch.autograd.Function):
             gvol = leap_backproject(gout, P, D=D, H=H, W=W, dx=dx, dy=dy, dz=dz,
                                     du=du, dv=dv, u0=u0, v_off=v_off)
         if ctx.needs_input_grad[1]:
-            kw = dict(dx=dx, dy=dy, dz=dz, du=du, dv=dv, u0=u0, v_off=v_off)
-            if GRAD_MODE == "sf":
-                from .triton_sf import sf_grad_P
-                gP = sf_grad_P(vol, gout, P, **kw)
-            else:
-                from .triton_leap_grad import leap_grad_P
-                gP = leap_grad_P(vol, gout, P, **kw)
+            from .triton_leap_grad import leap_grad_P
+            gP = leap_grad_P(vol, gout, P, dx=dx, dy=dy, dz=dz, du=du, dv=dv,
+                             u0=u0, v_off=v_off)
         return gvol, gP, None, None, None, None, None, None, None, None, None
 
 
@@ -380,6 +399,27 @@ def leap_project_3d_batched(volumes, Pmat, u_coords, v_coords, *, dx, dy, dz):
     du, dv, u0, v_off = _detector_params(u_coords, v_coords)
     return LEAPProject.apply(volumes[:, 0].to(torch.float32), Pmat.to(torch.float32),
                              len(v_coords), len(u_coords), dx, dy, dz, du, dv, u0, v_off)
+
+
+def leap_project_3d_tangent(volumes, Pmat, Pdot, u_coords, v_coords, *, dx, dy, dz):
+    """(y, dy/ds) of the forward projection along Pdot. (B,1,D,H,W) -> two (B,V,nv,nu).
+
+    The forward-projection twin of `leap_fdk_backproject_tangent`, and for the same reason: the
+    DATA bridge parameterizes its MEASUREMENT as y(s) = A(x; P(s*theta)) and regresses on
+    dy/ds, LEAP ships no derivative, so we differentiate LEAP's own pinned Joseph kernel
+    (`triton_leap_grad.leap_forward_tangent`, chained through the modular decomposition's jvp).
+
+    Raw kernel, no autograd Function -- taking it inside a live graph would silently return
+    graph-free tensors. The bridge calls it under `no_grad`, like every other draw-time
+    operator. The VALUE it returns is the transcription's, ~1e-4 from the texture unit; callers
+    that need the endpoints bit-exact take the value from `leap_project_3d_batched`.
+    """
+    du, dv, u0, v_off = _detector_params(u_coords, v_coords)
+    from .triton_leap_grad import leap_forward_tangent
+    return leap_forward_tangent(volumes[:, 0].to(torch.float32),
+                                Pmat.to(torch.float32), Pdot.to(torch.float32),
+                                nv=len(v_coords), nu=len(u_coords),
+                                dx=dx, dy=dy, dz=dz, du=du, dv=dv, u0=u0, v_off=v_off)
 
 
 def leap_backproject_3d_batched(sino, Pmat, u_coords, v_coords, *, D, H, W, dx, dy, dz):

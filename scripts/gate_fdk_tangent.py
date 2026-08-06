@@ -172,17 +172,17 @@ def main():
     sino32 = g64.float()
     w32, dw32 = w0.float(), dw0.float()
 
-    os.environ["FM3D_FDK_TANGENT_LEAP"] = "1"
+    # `_torch_ref` is the gate-only handle onto the torch reference arm; it replaced the
+    # FM3D_FDK_TANGENT_LEAP / FM3D_FDK_LEAP environment switches on 2026-08-04.
     x_tan, dx_tan = fdk_conebeam_3d_tangent(sino32, P32, dP32, u, v, cfg, **vox,
                                             view_weight=w32, view_weight_dot=dw32)
     x_plain = fdk_conebeam_3d_batched(sino32, P32, u, v, cfg, **vox, view_weight=w32)
     m, r = rel(x_tan, x_plain)
     gate("T4 value-factoring", m < 5e-4, f"rel max {m:.3e} rms {r:.3e}")
 
-    os.environ["FM3D_FDK_TANGENT_LEAP"] = "0"
     x_ref, dx_ref = fdk_conebeam_3d_tangent(sino32, P32, dP32, u, v, cfg, **vox,
-                                            view_weight=w32, view_weight_dot=dw32)
-    os.environ.pop("FM3D_FDK_TANGENT_LEAP", None)
+                                            view_weight=w32, view_weight_dot=dw32,
+                                            _torch_ref=True)
     m_x, _ = rel(x_tan, x_ref)
     m_d, r_d = rel(dx_tan, dx_ref)
     reld = (dx_tan - dx_ref).abs() / dx_ref.abs().amax().clamp_min(1e-30)
@@ -212,13 +212,10 @@ def main():
     s_mid = 0.5
 
     def fdk_at(s, leap=True):
-        os.environ["FM3D_FDK_LEAP"] = "1" if leap else "0"
-        try:
-            Ps = params_to_Pmot(s * thF, P_nomF)[None]
-            return fdk_conebeam_3d_batched(sF, Ps, uF, vF, cfgF, **voxF,
-                                           view_weight=view_angular_weights(Ps))
-        finally:
-            os.environ.pop("FM3D_FDK_LEAP", None)
+        Ps = params_to_Pmot(s * thF, P_nomF)[None]
+        return fdk_conebeam_3d_batched(sF, Ps, uF, vF, cfgF, **voxF,
+                                       view_weight=view_angular_weights(Ps),
+                                       _torch_ref=not leap)
 
     def tangent_at(s):
         PF, dPF = bridge_P_and_dP(thF, P_nomF, s)

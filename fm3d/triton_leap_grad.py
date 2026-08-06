@@ -8,8 +8,8 @@ projector, but LEAP ships no geometry derivative, so `LEAPProject.backward` borr
 CUDA kernels, transcribed line-for-line from `refs/LEAP/src/projectors_Joseph.cu` (MIT), so
 the estimator descends on the exact surface of the loss it evaluates.
 
-TWO KERNELS, BECAUSE LEAP RUNS TWO. `project_Joseph_modular` picks its kernel per GEOMETRY SET
-(the launcher, ibid. line ~2255):
+ONE KERNEL IN PRODUCTION, TWO TRANSCRIBED. Stock `project_Joseph_modular` picks its kernel per
+GEOMETRY SET (the launcher, ibid. line ~2255):
 
     modularBeamProjectorKernel_SF      if modularbeamIsAxiallyAligned() && useSF
     modularBeamJosephProjectorKernel   otherwise
@@ -17,10 +17,11 @@ TWO KERNELS, BECAUSE LEAP RUNS TWO. `project_Joseph_modular` picks its kernel pe
 and `modularbeamIsAxiallyAligned()` is TRUE only while EVERY view's (unit) rowVector keeps
 z >= 0.9961 -- a 5.06-degree panel tilt -- and the source z-span stays under half the panel
 height (`parameters::set_sourcesAndModules`). Our nominal orbit has rowv_z = +1 exactly, but a
-single view whose motion tilts the panel past ~5 degrees flips the WHOLE geometry to the
-Joseph kernel, silently. At our eval amplitude (10 deg p2p nodes + Akima overshoot) both
-branches are live production regimes, so both are differentiated here and
-`leap_projector.kernel_kind` replicates the launcher's selection.
+single view whose motion tilted the panel past ~5 degrees flipped the WHOLE geometry to the
+Joseph kernel, silently. Since the 2026-07-30 pin (`leap_projector._model` ->
+`set_forceJosephModular`) the deployed library ALWAYS runs Joseph, so `kind="JOSEPH"` is the
+default and the only production path. The SF transcription below stays for the gates: it is
+what proves the pin matters (the ripple ledger) and what a counterfactual A/B needs.
 
 THE TWO MODELS (both: volume texture with BORDER addressing = zero outside, `loadTexture(...,
 useExtrapolation=false, linear=true)`; sinogram (V, nv, nu); centred detector/volume grids):
@@ -57,9 +58,9 @@ continuous centre is a point on the pixel's own ray and its projection is the pi
 and jittering the eval point does not help (the literal gradient is biased, not oscillating:
 jittered mean +3.4e-5, std 3.3e-5). The JOSEPH kernel is bilinear in CONTINUOUS coordinates
 -- no rounding, no ripple -- so ITS exact gradient is the trend (FD parity 4e-4, 100x tighter
-than any SF-branch check). This first shipped as `GRAD_MODE = "auto"` (JOSEPH branch -> this
-module, SF branch -> the surrogate); since the 2026-07-30 `FORCE_JOSEPH` pin there is no SF
-branch left, so the deployed setting is `GRAD_MODE = "leap"` and this module is THE gradient.
+than any SF-branch check). This first shipped as a branch-aware gradient (JOSEPH -> this
+module, SF -> the surrogate); the 2026-07-30 Joseph pin removed the SF branch, and with it
+both the surrogate and the selector, so this module is THE gradient, unconditionally.
 
 The P chain happens OUTSIDE, in torch: `modular_arrays_torch` is the differentiable
 P -> (src, mod, rowv, colv) decomposition and `leap_grad_P` runs the vjp through it, so
@@ -84,8 +85,10 @@ Joseph path additionally assumes dz == dx (LEAP's own `lineIntegral_Joseph_ZYX` 
 "assumes T.x == T.y == T.z").
 
 Self-checks: `leap_forward_model` re-implements the VALUE of both kernels so the gate can pin
-the transcription against `leap_project` itself (`scripts/gate_leap_projector.py`), and the
-theta gradient is finite-differenced through the actual LEAP loss in BOTH branch regimes.
+the transcription against `leap_project` itself (`scripts/gate_leap_projector.py`) -- and so
+it can show that the deployed library matches JOSEPH and NOT SF on the nominal orbit, which
+is the pin's proof of work -- and the theta gradient is finite-differenced through the actual
+LEAP loss.
 """
 
 from __future__ import annotations
@@ -480,13 +483,17 @@ if HAVE_TRITON:
             okc1 = (ib + 1 >= 0) & (ib + 1 < NP)
             okz0 = (iz >= 0) & (iz < D)
             okz1 = (iz + 1 >= 0) & (iz + 1 < D)
-            cstep = tl.where(ydom, 1, NP).to(tl.int64)
-            fl00 = iz.to(tl.int64) * HW + tl.where(ydom, j * NP, j).to(tl.int64) \
-                + ib.to(tl.int64) * cstep
+            # THE COALESCED GATHER -- see `_joseph_tangent_kernel` for the full argument.
+            # `vol_ptr` holds the volume twice, [z,y,x] then [z,x,y] (stacked in `_launch`),
+            # and x-dominant rays read out of the second copy so the cross-axis step is 1 for
+            # every ray instead of NP. Half the deployed orbit's rays are x-dominant, and at
+            # NP-strided addresses a warp's 32 lanes touch 32 separate cache lines.
+            voff = tl.where(ydom, 0, D * NP * NP).to(tl.int64)
+            fl00 = voff + iz.to(tl.int64) * HW + (j * NP).to(tl.int64) + ib.to(tl.int64)
             f00 = tl.load(vol_ptr + fl00, mask=mask & okz0 & okc0, other=0.0)
-            f10 = tl.load(vol_ptr + fl00 + cstep, mask=mask & okz0 & okc1, other=0.0)
+            f10 = tl.load(vol_ptr + fl00 + 1, mask=mask & okz0 & okc1, other=0.0)
             f01 = tl.load(vol_ptr + fl00 + HW, mask=mask & okz1 & okc0, other=0.0)
-            f11 = tl.load(vol_ptr + fl00 + cstep + HW, mask=mask & okz1 & okc1, other=0.0)
+            f11 = tl.load(vol_ptr + fl00 + 1 + HW, mask=mask & okz1 & okc1, other=0.0)
             S = (1.0 - wb) * (1.0 - wz) * f00 + wb * (1.0 - wz) * f10 \
                 + (1.0 - wb) * wz * f01 + wb * wz * f11
             wgt = tl.where(j == j0, 0.5, 1.0)
@@ -546,6 +553,152 @@ if HAVE_TRITON:
 
 
 if HAVE_TRITON:
+
+    @triton.jit
+    def _joseph_tangent_kernel(vol_ptr, out_ptr, dout_ptr,
+                               src_ptr, mod_ptr, rowv_ptr, colv_ptr,
+                               dsrc_ptr, dmod_ptr, drowv_ptr, dcolv_ptr,
+                               nv, nu, NP, D, HW,
+                               dx, dz, du, dv, u0g, v0g, b0, z0,
+                               BLOCK: tl.constexpr):
+        """VALUE and s-directional DERIVATIVE of LEAP's pinned Joseph FORWARD projection.
+
+        The forward-mode twin of `_leap_joseph_kernel`'s MODE 2, and the forward-projection
+        counterpart of `_vd_tangent_kernel`. It exists because the DATA bridge
+        (`train_fm3d --bridge data`) parameterizes the MEASUREMENT as y(s) = A(x; P(s*theta))
+        and needs dy/ds as its velocity target; a central difference in s costs three
+        simulations per draw AND cannot get below ~2-4% (the projection through the 612^3
+        native volume is genuinely curved in s, so the truncation floor and the fp32
+        cancellation floor meet before either is small -- scripts/diag_bridge_data_tangent.py).
+
+        Every geometry-dependent factor of the value path, differentiated by the product rule:
+
+            det = c + u*s + v*t          ddet = dc + du_vec*s + dv_vec*t
+            r   = det - p                dr   = ddet - dp
+            L   = dx*|r|/|r_a|           dL   = dx*(d|r|/|r_a| - |r|*sgn(r_a)*dr_a/r_a^2)
+            lam = (w_j - p_a)/r_a        dlam = -(dp_a + lam*dr_a)/r_a
+            cb  = (p_b + lam*r_b - b0)/dx        dcb = (dp_b + dlam*r_b + lam*dr_b)/dx
+            cz  = (pz  + lam*rz  - z0)/dz        dcz = (dpz  + dlam*rz  + lam*drz )/dz
+            S   = bilerp(f; wb, wz)      dS   = dcb*d(bilerp)/dwb + dcz*d(bilerp)/dwz
+            y   = L * sum_j wgt_j S_j    dy   = dL*sum + L*sum_j wgt_j dS_j
+
+        FROZEN at the evaluation point, the same a.e. convention as the rest of this module
+        (and as `_vd_tangent_kernel`): the dominant-axis choice `ydom`, the entry plane `j0`,
+        the voxel indices, and the border masks. The Joseph kernel is bilinear in CONTINUOUS
+        coordinates, so unlike the SF branch there is no lattice ripple for that convention to
+        land on -- see the ripple ledger in the module docstring for why that distinction is
+        the whole reason the library is pinned to Joseph.
+
+        Detector-driven, one lane per pixel, no atomics: deterministic.
+        """
+        view = tl.program_id(1)
+        pix = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = pix < nv * nu
+        m = pix // nu
+        n = pix - m * nu
+
+        px = tl.load(src_ptr + view * 3 + 0)
+        py = tl.load(src_ptr + view * 3 + 1)
+        pz = tl.load(src_ptr + view * 3 + 2)
+        cx = tl.load(mod_ptr + view * 3 + 0)
+        cy = tl.load(mod_ptr + view * 3 + 1)
+        cz_ = tl.load(mod_ptr + view * 3 + 2)
+        vx = tl.load(rowv_ptr + view * 3 + 0)
+        vy = tl.load(rowv_ptr + view * 3 + 1)
+        vz = tl.load(rowv_ptr + view * 3 + 2)
+        ux = tl.load(colv_ptr + view * 3 + 0)
+        uy = tl.load(colv_ptr + view * 3 + 1)
+        uz = tl.load(colv_ptr + view * 3 + 2)
+
+        dpx = tl.load(dsrc_ptr + view * 3 + 0)
+        dpy = tl.load(dsrc_ptr + view * 3 + 1)
+        dpz = tl.load(dsrc_ptr + view * 3 + 2)
+        dcx = tl.load(dmod_ptr + view * 3 + 0)
+        dcy = tl.load(dmod_ptr + view * 3 + 1)
+        dcz_ = tl.load(dmod_ptr + view * 3 + 2)
+        dvx = tl.load(drowv_ptr + view * 3 + 0)
+        dvy = tl.load(drowv_ptr + view * 3 + 1)
+        dvz = tl.load(drowv_ptr + view * 3 + 2)
+        dux = tl.load(dcolv_ptr + view * 3 + 0)
+        duy = tl.load(dcolv_ptr + view * 3 + 1)
+        duz = tl.load(dcolv_ptr + view * 3 + 2)
+
+        t_r = m.to(tl.float32) * dv + v0g
+        s = n.to(tl.float32) * du + u0g
+
+        rx = (cx + ux * s + vx * t_r) - px
+        ry = (cy + uy * s + vy * t_r) - py
+        rz = (cz_ + uz * s + vz * t_r) - pz
+        drx = (dcx + dux * s + dvx * t_r) - dpx
+        dry = (dcy + duy * s + dvy * t_r) - dpy
+        drz = (dcz_ + duz * s + dvz * t_r) - dpz
+
+        ydom = tl.abs(ry) > tl.abs(rx)                       # FROZEN
+        r_a = tl.where(ydom, ry, rx)
+        r_b = tl.where(ydom, rx, ry)
+        p_a = tl.where(ydom, py, px)
+        p_b = tl.where(ydom, px, py)
+        dr_a = tl.where(ydom, dry, drx)
+        dr_b = tl.where(ydom, drx, dry)
+        dp_a = tl.where(ydom, dpy, dpx)
+        dp_b = tl.where(ydom, dpx, dpy)
+        inv_ra = 1.0 / r_a
+        j0 = tl.where(r_a > 0.0, 0, NP - 1)                  # FROZEN
+
+        nrm = tl.sqrt(rx * rx + ry * ry + rz * rz)
+        dnrm = (rx * drx + ry * dry + rz * drz) / nrm
+        abs_ra = tl.abs(r_a)
+        sgn_a = tl.where(r_a >= 0.0, 1.0, -1.0)
+        L = dx * nrm / abs_ra
+        dL = dx * (dnrm / abs_ra - nrm * sgn_a * dr_a / (r_a * r_a))
+
+        S_tot = tl.zeros((BLOCK,), dtype=tl.float32)
+        dS_tot = tl.zeros((BLOCK,), dtype=tl.float32)
+
+        for j in range(0, NP):
+            w_j = j * dx + b0
+            lam = (w_j - p_a) * inv_ra
+            dlam = -(dp_a + lam * dr_a) * inv_ra
+            cb = (p_b + lam * r_b - b0) / dx
+            cz = (pz + lam * rz - z0) / dz
+            dcb = (dp_b + dlam * r_b + lam * dr_b) / dx
+            dcz = (dpz + dlam * rz + lam * drz) / dz
+            ibf = tl.floor(cb)
+            izf = tl.floor(cz)
+            wb = cb - ibf
+            wz = cz - izf
+            ib = ibf.to(tl.int32)
+            iz = izf.to(tl.int32)
+            okc0 = (ib >= 0) & (ib < NP)
+            okc1 = (ib + 1 >= 0) & (ib + 1 < NP)
+            okz0 = (iz >= 0) & (iz < D)
+            okz1 = (iz + 1 >= 0) & (iz + 1 < D)
+            # THE COALESCED GATHER. `vol_ptr` holds the volume TWICE: [z,y,x] then [z,x,y]
+            # (see `leap_forward_tangent`). Half the rays are x-dominant -- measured 50.9% on
+            # the deployed orbit -- and in the natural layout their cross-axis step is NP=612
+            # elements, so a warp's 32 lanes touch 32 separate cache lines. Reading those rays
+            # out of the transposed copy makes the step 1 for EVERY ray, at the price of one
+            # extra buffer. `voff` is 0 or D*H*W and is the only thing that differs.
+            voff = tl.where(ydom, 0, D * NP * NP).to(tl.int64)
+            fl00 = voff + iz.to(tl.int64) * HW + (j * NP).to(tl.int64) + ib.to(tl.int64)
+            f00 = tl.load(vol_ptr + fl00, mask=mask & okz0 & okc0, other=0.0)
+            f10 = tl.load(vol_ptr + fl00 + 1, mask=mask & okz0 & okc1, other=0.0)
+            f01 = tl.load(vol_ptr + fl00 + HW, mask=mask & okz1 & okc0, other=0.0)
+            f11 = tl.load(vol_ptr + fl00 + 1 + HW, mask=mask & okz1 & okc1, other=0.0)
+            S = (1.0 - wb) * (1.0 - wz) * f00 + wb * (1.0 - wz) * f10 \
+                + (1.0 - wb) * wz * f01 + wb * wz * f11
+            # the interpolant's own partials -- the SAME four taps the value used, which is
+            # what makes this the exact derivative of THIS kernel rather than of an idealized
+            # continuous model (cf. the retired cross-model tangent's 0.5% target error)
+            dS = dcb * ((1.0 - wz) * (f10 - f00) + wz * (f11 - f01)) \
+                + dcz * ((1.0 - wb) * (f01 - f00) + wb * (f11 - f10))
+            wgt = tl.where(j == j0, 0.5, 1.0)
+            S_tot += wgt * S
+            dS_tot += wgt * dS
+
+        off = (view * nv * nu).to(tl.int64) + pix
+        tl.store(out_ptr + off, L * S_tot, mask=mask)
+        tl.store(dout_ptr + off, dL * S_tot + L * dS_tot, mask=mask)
 
     @triton.jit
     def _vd_tangent_kernel(g_ptr, src_ptr, mod_ptr, rowv_ptr, colv_ptr,
@@ -713,6 +866,61 @@ def modular_arrays_jvp(P: torch.Tensor, dP: torch.Tensor, u0: float, v_off: floa
     return tuple(to32(a) for a in arrs), tuple(to32(d) for d in darrs)
 
 
+def leap_forward_tangent(vol, P, dP, *, nv, nu, dx, dy, dz, du, dv, u0=0.0, v_off=0.0,
+                         block=1024):
+    """(y, dy/ds) of LEAP's pinned Joseph forward projection along Pdot.
+
+    vol (B,D,H,W), P/dP (B,V,3,4) -> two (B,V,nv,nu) fp32 tensors. The forward-projection twin
+    of `leap_vd_backproject_tangent`, and the exact velocity target of the DATA bridge.
+
+    NOTE, exactly as for the backprojection tangent: the VALUE returned here is this kernel's
+    own transcription, not the vendored library's texture-unit path, so callers that must stay
+    bit-consistent with an endpoint keep taking the value from `leap_project` and only the
+    derivative from here. `train_fm3d.bridge_pair_data` does precisely that -- its t=0 and t=1
+    endpoints are gated at rel 0.000e+00 against the cold start and the static anchor.
+
+    SPEED, and where it came from. At the 612^3 native simulation grid with 360 views this runs
+    in 1.52 s against LEAP's own 1.14 s for the VALUE ALONE -- i.e. the exact derivative costs
+    about a third of a projection on top. It did not start there: the first version took 21.1 s,
+    and the transcribed VALUE path (`leap_forward_model`, MODE 0) still does 22.9 s. The whole
+    gap was the GATHER. 49.2% of the deployed orbit's rays are x-dominant, and in the natural
+    [z,y,x] layout their cross-axis step is NP = 612 elements, so a warp's lanes hit 32 separate
+    cache lines. Stacking a [z,x,y] transpose behind the volume and reading those rays out of it
+    makes the step 1 for every ray: 21.1 -> 1.78 s. BLOCK 1024 over 128 took it to 1.52 s.
+
+    `_leap_joseph_kernel` (the value/vjp kernel that `leap_grad_P` runs for the ESTIMATOR) had
+    the identical gather and now shares the fix -- 1.32x on the vjp, 2.05x on the value, at the
+    estimator's own 256^3 grid, bit-identical output. See `stack_transposed`.
+    """
+    if abs(dx - dy) > 1e-9:
+        raise ValueError(f"dx == dy required, got {dx} vs {dy}")
+    B, D, H, W = vol.shape
+    V = P.shape[1]
+    if W != H:
+        raise ValueError(f"the unified in-plane slab loop needs W == H, got {W}x{H}")
+    if abs(dz - dx) > 1e-9:
+        raise ValueError(f"LEAP's Joseph kernel assumes an isotropic voxel, got dx={dx} dz={dz}")
+    y = torch.empty((B, V, nv, nu), device=vol.device, dtype=torch.float32)
+    dy = torch.empty_like(y)
+    vol = vol.contiguous().to(torch.float32)
+    u0g = -0.5 * (nu - 1) * du
+
+    v0g = -0.5 * (nv - 1) * dv
+    b0 = -0.5 * (W - 1) * dx
+    z0 = -0.5 * (D - 1) * dz
+    grid = (triton.cdiv(nv * nu, block), V)
+    for b in range(B):
+        (src, mod, rowv, colv), (dsrc, dmod, drowv, dcolv) = \
+            modular_arrays_jvp(P[b], dP[b], u0, v_off)
+        _joseph_tangent_kernel[grid](
+            stack_transposed(vol[b]), y[b], dy[b],
+            src, mod, rowv, colv, dsrc, dmod, drowv, dcolv,
+            nv, nu, W, D, H * W,
+            float(dx), float(dz), float(du), float(dv),
+            float(u0g), float(v0g), float(b0), float(z0), BLOCK=block)
+    return y, dy
+
+
 def leap_vd_backproject_tangent(g2, P, dP, wgt, dwgt, *, D, H, W, dx, dy, dz, du, dv,
                                 u0=0.0, v_off=0.0, block=256):
     """(x, dx/ds) of `sum_v wgt_v * VD-backprojection_v(g2; geometry(P))` along (dP, dwgt).
@@ -758,12 +966,44 @@ def modular_arrays_torch(P: torch.Tensor, u0: float, v_off: float):
     return C, mod, e_v, e_u
 
 
+def stack_transposed(v: torch.Tensor) -> torch.Tensor:
+    """[z,y,x] volume -> flat [ [z,y,x] ; [z,x,y] ], the layout the JOSEPH kernels gather from.
+
+    THE COALESCING FIX (2026-08-05). Both Joseph kernels march the dominant in-plane axis and
+    step along the OTHER one; in the natural [z,y,x] layout that step is 1 for a y-dominant ray
+    and NP for an x-dominant one, and 49% of the deployed orbit's rays are x-dominant, so half
+    the warps scatter across 32 cache lines. Reading those rays out of a [z,x,y] twin makes the
+    step 1 for every ray, at the price of one extra volume of VRAM.
+
+    IT IS A PURE LAYOUT CHANGE -- every output below is bit-identical before and after
+    (rel 0.000e+00 on both `leap_grad_P` and `leap_forward_model`). Measured, interleaved A/B in
+    one process because the GPUs were shared:
+
+        612^3 native grid  (the DATA bridge's simulation grid)
+            forward tangent            21.1  -> 1.78 s   (12x; BLOCK 1024 then took it to 1.52)
+        256^3 coarse grid  (what the ESTIMATOR differentiates y on, 360 views)
+            leap_grad_P, the vjp        0.72 -> 0.55 s   (1.32x, stable over 3 rounds)
+            leap_forward_model, value   0.79 -> 0.38 s   (2.05x; LEAP's own is 0.36 s)
+
+    The win shrinks with the grid because the stride shrinks with it (612 elements = 2.4 kB
+    against 256 = 1 kB), and the vjp gains less than the value because it does far more
+    arithmetic per tap (12 accumulators plus atomics), so memory is a smaller share of it.
+
+    SWAP THE LAST TWO AXES. `transpose(0, 1)` also runs, also looks plausible, and is wrong --
+    scripts/gate_leap_forward_tangent.py catches it at cos 0.53, nothing cheaper does.
+    """
+    return torch.stack((v, v.transpose(-2, -1).contiguous())).reshape(-1)
+
+
 def _launch(kind, mode, vol, gout, out, arrs, *, nv, nu, D, H, W, dx, dz, du, dv, block=128):
     src, mod, rowv, colv = arrs
     if W != H:
         raise ValueError(f"the unified in-plane slab loop needs W == H, got {W}x{H}")
     if kind == "JOSEPH" and abs(dz - dx) > 1e-9:
         raise ValueError(f"LEAP's Joseph kernel assumes an isotropic voxel, got dx={dx} dz={dz}")
+    if kind == "JOSEPH":
+        # the SF kernel keeps its own 3x3 footprint indexing and its natural layout
+        vol = stack_transposed(vol)
     V = src.shape[0]
     u0g = -0.5 * (nu - 1) * du
     v0g = -0.5 * (nv - 1) * dv
@@ -785,34 +1025,34 @@ def _arrays32(P_view, u0, v_off):
     return tuple(a.to(torch.float32).contiguous() for a in arrs)
 
 
-def leap_forward_model(vol, P, *, nv, nu, dx, dy, dz, du, dv, u0=0.0, v_off=0.0, kind=None):
+def leap_forward_model(vol, P, *, nv, nu, dx, dy, dz, du, dv, u0=0.0, v_off=0.0,
+                       kind="JOSEPH"):
     """VALUE of the transcribed LEAP model: vol (B,D,H,W), P (B,V,3,4) -> (B,V,nv,nu).
 
     The parity rig for `gate_leap_projector`: this must match `leap_project` itself to tex-
-    quantization precision, per branch. `kind` overrides the launcher-replica selection."""
+    quantization precision. `kind` is JOSEPH -- the only kernel the pinned library runs; a
+    gate may pass "SF" to evaluate the counterfactual (see the ripple ledger above)."""
     if abs(dx - dy) > 1e-9:
         raise ValueError(f"dx == dy required, got {dx} vs {dy}")
     B, D, H, W = vol.shape
     V = P.shape[1]
-    from .leap_projector import kernel_kind
     g = torch.zeros((B, V, nv, nu), device=vol.device, dtype=torch.float32)
     vol = vol.contiguous().to(torch.float32)
     for b in range(B):
-        k = kind or kernel_kind(P[b], nv=nv, du=du, dv=dv, dx=dx, dz=dz, D=D, H=H, W=W)
         arrs = _arrays32(P[b], u0, v_off)
-        _launch(k, 0, vol[b], None, g[b], arrs, nv=nv, nu=nu, D=D, H=H, W=W,
+        _launch(kind, 0, vol[b], None, g[b], arrs, nv=nv, nu=nu, D=D, H=H, W=W,
                 dx=dx, dz=dz, du=du, dv=dv)
     return g
 
 
 def leap_grad_geom(vol, gout, P_view, *, nv, nu, dx, dz, du, dv, u0=0.0, v_off=0.0,
-                   kind=None):
+                   kind="JOSEPH"):
     """d<gout, LEAP(vol; geom)>/d(src, mod, rowv, colv) for ONE geometry set.
 
-    vol (D,H,W), gout (V,nv,nu), P_view (V,3,4) -> four (V,3) fp64 tensors."""
+    vol (D,H,W), gout (V,nv,nu), P_view (V,3,4) -> four (V,3) fp64 tensors. `kind` as in
+    `leap_forward_model`: JOSEPH is the deployed (and only) kernel."""
     D, H, W = vol.shape
-    from .leap_projector import kernel_kind
-    k = kind or kernel_kind(P_view, nv=nv, du=du, dv=dv, dx=dx, dz=dz, D=D, H=H, W=W)
+    k = kind
     arrs = _arrays32(P_view, u0, v_off)
     out = torch.zeros((P_view.shape[0], 12), device=vol.device, dtype=torch.float64)
     _launch(k, 2, vol.contiguous().to(torch.float32),
@@ -822,8 +1062,8 @@ def leap_grad_geom(vol, gout, P_view, *, nv, nu, dx, dz, du, dv, u0=0.0, v_off=0
 
 
 def leap_grad_P(vol, gout, P, *, dx, dy, dz, du, dv, u0=0.0, v_off=0.0):
-    """d <gout, LEAP(vol; P)> / dP -> (B,V,3,4) fp32. Drop-in for `triton_sf.sf_grad_P`,
-    but the gradient of LEAP'S OWN forward (branch-matched), chained through the
+    """d <gout, LEAP(vol; P)> / dP -> (B,V,3,4) fp32. THE geometry gradient of the deployed
+    operator: the exact gradient of LEAP's pinned Joseph forward, chained through the
     differentiable modular decomposition."""
     if abs(dx - dy) > 1e-9:
         raise ValueError(f"dx == dy required, got {dx} vs {dy}")

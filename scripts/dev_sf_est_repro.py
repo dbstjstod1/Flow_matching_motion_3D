@@ -23,17 +23,17 @@ with torch.no_grad():
     y = forward_project_3d_batched(gt[None, None], params_to_Pmot(th_true, P_nom)[None], u, v,
                                    dx=1, dy=1, dz=1)[0]
 
-# "ray" retired 2026-07-28 (forward_project routes to SF); historical anchor from the last
-# two-arm run, same seed/GPU: ray reached loss 0.00197 / rot 3.37 / obs 0.55 mm at iter 300.
-for backend in ("leap",):
-    torch.manual_seed(0)
-    est = make_estimator("net", cfg, P_nom, u, v, DEV, dx=1.0, dy=1.0, dz=1.0,
-                         loss="l2", views_per_iter=24, lr=3e-3,
-                         n_levels=16, base_resolution=16, per_level_scale=1.5)
-    t0 = time.time()
-    for it in range(6):
-        loss = est.refine_global(gt, y, iters=50)
-        me = motion_error(est.current_params(), th_true, cfg=cfg)
-        print(f"{backend:4s} iter {(it+1)*50:4d} | loss {loss:.5f} | "
-              f"rot {me['rot_rmse_deg']:.3f} deg obs {me['trans_obs_mm']:.3f} mm | "
-              f"{time.time()-t0:.1f}s", flush=True)
+# There is ONE operator, so there is one arm: `forward_project_3d_batched` is LEAP's.
+# Historical anchors from the two-arm era, same seed/GPU, for scale only: the retired ray
+# march reached loss 0.00197 / rot 3.37 / obs 0.55 mm at iter 300.
+torch.manual_seed(0)
+est = make_estimator("net", cfg, P_nom, u, v, DEV, dx=1.0, dy=1.0, dz=1.0,
+                     loss="l2", views_per_iter=24, lr=3e-3,
+                     n_levels=16, base_resolution=16, per_level_scale=1.5)
+t0 = time.time()
+for it in range(6):
+    loss = est.refine_global(gt, y, iters=50)
+    me = motion_error(est.current_params(), th_true, cfg=cfg)
+    print(f"iter {(it+1)*50:4d} | loss {loss:.5f} | "
+          f"rot {me['rot_rmse_deg']:.3f} deg obs {me['trans_obs_mm']:.3f} mm | "
+          f"{time.time()-t0:.1f}s", flush=True)

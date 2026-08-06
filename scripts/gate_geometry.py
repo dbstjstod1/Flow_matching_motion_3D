@@ -196,10 +196,10 @@ def gate_grad(P_nom, u, v, vol) -> None:
          WHAT "AGREE" MEANS CHANGED ON 2026-07-29, and the bar moved with it. This used to be
          an AUTOGRAD IDENTITY: one operator, differentiated exactly, so <1% was the right bar.
          It is now a CROSS-OPERATOR consistency check -- the forward VALUE is LEAP's and the
-         analytic d/dP is ours (when this was written the dispatch was the branch-aware
-         `GRAD_MODE = "auto"`; the 2026-07-30 `FORCE_JOSEPH` pin removed the SF branch, so
-         the deployed setting is `GRAD_MODE = "leap"` -- but the history matters because on
-         the old SF-branch geometry the gradient was the continuous-corner surrogate `sf_grad_P`,
+         analytic d/dP is ours (when this was written the dispatch was branch-aware; the
+         2026-07-30 Joseph pin removed the SF branch and the 2026-08-04 cleanup removed the
+         selector with it, so `leap_grad_P` is unconditional -- but the history matters because
+         on the old SF-branch geometry the gradient was the continuous-corner surrogate `sf_grad_P`,
          two models that differ by ~3e-3 in value). The finite difference divides that gap by
          eps, so a step calibrated for the old identity reads as a failure: MEASURED here, the
          (view 0, tx) probe reads rel 6.0e-1 at eps 1e-2 mm and converges to 1.7e-2 at 0.3 mm
@@ -219,9 +219,9 @@ def gate_grad(P_nom, u, v, vol) -> None:
         Note what G4a enforces beyond correctness: it is THE RIPPLE GATE. The exact gradient
         of LEAP's rounded-centre SF model reads +4e-5 on the (view 2, rz) probe while this
         FD (and the loss trend) reads -3.4e-4 -- opposite signs -- so G4a FAILS if anyone
-        flips `GRAD_MODE` to 'leap' on the SF branch (tried 2026-07-30; the measurement
-        ledger is in `triton_leap_grad`'s docstring). `gate_leap_projector.py` pins the
-        Joseph-branch gradient, where exact and trend coincide.
+        ever puts the SF kernel back in front of the exact gradient (tried 2026-07-30; the
+        measurement ledger is in `triton_leap_grad`'s docstring). `gate_leap_projector.py`
+        pins the Joseph-branch gradient, where exact and trend coincide.
     """
     print("\nG4  d(loss)/d(theta)")
     dz, dy, dx = SPACING

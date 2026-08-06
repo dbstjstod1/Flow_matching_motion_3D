@@ -56,8 +56,9 @@ import torch
 from .filters import calibrate_scale
 from .geometry_3d import (ConeBeam3DConfig, build_conebeam_orbit, detector_coords_3d,
                           view_angular_weights, view_angular_weights_dot)
-from .projector_3d import (adjoint_project_3d_batched, fdk_conebeam_3d_batched,
-                           fdk_conebeam_3d_tangent, forward_project_3d_batched)
+from .projector_3d import (adjoint_project_3d_batched, fdk_backproject_filtered,
+                           fdk_conebeam_3d_batched, fdk_conebeam_3d_tangent,
+                           forward_project_3d_batched, forward_project_3d_tangent)
 from .rigid_motion import params_to_Pmot, random_motion
 
 MU_WATER = 0.02
@@ -180,7 +181,7 @@ class CQ500Generator:
                  hu_norm=(-1000.0, 2000.0), clip: bool = True, mu_water: float = MU_WATER,
                  thin_mm: float = 0.7, count_tol: float = 0.5,
                  split_counts=(150, 50, 120),
-                 angle_weight: bool = True, sim_native: bool = True,
+                 angle_weight: bool = True, sim_native: bool = True, fine_workers: int = 1,
                  cache_dir: str | None = None, verbose: bool = True):
         self.device = torch.device(device)
         self.root = root
@@ -261,7 +262,16 @@ class CQ500Generator:
             for n, d in zip(self.shape_dhw, (self.dz, self.dy, self.dx)))
         self._fine_cache: tuple[int, torch.Tensor] | None = None  # (key, PINNED fp32 hu)
         self._fine_futures: dict[int, object] = {}  # key -> Future -- see `prefetch_fine`
-        self._fine_pool = None     # lazy 1-thread executor backing `prefetch_fine`
+        self._fine_pool = None     # lazy executor backing `prefetch_fine`
+        # HOW MANY VOLUMES MAY LOAD AT ONCE. 1 is right for the TRAINER, which refreshes one
+        # draw every `--refresh` steps and so has ~6 s of GPU work to hide a ~1.2 s load under.
+        # A caller that consumes one volume PER SAMPLE (the Thies bench: batch 16, ~0.9 s of GPU
+        # work per sample) is LOADER-BOUND at 1 worker -- measured 87% duty cycle with the
+        # remaining dips being the GPU waiting on the loader. Raising this is safe because every
+        # stage of `_fine_load_pinned` releases the GIL (npz IO, sitk resample, pin memcpy); the
+        # cost is one extra page-locked native volume in host RAM (~0.9 GB) per worker.
+        # DEFAULT STAYS 1 so no existing caller changes behaviour.
+        self.fine_workers = max(1, int(fine_workers))
         if verbose and self.sim_native:
             print(f"[cq500] simulation grid: {'x'.join(map(str, self.sim_shape_dhw))} @ "
                   f"{self.sim_voxel_mm:.5f} mm (native = du*SOD/SDD) | "
@@ -388,7 +398,7 @@ class CQ500Generator:
             return
         if self._fine_pool is None:
             from concurrent.futures import ThreadPoolExecutor
-            self._fine_pool = ThreadPoolExecutor(max_workers=1)
+            self._fine_pool = ThreadPoolExecutor(max_workers=self.fine_workers)
         self._fine_futures[key] = self._fine_pool.submit(self._fine_load_pinned, key)
 
     def volume_fine(self, idx: int = 0) -> torch.Tensor:
@@ -437,6 +447,31 @@ class CQ500Generator:
         del vol
         return y
 
+    @torch.no_grad()
+    def simulate_tangent(self, idx: int, Pmat: torch.Tensor, Pdot: torch.Tensor):
+        """(y, dy/ds) of `simulate` along Pdot, on the SAME native grid. (B,V,nv,nu) x2.
+
+        The DATA bridge's velocity target (`train_fm3d.bridge_pair_data`). Only the DERIVATIVE
+        is meant to be consumed: the value comes from the transcribed kernel rather than the
+        vendored library's texture path (~1e-4 apart), so a caller that needs y itself keeps
+        calling `simulate` -- which is what keeps the bridge's t=0/t=1 endpoints bit-exact
+        against the cold start and the static anchor.
+
+        `sim_native=False` (the inverse-crime ablation) projects the coarse volume instead, the
+        same split `simulate` makes."""
+        P = Pmat if Pmat.dim() == 4 else Pmat[None]
+        dP = Pdot if Pdot.dim() == 4 else Pdot[None]
+        if not self.sim_native:
+            return forward_project_3d_tangent(self.volume(idx), P, dP,
+                                              self.u_coords, self.v_coords,
+                                              dx=self.dx, dy=self.dy, dz=self.dz)
+        vol = self.volume_fine(idx)
+        out = forward_project_3d_tangent(
+            vol, P, dP, self.u_coords, self.v_coords,
+            dx=self.sim_voxel_mm, dy=self.sim_voxel_mm, dz=self.sim_voxel_mm)
+        del vol
+        return out
+
     # -- net <-> mu ---------------------------------------------------------------------
     def to_net(self, mu):
         return 2.0 * (mu - self.mu_lo) / (self.mu_hi - self.mu_lo) - 1.0
@@ -471,14 +506,35 @@ class CQ500Generator:
             D=D, H=H, W=W, dx=self.dx, dy=self.dy, dz=self.dz, **kw)
 
 
+    def fdk_filtered(self, sino: torch.Tensor, **kw) -> tuple[torch.Tensor, float]:
+        """The FDK's filtering half alone -> (filtered sinogram, panel-centre offset u0).
+
+        GEOMETRY-FREE, which is the point: cosine, Wang, Ohnesorge and the ramp read the DETECTOR
+        only (`fdk_conebeam_3d_batched` never touches Pmat before returning this), so one call
+        serves EVERY `fdk`/`fdk_tangent` of the same y. A bridge draw needs two -- FDK(y,P(theta))
+        for the anchor's Delta and FDK(y,P(t*theta)) for x_t -- and used to filter twice.
+        Pass the result back as `filtered=` to both. `P_nom` below is a placeholder: unused."""
+        return fdk_conebeam_3d_batched(
+            sino, self.P_nom[None], self.u_coords, self.v_coords, self.cfg,
+            D=1, H=1, W=1, dx=self.dx, dy=self.dy, dz=self.dz,
+            view_chunk=kw.pop("view_chunk", 8), _return_filtered=True, **kw)
+
     def fdk(self, sino: torch.Tensor, Pmat: torch.Tensor, *, scale=None,
-            angle_weight: bool | None = None, **kw) -> torch.Tensor:
+            angle_weight: bool | None = None, filtered=None, **kw) -> torch.Tensor:
         D, H, W = self.shape_dhw
         aw = self.angle_weight if angle_weight is None else bool(angle_weight)
         # an explicitly-passed view_weight wins (and must not collide with the one we derive)
         vw = kw.pop("view_weight", None)
         if vw is None and aw:
             vw = view_angular_weights(Pmat)                        # (B,V), from the ACTUAL orbit
+        if filtered is not None:
+            # `fdk_filtered`'s output: skip the ramp, backproject only. The angular weight moves
+            # from before the filter to after it, which is EXACT (fdk_backproject_filtered).
+            g, u0 = filtered
+            return fdk_backproject_filtered(
+                g, Pmat, self.cfg, u0=u0, D=D, H=H, W=W,
+                dx=self.dx, dy=self.dy, dz=self.dz, scale=scale, view_weight=vw,
+                view_chunk=kw.pop("view_chunk", 8), **kw)
         return fdk_conebeam_3d_batched(
             sino, Pmat, self.u_coords, self.v_coords, self.cfg,
             D=D, H=H, W=W, dx=self.dx, dy=self.dy, dz=self.dz,
@@ -486,7 +542,7 @@ class CQ500Generator:
             view_chunk=kw.pop("view_chunk", 8), view_weight=vw, **kw)
 
     def fdk_tangent(self, sino: torch.Tensor, Pmat: torch.Tensor, Pdot: torch.Tensor, *,
-                    scale=None, angle_weight: bool | None = None, **kw):
+                    scale=None, angle_weight: bool | None = None, filtered=None, **kw):
         """(FDK(sino, Pmat), its exact directional derivative along Pdot) -- one fused pass.
 
         The tangent twin of `fdk`: same scale, same Voronoi angular weighting (plus the
@@ -500,7 +556,7 @@ class CQ500Generator:
         return fdk_conebeam_3d_tangent(
             sino, Pmat, Pdot, self.u_coords, self.v_coords, self.cfg,
             D=D, H=H, W=W, dx=self.dx, dy=self.dy, dz=self.dz,
-            scale=scale,
+            scale=scale, filtered=filtered,
             view_weight=vw, view_weight_dot=vwd, **kw)
 
 

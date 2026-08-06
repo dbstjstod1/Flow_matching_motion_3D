@@ -33,10 +33,33 @@ ceiling vs GT ≈ 33.4 dB / 0.825 on val 0.
 
 ## Deployed inference configuration (what the retrain will be evaluated under)
 
-`run_posterior3d.py` defaults: N=50, c2f estimator (coarse 1/2 until t=0.5), PER 400, fullband
-NGP lr 3e-3, loss l2, views/iter 24, dc_op cg (SF matched pair, cg_iters 5), TV (kappa 0.3,
-step 0.015, iters 5), fp16 prior batch 64, metric_mode defer (+`render_posterior3d.py`),
-akima 5/5 eval. Step times on the SF operator: coarse ~15 s, fine ~54 s → N=50 ≈ **~29 min**.
+`run_posterior3d.py` defaults: N=50, c2f estimator (coarse 1/2 until t=0.5), **PER 200**, fullband
+NGP lr 3e-3, loss l2, views/iter 24, dc_op cg (cg_iters 5), TV (kappa 0.3,
+step 0.015, iters 5), fp16 prior batch 64, metric_mode defer (+`render_posterior3d.py`).
+Step times on LEAP with the 500k prior: coarse ~10.7 s, fine ~27.3 s → N=50 ≈ **9.3 min/patient**
+(was 15.8 min at PER 400). The SF-era "coarse ~15 s / fine ~54 s → ~29 min" line is retired.
+
+### PER 400 → 200 and the coarse schedule (2026-08-03, first sweep on a FINISHED prior)
+
+3-patient blind A/B, 500k ckpt, val 0/1/2, akima **10/10 p2p**, x_t aligned vs GT (the deliverable):
+
+| config | s/patient | x_t dB / SSIM | rot |
+|---|---|---|---|
+| fine the whole way, PER 400 | 1321 | 38.52 / 0.9858 | 0.122° |
+| c2f, PER 400 (previous default) | 948 | 38.53 / 0.9869 | 0.100° |
+| **c2f, PER 200 (deployed)** | **558** | 38.60 / 0.9853 | 0.142° |
+| *(--theta_oracle, x_t ceiling)* | *223* | *40.71 / 0.9893* | *0* |
+
+- **The estimator is 76–84% of a step** (949 s blind vs 223 s oracle), not the ~15% the old
+  ray-march-era note claimed. PER is the only real lever on inference time.
+- **Running fine throughout buys nothing** (+39% time, SSIM −0.0011 vs c2f, 3/3 patients).
+- **PER 100 does not converge** — rot still descending at step 49; SSIM −0.0096 = 5× the bar.
+  PER 50 collapses (−3.3 dB). `--per_sched ramp` is refuted on both quality and wall clock.
+- **Rerun noise is config-dependent**: 0.0018 SSIM at PER 400, **0.0047 at PER 200**. The
+  −0.00165 SSIM deficit of PER 200 is therefore *undetectable*, not *absent*; the 3/3 sign
+  agreement and the real rot degradation (0.100→0.142°) are the residual risk. Validated at
+  10/10 p2p only — θ costs the OUTPUT 0.1 dB but x_t **1.68 dB**, so a harder regime may break
+  PER 200 first. Montages indistinguishable by eye.
 
 ## FDK normalization (fitted scale DELETED 2026-07-28)
 

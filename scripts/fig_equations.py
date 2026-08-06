@@ -148,7 +148,7 @@ def draw_scheme(ax):
                    "$\\Delta t=1/N$,   $N=50$)")
     eq(ax, 43.0,
        "$\\tilde x_k \\;=\\; x_k \\;+\\; \\Delta t\\; v_{\\psi^\\star}(x_k,\\,t_k)$",
-       "PREDICT — the prior moves first, evaluated on $64^3$ tiles\n"
+       "PREDICT — the prior moves first, evaluated on $32^3$ tiles\n"
        "and blended back to the volume.", num=11)
     eq(ax, 34.5,
        "$\\theta_{k+1} \\;\\approx\\; \\mathrm{arg\\,min}_{\\,\\theta}\\;"

@@ -2,8 +2,8 @@
 (volume grad = LEAP's VD backprojection; geometry grad = ours, of LEAP's own model).
 
 The pair became LEAP's on 2026-07-29 (`fm3d/leap_projector.py`) and its modular forward was
-PINNED TO JOSEPH on 2026-07-30 (`FORCE_JOSEPH`, via our patch to the vendored library --
-refs/LEAP/FM3D_PATCH.md). Each consequence is a test here:
+PINNED TO JOSEPH on 2026-07-30 (`leap_projector._model` -> `set_forceJosephModular`, via our
+patch to the vendored library -- refs/LEAP/FM3D_PATCH.md). Each consequence is a test here:
 
   T1  THE FORWARD IS A DIFFERENT MODEL -- and since the pin it is a RAY-DRIVEN one, the same
       model class as the `grid_sample` ray march, so T1's old expectation is INVERTED: LEAP
@@ -45,7 +45,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fm3d.geometry_3d import ConeBeam3DConfig, build_conebeam_orbit, detector_coords_3d
-from fm3d.leap_projector import (ADJOINT_MODE, kernel_kind, leap_backproject, leap_project,
+from fm3d.leap_projector import (ADJOINT_MODE, leap_backproject, leap_project,
                                  leap_project_3d_batched, sf_branch, stock_kernel_kind)
 from fm3d.triton_leap_grad import leap_forward_model
 from fm3d.phantom import head_phantom
@@ -155,15 +155,16 @@ def main():
     check("stock LEAP would have picked SF on the nominal orbit",
           stock_kernel_kind(P_nom, nv=CFG.nv, du=kwf["du"], dv=kwf["dv"], dx=dx, dz=dz,
                             D=D, H=H, W=W) == "SF", "(the counterfactual this test needs)")
-    check("FORCE_JOSEPH is ACTIVE (deployed lib runs Joseph there anyway)", r_j < r_s / 10,
+    check("the Joseph pin is ACTIVE (deployed lib runs Joseph there anyway)", r_j < r_s / 10,
           f"vs JOSEPH-model {r_j:.2e}  vs SF-model {r_s:.2e}  -- an unpatched .so flips these")
 
     # T1b-ii the transcription itself, on the geometry production actually runs (Joseph),
-    # nominal AND moved.
+    # nominal AND moved. The moved geometry is where stock LEAP would ALSO have landed on
+    # Joseph -- printed, not asserted: the point of the pin is that the answer stops mattering.
     check("JOSEPH transcription, nominal orbit", r_j < 2e-4, f"rel = {r_j:.2e}")
-    kk = kernel_kind(P[0], nv=CFG.nv, du=kwf["du"], dv=kwf["dv"], dx=dx, dz=dz,
-                     D=D, H=H, W=W)
-    check("moved geometry is Joseph too (one kernel, always)", kk == "JOSEPH", f"kind = {kk}")
+    print("      stock LEAP on the MOVED geometry would have picked "
+          f"{stock_kernel_kind(P[0], nv=CFG.nv, du=kwf['du'], dv=kwf['dv'], dx=dx, dz=dz, D=D, H=H, W=W)}"
+          " (the pin makes it JOSEPH either way)")
     with torch.no_grad():
         g_model = leap_forward_model(vol[None], P, **kwf)
     r_mv = float((g_model - g_leap).norm() / g_leap.norm())
@@ -270,10 +271,10 @@ def main():
         return 0.5 * ((pred - y5) ** 2).mean()
 
     th5_0 = (0.5 * th_true5).detach().clone()
-    kk5 = kernel_kind(params_to_Pmot(th5_0, P_nom), nv=CFG.nv, du=kwf["du"], dv=kwf["dv"],
-                      dx=dx, dz=dz, D=D, H=H, W=W)
-    check("the T5 eval point is Joseph (as everything now is)", kk5 == "JOSEPH",
-          f"kind = {kk5}")
+    kk5 = stock_kernel_kind(params_to_Pmot(th5_0, P_nom), nv=CFG.nv, du=kwf["du"],
+                            dv=kwf["dv"], dx=dx, dz=dz, D=D, H=H, W=W)
+    print(f"      stock LEAP would run {kk5} at the T5 eval point; the pin runs JOSEPH, and "
+          "the gradient below is finite-differenced through the DEPLOYED loss either way")
     th5 = th5_0.clone().requires_grad_(True)
     loss5_at(th5).backward()
     g5 = th5.grad.clone()

@@ -4,7 +4,8 @@ Since 2026-07-30 the static FDK's distance-weighted backprojection runs through
 `leap_projector.leap_fdk_backproject` (the operator-unification decision: our
 cosine/Wang/Ohnesorge/ramp/Voronoi algorithm, LEAP's backprojector under it, with LEAP's
 geometric ray weight folded back to our exact 1/w^2 convention -- the algebra is in that
-function's docstring). The torch loop survives as the reference; FM3D_FDK_LEAP=0 routes to it.
+function's docstring). The torch loop survives as the reference; `_torch_ref=True` routes to
+it (a gate-only keyword -- the FM3D_FDK_LEAP environment switch was deleted 2026-08-04).
 
 WHAT IS CLAIMED:
   * the LEAP-backed FDK computes the SAME reconstruction as the torch reference up to the
@@ -50,11 +51,9 @@ def gate(name, ok, detail):
 
 
 def fdk(sino, P, u, v, cfg, leap: bool, **kw):
-    os.environ["FM3D_FDK_LEAP"] = "1" if leap else "0"
-    try:
-        return fdk_conebeam_3d_batched(sino, P, u, v, cfg, **kw)
-    finally:
-        os.environ.pop("FM3D_FDK_LEAP", None)
+    """`leap=False` takes the torch reference loop -- `_torch_ref` is the gate-only handle
+    that replaced the FM3D_FDK_LEAP environment switch (2026-08-04)."""
+    return fdk_conebeam_3d_batched(sino, P, u, v, cfg, _torch_ref=not leap, **kw)
 
 
 def smooth_sino(B, V, nv, nu, seed=0):

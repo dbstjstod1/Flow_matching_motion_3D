@@ -230,8 +230,8 @@ def make_motion(
     kind: str,
     n_views: int,
     *,
-    trans_mm: tuple[float, float, float] = (6.0, 6.0, 4.0),
-    rot_deg: tuple[float, float, float] = (3.0, 3.0, 4.0),
+    trans_mm: float | tuple[float, float, float] = (6.0, 6.0, 4.0),
+    rot_deg: float | tuple[float, float, float] = (3.0, 3.0, 4.0),
     cycles: float = 1.5,
     device="cpu",
     dtype=torch.float32,
@@ -267,8 +267,18 @@ def make_motion(
         g.manual_seed(seed)
 
     s = torch.arange(n_views, dtype=torch.float64) / max(n_views - 1, 1)
+    # SCALARS ARE ISOTROPIC, as they already are on the `akima` path (`akima_motion`'s own
+    # signature takes `float | tuple`). Without this the non-akima kinds raised
+    # `TypeError: 'float' object is not iterable` for every caller that passes a plain number --
+    # which is what `run_posterior3d.build_world` does for ALL kinds, so `--motion_kind mixed`
+    # (and sinusoid/linear/jerk/step) crashed before the first projection. That included the
+    # reproduction recipe printed in run_posterior3d's own --motion_kind comment.
+    def _triple(a):
+        return [float(a)] * 3 if isinstance(a, (int, float)) else [float(v) for v in a]
+
     # `_profile` scales by the PEAK, and the arguments are peak-to-peak -> halve.
-    amps = [0.5 * a for a in list(trans_mm)] + [0.5 * math.radians(d) for d in rot_deg]
+    amps = [0.5 * a for a in _triple(trans_mm)] + \
+           [0.5 * math.radians(d) for d in _triple(rot_deg)]
 
     kinds = ["sinusoid", "linear", "jerk", "step"]
     theta = torch.zeros(n_views, 6, dtype=torch.float64)

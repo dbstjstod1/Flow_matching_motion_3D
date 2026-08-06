@@ -2,3 +2,9 @@ data/
 __pycache__/
 *.pyc
 logs/
+
+# Downloaded papers: not our output, and a PDF is a permanent binary blob in git history.
+# The IEEE Xplore full text also carries "Authorized licensed use limited to ... Restrictions
+# apply" in its own footer. Read it from docs/ locally; refs/ carries the text extraction we
+# actually cite line numbers against.
+docs/*.pdf

@@ -26,8 +26,8 @@ independent rigid pose on every view:
              settings ("hashbl"). This is the deployed default there.
 
 NOTE ON THE PROJECTOR. Motion estimation needs d(loss)/dP. The forward is LEAP's modular-beam
-projector, PINNED to its Joseph kernel (`leap_projector.FORCE_JOSEPH`, no backend switch and
-no kernel switch), and the geometry gradient is the EXACT gradient of that kernel
+projector, PINNED to its Joseph kernel (`leap_projector._model` -> `set_forceJosephModular`;
+no backend switch and no kernel switch), and the geometry gradient is the EXACT gradient of it
 (`triton_leap_grad.leap_grad_P`). Because Joseph is bilinear in continuous coordinates the
 exact gradient is also the loss TREND -- the pin removed the SF lattice ripple that used to
 force a surrogate. Gated by `scripts/gate_leap_projector.py` (FD of the LEAP loss itself) and

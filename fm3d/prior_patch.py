@@ -234,7 +234,8 @@ def predict_x1_patched(model, x_t: torch.Tensor, t: float, *, patch: int = 64,
 @torch.no_grad()
 def prior_ode(model, x0: torch.Tensor, *, n_steps: int = 50, patch: int = 64,
               stride: int | None = None, batch: int = 8, context: str = "auto",
-              n_offsets: int = 1, blend: str = "hann", generator=None) -> torch.Tensor:
+              n_offsets: int = 1, blend: str = "hann", generator=None,
+              amp: bool = True) -> torch.Tensor:
     """Prior-ONLY Euler integration of the FM ODE, t: 0 -> 1. No data consistency, no TV --
     "what does the prior ALONE make of the cold start". This is the validation metric, the same
     one the sibling 4DCT project renders every `val_every` steps.
@@ -247,14 +248,21 @@ def prior_ode(model, x0: torch.Tensor, *, n_steps: int = 50, patch: int = 64,
     x <- x + (dt/(1-t)) * (x1_hat - x_t) -- so the t -> 1 endpoint is well behaved. On an affine
     path an oracle net emitting the true constant velocity gives x_N = x_1 for any N; on this
     project's CURVED geometry bridge more steps genuinely help, hence the default 50 (the deploy
-    loop's own count), against 4DCT's cheaper 10."""
+    loop's own count), against 4DCT's cheaper 10.
+
+    `amp` defaults to TRUE and matches `run_posterior3d`'s deployed `--prior_amp`, for exactly the
+    same reason: the 500k prior TRAINED under fp16 autocast, so an fp16 forward is the regime the
+    weights saw, and the fp32 path this took until 2026-08-04 was itself the mismatch. It was
+    simply never wired through, which ran the inline validation 1.6x slower (measured 369 vs 231
+    ms per 64 tiles) in a precision the deployed loop does not use -- i.e. the val curve was
+    scoring a configuration nothing ships. Pass amp=False to reproduce an older val number."""
     x = x0
     dt = 1.0 / n_steps
     for k in range(n_steps):
         t = k / n_steps
         x1 = predict_x1_patched(model, x, t, patch=patch, stride=stride, batch=batch,
                                 context=context, n_offsets=n_offsets, blend=blend,
-                                generator=generator)
+                                generator=generator, amp=amp)
         x = x + (dt / max(1.0 - t, 1e-3)) * (x1 - x)          # == x + dt * v
     return x
 

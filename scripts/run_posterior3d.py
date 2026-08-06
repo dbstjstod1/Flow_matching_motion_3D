@@ -77,10 +77,11 @@ def fm_predict(model, gen, x_mu, t, dt, patch, context="auto", n_offsets=1, gene
 
     The prior is evaluated PATCH-WISE and blended (`predict_x1_patched`), never on the whole slab
     at once, and that is not only about memory. UNet3D normalizes with GroupNorm, whose statistics
-    are taken over the spatial extent -- so the same weights fed a 64x256x256 volume normalize
-    differently than they did on the 32^3 patches they were trained on. Running the net at a
-    spatial size it never saw is a silent train/test mismatch. The blending is identity-exact, so
-    tiling costs nothing.
+    are taken over the spatial extent -- so the same weights fed a 256^3 volume normalize
+    differently than they did on the `--patch`^3 patches they were trained on (32^3 in the
+    deployed checkpoint; `patch` comes off the ckpt args, never off a literal here). Running the
+    net at a spatial size it never saw is a silent train/test mismatch. The blending is
+    identity-exact, so tiling costs nothing.
 
     `blend`: "uniform" (DEFAULT) = the archive paper's non-overlapping random-tiling scheme
     (arXiv:2512.18161), which needs n_offsets>=2 (a single non-overlapping pass leaves seams).
@@ -130,11 +131,13 @@ def _adjoint(s, P, gen):
     kernel neither of LEAP's backprojectors is, and the defect is MEASURED, not asserted
     (gate_leap_projector T2: 3.5e-4 on a real sinogram, 1.3e-2 on white noise).
 
-    HISTORY, because three regimes preceded this one and their lessons are in the memories: the
+    HISTORY, because several regimes preceded this one and their lessons are in the memories: the
     autograd-of-a-zero-forward route (wasted a full march per call), the direct ray-march
-    scatter (3.9 s/application, L2-footprint-bound floor), and the toolkits' UNMATCHED voxel
-    gather (35x cheaper but B A nonsymmetric; quality -0.5 dB in the A/B). The SF transpose is
-    the resolution: matched AND gather-speed (2026-07-28, all other operators retired)."""
+    scatter (3.9 s/application, L2-footprint-bound floor), the toolkits' UNMATCHED voxel gather
+    (35x cheaper but B A nonsymmetric; quality -0.5 dB in the A/B), and our own SF pair, which
+    WAS matched to ~1e-6 and is now gates-only. The 2026-07-29/30 switch to LEAP traded that
+    exactness back for one vendor-verified operator everywhere: we are again on an unmatched
+    pair, at the defect measured above rather than at the toolkits' unmeasured one."""
     with torch.no_grad():
         return gen.adjoint(s[None], P[None])[0, 0]
 
@@ -248,12 +251,20 @@ def cg_dc_step(x_mu, theta, y, gen, iters=5, lam=0.0, views=None):
     regularizer (truncated-Krylov). lam > 0 adds an explicit proximal pull toward the warm start;
     lam = 0 relies on `iters` alone (the DDS default flavor).
 
-    A/A^T are the SF MATCHED pair (the project's only operator since 2026-07-28: gen.project
-    and gen.adjoint both route to fm3d/triton_sf, adjoint identity ~1e-6 in gate_sf_projector),
-    so this is honest truncated-Krylov -- unlike the toolkits' unmatched-gather CG it briefly
-    ran as (quality -0.5 dB in that A/B), and at gather speed unlike the retired ray-march
-    scatter (3.9 s/application). Wrong-theta stamping is bounded by `iters`, not by a step
-    size: keep it small (3-5) while theta is still moving.
+    THE PAIR IS NO LONGER MATCHED, so `M` is not exactly symmetric and this is CG on a
+    slightly non-symmetric operator. Since 2026-07-30 A is LEAP's Joseph modular forward and
+    A^T is LEAP's VD backprojector (see `_adjoint`); the SF pair that WAS matched to ~1e-6 is
+    gates-only. MEASURED on this geometry, 256^3 / 360 views / akima 10-10 motion:
+        adjointness   <Au,s> vs <u,A^Ts>       3.5e-4 on a real sinogram, 1.25e-2 on noise
+        symmetry      <Mu,w> vs <u,Mw>         7e-3 .. 1.2e-2 on image-like directions
+    That is a real defect, not a rounding one, and CG has no convergence theorem here. What it
+    does have is the measurement: run from the loop's own warm start (the cold FDK), ||Az - y||
+    fell MONOTONICALLY over 8 iterations (2.13e3 -> 5.18e2) with p^T M p > 0 throughout -- no
+    breakdown, no negative curvature. So the deployed --cg_iters 5 is empirically safe; treat
+    a LARGE --cg_iters as unvalidated, since asymmetry compounds with Krylov depth.
+
+    Wrong-theta stamping is bounded by `iters`, not by a step size: keep it small (3-5) while
+    theta is still moving -- which is also what keeps the asymmetry above harmless.
 
     MEMORY. The volumes are trivial (256^3 fp32 = 64 MB) but each A(v) materializes a FULL
     SINOGRAM (~482 MB at 360 x 500 x 700). Peak is therefore set by how many sinograms are alive
@@ -349,7 +360,9 @@ def admm_dc_step(x_mu, theta, y, gen, state, *, rho, thresh, iters=5, views=None
             return gen.project(v[None, None], P[None])[0]
 
     def AT(s):
-        # LEAP's VD backprojector, exactly as in cg_dc_step
+        # LEAP's VD backprojector, exactly as in cg_dc_step -- and carrying the same
+        # non-symmetry of A^T A that `cg_dc_step`'s docstring measures. The rho*D^T D block
+        # added below IS exactly symmetric, so it dilutes rather than compounds it.
         return _adjoint(s, P, gen)
 
     def DtD(v):
@@ -487,8 +500,15 @@ def build_world(*, ckpt, dev="cuda", root=None, split="val", data=DATA,
         root = root or ca.get("root")
         if not root or not os.path.isdir(root):
             raise SystemExit(f"CQ500 root {root!r} not found -- pass --root")
+        # THE SIMULATION GRID COMES OFF THE CHECKPOINT TOO. y is the one thing the prior was
+        # trained against, and `sim_grid` decides whether it is projected from the native
+        # 612^3 truth or from the 1 mm inversion grid (the inverse crime). Both default to
+        # "native", so this is currently a no-op -- but leaving it implicit is exactly how a
+        # coarse-trained prior would get evaluated on native data without a word of warning,
+        # the same failure class the dataset/shape/views checks above exist to stop.
         gen = CQ500Generator(root, cfg, device=dev, split=split,
-                             shape=tuple(ca["shape"]), voxel_mm=1.0)
+                             shape=tuple(ca["shape"]), voxel_mm=1.0,
+                             sim_native=(ca.get("sim_grid", "native") == "native"))
     elif ds == "aapm":
         cfg = ConeBeam3DConfig(det_bin=2, n_views=ca["views"])
         gen = AAPMSlabGenerator(data, cfg, device=dev, slab=ca["slab"],
@@ -593,12 +613,36 @@ def main():
     # 500 = 0.20, 1500 = 0.17, and REBOUNDS to 0.28 by 2250 with no lr decay. At n_steps=30 the
     # estimator warm-starts across steps, so PER=50 accumulates 30*50 = 1500 iters over the loop
     # -- landing at the knee and BEFORE the 2250-iter rebound.
-    # PER 400 is the deployed value (2026-07-27). The estimator is only ~15% of a step (49.0 s
-    # blind vs 41.7 s with --theta_oracle), and theta is worth 6-11 dB on x_t, so iterations are
-    # the cheapest thing to buy: 50 -> 200 gained +1.74 dB of x_t and 200 -> 400 another +0.57.
-    # 400 is PAST the accuracy knee (~200) but it is what the coarse-to-fine schedule below is
-    # priced for -- on the 2 mm grid an iteration costs ~1/6.4 of a fine one.
-    ap.add_argument("--per", type=int, default=400)          # motion iters per ODE step
+    # PER 200 is the deployed value (user's call, 2026-08-03), down from 400. REPLACES the old
+    # note here, whose premise is REFUTED: "the estimator is only ~15% of a step (49.0 s blind vs
+    # 41.7 s oracle)" was measured on the RETIRED ray-march operator. Re-measured under LEAP on
+    # the 500k prior: 949 s blind vs 223 s with --theta_oracle, i.e. the estimator is 76-84% OF
+    # THE STEP. PER is therefore the only real lever on inference time, and 400 was buying the
+    # tail of a converged fit.
+    #
+    # 3-patient blind A/B (500k ckpt, val 0/1/2, akima 10/10 p2p, everything else at the winning
+    # set), x_t aligned vs GT -- the deliverable:
+    #     c2f PER 400   948 s   38.53 dB / SSIM 0.9869   rot 0.100 deg
+    #     c2f PER 200   558 s   38.60 dB / SSIM 0.9853   rot 0.142 deg   <- -41% wall clock
+    # and the montages are indistinguishable by eye on both patients rendered.
+    #
+    # WHAT THE NOISE BAR ALLOWS YOU TO CONCLUDE. The loop is not bit-reproducible (atomics), and
+    # the rerun spread is CONFIG-DEPENDENT: identical-command reruns differ by 0.0018 SSIM at
+    # PER 400 but 0.0047 at PER 200 (less converged -> more variable). So the -0.00165 SSIM
+    # deficit is NOT resolved -- "undetectable at this rig", not "free". Two residual hints that
+    # it is real: the sign is the same on 3/3 patients, and rot genuinely degrades (0.100 ->
+    # 0.142 deg, outside its own 0.03 deg bar). rot costs the OUTPUT nothing (FDK is already the
+    # ceiling, 0.1 dB) but x_t 1.68 dB, so a harder regime -- larger amplitude, worse cold start
+    # -- may break PER 200 first. Validated at 10/10 p2p only.
+    #
+    # WHAT IS BELOW THE KNEE. PER 100 does NOT converge: its rot curve is STILL DESCENDING at
+    # step 49 (fine grid: 3.18 -> 1.62 @5 -> 0.36 @20 -> 0.22 @49, against PER 400's plateau at
+    # ~0.16 by step 20), and it loses 0.0096 SSIM = 5x the bar. PER 50 collapses outright
+    # (-3.3 dB / -0.019 SSIM). The loop is path-dependent, so the damage is done EARLY: PER 100
+    # is at 1.62 deg where PER 400 is at 0.45 deg by step 5, and no amount of late refinement
+    # undoes the geometry that got baked into x_t. Do not cut below 200 without re-running the
+    # 3-patient A/B.
+    ap.add_argument("--per", type=int, default=200)          # motion iters per ODE step
     ap.add_argument("--estimator", default="net")            # net = hashbl, the 2D default
     # PLAIN L2 (user's call, 2026-07-28). `l2si` was inherited from the 2D project, where the
     # flow-matching push and the data-residual update disagreed about the image's overall
@@ -756,8 +800,9 @@ def main():
     # ---- THE OPERATOR (2026-07-29/30, user decisions, retraining accepted) ----------------
     # There is no operator knob anymore. forward_project_3d_batched and gen.adjoint route every
     # call -- estimator (d/dP included), CG/ADMM pair, y simulation, trainer bridge, FDK -- to
-    # LEAP modular-beam: forward = LEAP's JOSEPH kernel, PINNED (leap_projector.FORCE_JOSEPH,
-    # via our patch to the vendored library, refs/LEAP/FM3D_PATCH.md, so the geometry can no
+    # LEAP modular-beam: forward = LEAP's JOSEPH kernel, PINNED (set_forceJosephModular in
+    # leap_projector._model, via our patch to the vendored library, refs/LEAP/FM3D_PATCH.md,
+    # so the geometry can no
     # longer flip the model mid-run); backward = LEAP's VD backprojector, which also carries
     # our FDK (leap_fdk_backproject folds LEAP's ray weight back to our 1/w^2 convention).
     # The retired flavors and why, so nobody reinvents them:
@@ -864,16 +909,37 @@ def main():
                          "path-dependent: theta and x_t bootstrap each other, so the early steps "
                          "bake a badly-wrong geometry into x_t that later steps cannot undo. A "
                          "second pass re-runs those early steps with the theta we ended up with")
+    # c2f IS FREE SPEED, measured 3v3 blind on the 500k prior (2026-08-03), x_t aligned vs GT:
+    #     fine the whole way (--est_coarse 1)   1321 s   38.52 dB / SSIM 0.9858 / rot 0.122 deg
+    #     c2f (this default)                     948 s   38.53 dB / SSIM 0.9869 / rot 0.100 deg
+    # So running fine throughout costs +39% wall clock and buys NOTHING -- c2f is in fact ahead
+    # on SSIM (3/3 patients, though by less than the 0.0018 rerun bar) and on rot. The reason is
+    # visible in the step profile: c2f's saving is entirely in steps 0-24 (10.7 vs 25.3 s/step),
+    # which is exactly the IMAGE-LIMITED stretch where theta falls 2.5 -> 0.16 deg and where this
+    # file's own `per_at` note measured every estimator config plateauing at ~2 deg regardless of
+    # lr/loss/bandwidth. 1 mm precision cannot be cashed in against a reference that bad; the
+    # steps where it can are already fine. Coarse ALL the way (--est_coarse_until 1.0) is another
+    # 2x cheaper again at equal x_t but 1.7x worse rot -- available, not deployed.
     ap.add_argument("--est_coarse_until", type=float, default=0.5,
                     help="ODE time at which --est_coarse switches back to the full grid. 1.0 = "
                          "coarse the whole way. TRUE COARSE-TO-FINE: the coarse grid converges "
                          "faster early but plateaus higher (~0.30 deg vs the fine run's 0.176), "
                          "so buy the descent cheaply and the endpoint precisely")
+    # `ramp` IS REFUTED (2026-08-03, blind val0, c2f, PER 200): x_t 39.30 -> 36.76 dB and rot
+    # 0.16 -> 0.32 deg against `const` at the same iteration count. Its premise -- that early
+    # iterations are wasted because the cold reference is image-limited -- ignores that the
+    # estimator WARM-STARTS across ODE steps and the loop is PATH-DEPENDENT, so the early fit is
+    # what the whole trajectory is built on. It also costs MORE WALL CLOCK, not the same: "SAME
+    # TOTAL" is true of ITERATIONS, but ramp moves them onto the t>0.5 steps, which run on the
+    # fine grid at ~2.5x the price per iteration (557 s const -> 649 s ramp). Keep `const`.
+    # If the tail ever does need trimming, the schedule to write is the OPPOSITE one (decay:
+    # big early, small late) -- PER 400 plateaus at ~0.16 deg by step 20 and then spends ~60% of
+    # the runtime buying 0.16 -> 0.08 deg, which PER 200's result says x_t does not cash in.
     ap.add_argument("--per_sched", default="const", choices=["const", "ramp"],
-                    help="how --per is spent across the ODE. `ramp` is linear in t at the SAME "
-                         "TOTAL cost (2*per*(k+0.5)/N), front-loading nothing and back-loading the "
-                         "work onto the steps where the reference image can actually support it -- "
-                         "on a cold reference every estimator config plateaus at ~2 deg")
+                    help="how --per is spent across the ODE. `const` is DEPLOYED. `ramp` is "
+                         "linear in t at the same ITERATION count (2*per*(k+0.5)/N), back-loading "
+                         "the work onto the late steps -- MEASURED WORSE on both axes, see above; "
+                         "kept only so the refutation stays reproducible")
     ap.add_argument("--context", default="auto", choices=["auto", "global", "none"],
                     help="auto reads in_ch off the checkpoint's in_conv weight")
     ap.add_argument("--blend", default="uniform", choices=["uniform", "hann"],
@@ -904,6 +970,14 @@ def main():
                          "(blend stays fp32). --no-prior_amp for the fp32 forward the "
                          "pre-2026-07-25 baselines used.")
     ap.add_argument("--no-prior_amp", dest="prior_amp", action="store_false")
+    # Same knob, same default and the same rationale as train_fm3d's --compile: the prior net is
+    # 24% of an ODE step and torch.compile fuses its many small 3D-conv kernels. It compiles the
+    # UNDERLYING module (the ckpt is loaded first), so nothing about the weights or the blend
+    # changes -- only kernel scheduling. Measured 1.34x on top of --prior_amp.
+    ap.add_argument("--compile", action="store_true", default=True,
+                    help="torch.compile the prior net (~1.34x on the net forward, ~8%% of the "
+                         "run). One graph, compiled once. --no-compile to disable.")
+    ap.add_argument("--no-compile", dest="compile", action="store_false")
     args = ap.parse_args()
     if args.blend == "uniform" and args.patch_offsets < 2:
         raise SystemExit("--blend uniform needs --patch_offsets >= 2 (K=1 leaves tile seams; "
@@ -952,6 +1026,17 @@ def main():
     model.eval()
     for q in model.parameters():
         q.requires_grad_(False)
+    # torch.compile, for the SAME reason the trainer does it (train_fm3d --compile): the prior is
+    # a stack of many small 3D convs and the win is kernel fusion, not precision. MEASURED here,
+    # 64 tiles of 32^3, in_ch=5 base=32, A6000:
+    #     fp32 eager 369.3 ms | fp16 autocast 230.7 ms (the deployed --prior_amp) | +compile 172.3 ms
+    # i.e. 1.34x on top of amp, which is ~24% of an ODE step (1024 tiles / 64 = 16 net calls per
+    # step at the deployed uniform K=2). The tile SHAPE is constant for a whole run, so exactly
+    # one graph is compiled and the ~1 min warmup is paid once. channels_last_3d was measured and
+    # is SLOWER here (287 ms) -- do not add it.
+    if args.compile:
+        model = torch.compile(model)
+        print("torch.compile: ON for the prior (~1.34x on the net forward). --no-compile to disable.")
 
     spacing, meas = world["spacing"], world["meas"]
     gt3, theta_true = world["gt3"], world["theta_true"]

@@ -13,7 +13,7 @@ Every label is taken from the code it describes, so keep them in sync when the p
   training  -- scripts/train_fm3d.py (bridge, anchor, cache, optimizer) + fm3d/prior_patch.py
                (patch tiling, in_ch=5 global context)
   inference -- scripts/run_posterior3d.py (predictor-corrector loop, dc_op=cg, theta readout)
-               + fm3d/motion_estimation.py (MotionNet6DoF, l2si) + fm3d/tv.py (TV corrector)
+               + fm3d/motion_estimation.py (MotionNet6DoF, l2) + fm3d/tv.py (TV corrector)
 """
 
 from __future__ import annotations
@@ -100,7 +100,7 @@ def draw_training(ax):
     box(ax, xs[0], y1, w, h, "Head volume  $x_{GT}$",
         "CQ500, $256^3$ @ 1 mm\nHU $\\rightarrow\\ \\mu$ (1/mm)", DATA)
     box(ax, xs[1], y1, w, h, "Random rigid motion  $\\theta$",
-        "Akima spline, 10 nodes, per view\n6-DoF, 5 mm / 5$\\degree$ peak", DATA)
+        "Akima spline, 10 nodes, per view\n6-DoF, 10 mm / 10$\\degree$ peak-to-peak", DATA)
     box(ax, xs[2], y1, w, h, "Cone-beam forward projection",
         "$y = A(x_{GT};\\, P_{nom}T(\\theta))$\nSID 785 / SDD 1200, 360 views", DATA)
     box(ax, xs[3], y1, w, h, "Motion-corrupted scan  $y$",
@@ -136,9 +136,9 @@ def draw_training(ax):
     band(ax, 23.5, "3.  Train the patch prior", x=157.0, ha="right")
     y3, h3 = 7.0, 13.5
     box(ax, 3.0, y3, 30.0, h3, "Patch sampling",
-        "$64^3$ crops, origins inside\nthe MEASURED-REGION mask", PRIOR)
+        "$32^3$ crops, origins inside\nthe MEASURED-REGION mask", PRIOR)
     box(ax, 36.0, y3, 34.0, h3, "Input channels: $in\\_ch=5$",
-        "ch0 $x_t$ patch | ch1 whole $x_t$ $\\downarrow$ to $64^3$\n"
+        "ch0 $x_t$ patch | ch1 whole $x_t$ $\\downarrow$ to $32^3$\n"
         "ch2–4 absolute $z,y,x$  (global context)", PRIOR)
     box(ax, 73.0, y3, 27.0, h3, "UNet3D   $v_\\psi(x_t,t)$",
         "base 32, $t$-embedding\ntorch.compile", PRIOR)
@@ -154,9 +154,9 @@ def draw_training(ax):
     tag(ax, 115.0, 30.0, "$dx_t/dt$", color="#6d28d9")
 
     foot(ax, 5.0, "MEMORY SPLIT — the OPERATOR (FDK + its tangent) runs on the FULL volume under "
-                  "no_grad; the NET only ever sees $64^3$ patches.")
+                  "no_grad; the NET only ever sees $32^3$ patches.")
     foot(ax, 2.9, "A rolling cache of 8 whole-volume bridge draws is refreshed every 12 steps; "
-                  "each batch of 8 patches mixes several draws, so $t$ varies within a batch.")
+                  "each batch of 64 patches mixes several draws, so $t$ varies within a batch.")
     foot(ax, 0.8, "Validation = prior-only ODE from the cold start on held-out patients: "
                   "25.42 dB / SSIM 0.78 (rigid-aligned).")
 
@@ -175,7 +175,7 @@ def draw_inference(ax):
     # ---- inputs --------------------------------------------------------------------------
     yt, ht = 66.5, 12.0
     box(ax, 3.0, yt, 32.0, ht, "Measured scan  $y$",
-        "motion-corrupted, blind\n(Akima 5 mm / 5$\\degree$ test motion)", DATA)
+        "motion-corrupted, blind\n(Akima 10 mm / 10$\\degree$ p2p test motion)", DATA)
     box(ax, 40.0, yt, 34.0, ht, "Cold start",
         "$x \\leftarrow \\mathrm{FDK}(y,P_{nom})$,   $\\hat\\theta \\leftarrow 0$", DATA)
     box(ax, 79.0, yt, 42.0, ht, "Trained FM prior  $v_\\psi$   (FROZEN)",
@@ -192,16 +192,16 @@ def draw_inference(ax):
     yl, hl = 28.5, 25.0
     box(ax, 6.0, yl, 44.0, hl, "1.  PREDICT — the prior moves first",
         "$x_{prior}=x+dt\\cdot v_\\psi(x,t)$\n\n"
-        "evaluated on $64^3$ tiles carrying the\n"
+        "evaluated on $32^3$ tiles carrying the\n"
         "global-context channels, then blended\nback to the full volume",
         PRIOR, ts=9.6, bs=8.2)
     box(ax, 55.0, yl, 46.0, hl, "2.  ESTIMATE — on the IMPROVED image",
-        "$\\hat\\theta=\\arg\\min_\\theta\\; L_{l2si}(A(x_{prior};P_{nom}T(\\theta)),\\; y)$\n\n"
-        "MotionNet6DoF over the view index\n(Instant-NGP, full band, lr $10^{-3}$)\n"
-        "50 it/step, 24 views/it, warm-started,\ncoarse-to-fine estimation grid",
+        "$\\hat\\theta=\\arg\\min_\\theta\\; L_{2}(A(x_{prior};P_{nom}T(\\theta)),\\; y)$\n\n"
+        "MotionNet6DoF over the view index\n(Instant-NGP, full band, lr $3\\!\\cdot\\!10^{-3}$)\n"
+        "400 it/step, 24 views/it, warm-started,\ncoarse-to-fine estimation grid",
         EST, ts=9.6, bs=8.2)
     box(ax, 106.0, yl, 45.0, hl, "3.  CORRECT — PnP forward–backward",
-        "data step (CG, 5 it, matched adjoint):\n"
+        "data step (CG, 5 it, LEAP VD adjoint):\n"
         "$z \\approx \\arg\\min_z \\Vert A_{\\hat\\theta}\\,z-y\\Vert ^2$\n\n"
         "TV corrector:  $z \\leftarrow z+\\kappa\\,(\\mathrm{TV}(z)-z)$\n"
         "$\\kappa=0.3$, 5 inner it, step 0.015",
@@ -231,7 +231,7 @@ def draw_inference(ax):
     # ---- outputs -------------------------------------------------------------------------
     band(ax, 15.8, "Readout")
     box(ax, 3.0, 3.0, 46.0, 10.5, "Motion estimate",
-        "$\\bar\\theta$ = mean of the last $K=2$ steps\n(kills the period-2 tail limit cycle)",
+        "$\\hat\\theta$ = the last step's estimate\n($K$-step averaging available offline)",
         EST, ts=9.4, bs=8.0)
     box(ax, 54.0, 3.0, 48.0, 10.5, "Two deliverables",
         "output $=\\mathrm{FDK}(y,\\,P_{nom}T(\\bar\\theta))$\n"

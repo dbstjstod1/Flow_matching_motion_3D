@@ -13,18 +13,19 @@ WHAT STAYS OURS, AND WHY:
     motion-compensated case. Since 2026-07-30 the backprojection OPERATOR under the algorithm
     is LEAP's modular VD backprojector (`leap_projector.leap_fdk_backproject`, which folds
     LEAP's geometric ray weight back to our exact 1/w^2 convention; parity vs the retired
-    fused kernel 3.1e-3 / ls-scale 1.000000, and faster). FM3D_FDK_LEAP=0 forces the torch
-    reference loop. The bridge's analytic s-TANGENT is the EXACT derivative of that same VD
-    model (`leap_fdk_backproject_tangent` -- LEAP ships no derivative, so we differentiated
-    its kernel; fp64-jvp parity 5.0e-5), while the tangent path's VALUE comes from the same
-    `leap_fdk_backproject` call the anchor uses, keeping x(1) bit-consistent with it.
-    FM3D_FDK_TANGENT_LEAP=0 forces the torch tangent reference.
+    fused kernel 3.1e-3 / ls-scale 1.000000, and faster). The bridge's analytic s-TANGENT is
+    the EXACT derivative of that same VD model (`leap_fdk_backproject_tangent` -- LEAP ships
+    no derivative, so we differentiated its kernel; fp64-jvp parity 5.0e-5), while the tangent
+    path's VALUE comes from the same `leap_fdk_backproject` call the anchor uses, keeping x(1)
+    bit-consistent with it. The torch loops under both survive only as the GATES' reference
+    (`_torch_ref=True`) and as the differentiable/CPU safety route -- there is no environment
+    variable and no user-facing switch (FM3D_FDK_LEAP / FM3D_FDK_TANGENT_LEAP are gone).
   * `d(loss)/dP`, in `triton_leap_grad.leap_grad_P`. LEAP has no geometry derivative at all
     (`leaptorch`'s backward returns the volume gradient and `None` for everything else), so
     the motion estimator could never run on it. `LEAPProject` takes its value and its volume
     gradient from LEAP and its geometry gradient from our kernel -- the EXACT gradient of the
-    Joseph forward LEAP is pinned to (`leap_projector.FORCE_JOSEPH`), so one operator and one
-    gradient serve every geometry.
+    Joseph forward LEAP is pinned to (`leap_projector._model`'s `set_forceJosephModular`), so
+    one operator and one gradient serve every geometry.
   * The ray-march `grid_sample` REFERENCE, `reference_project_3d_batched` below. It is not a
     backend any more -- nothing in production can reach it -- but it is the gates' independent
     oracle: exact autograd by construction, in a third codebase, which is what lets a gate
@@ -47,14 +48,14 @@ FM prior's volume-size problem is the OTHER half and is solved by 3D patches (pr
 from __future__ import annotations
 
 import math
-import os
 
 import torch
 import torch.nn.functional as F
 
 from .geometry_3d import ConeBeam3DConfig
 from .filters import DEFAULT_RAMP_WINDOW, ramp_filter, calibrate_scale  # ramp; calibrate_scale is gate-only now
-from .leap_projector import leap_backproject_3d_batched, leap_project_3d_batched
+from .leap_projector import (leap_backproject_3d_batched, leap_project_3d_batched,
+                             leap_project_3d_tangent)
 
 __all__ = [
     "forward_project_3d_batched",
@@ -63,6 +64,7 @@ __all__ = [
     "reference_adjoint_3d_batched",
     "_fdk_physical_norm",
     "fdk_conebeam_3d_batched",
+    "fdk_backproject_filtered",
     "fdk_conebeam_3d_tangent",
     "wang_weight",
     "calibrate_scale",
@@ -225,6 +227,32 @@ def forward_project_3d_batched(
         raise ValueError("the projector pair is LEAP's and runs on the GPU only; "
                          "`reference_project_3d_batched` serves CPU tensors, for gates")
     return leap_project_3d_batched(volumes, Pmat, u_coords, v_coords, dx=dx, dy=dy, dz=dz)
+
+
+def forward_project_3d_tangent(
+    volumes: torch.Tensor,    # (B, 1, D, H, W)
+    Pmat: torch.Tensor,       # (B, V, 3, 4)
+    Pdot: torch.Tensor,       # (B, V, 3, 4)  dP/ds
+    u_coords: torch.Tensor,
+    v_coords: torch.Tensor,
+    *,
+    dx: float,
+    dy: float,
+    dz: float,
+):
+    """(y, dy/ds) of THE forward operator along Pdot -- the DATA bridge's velocity target.
+
+    The forward-projection twin of `fdk_conebeam_3d_tangent`: one fused pass that emits the
+    value and the EXACT s-derivative of the same Joseph kernel, replacing a central difference
+    that needed three simulations per draw and still sat 2-4% from the limit. See
+    `leap_projector.leap_project_3d_tangent`.
+    """
+    if volumes.ndim != 5:
+        raise ValueError("volumes must be (B, 1, D, H, W)")
+    if not volumes.is_cuda:
+        raise ValueError("the projector pair is LEAP's and runs on the GPU only")
+    return leap_project_3d_tangent(volumes, Pmat, Pdot, u_coords, v_coords,
+                                   dx=dx, dy=dy, dz=dz)
 
 
 def reference_project_3d_batched(
@@ -550,10 +578,10 @@ def fdk_conebeam_3d_batched(
     view_chunk: int = 8,
     vox_chunk: int = 2_000_000,
     eps: float = 1e-8,
-    disp: torch.Tensor | None = None,
     trunc_pad: int | None = None,
     view_weight: torch.Tensor | None = None,
     _return_filtered: bool = False,
+    _torch_ref: bool = False,       # GATE ONLY: force the torch reference backprojection
 ) -> torch.Tensor:
     """Batched FDK (Feldkamp) cone-beam reconstruction. Returns (B, D, H, W).
 
@@ -567,24 +595,12 @@ def fdk_conebeam_3d_batched(
     caller that averages the batch elements over the true V reproduces the
     standard FDK weight — this is what the continuous 3D MC-FBP relies on.
 
-    `disp` (B, V, 3, D, H, W) VOXEL displacements = MOTION-COMPENSATED backprojection.
-    Each reference voxel q is backprojected from where its material actually WAS at that
-    view's acquisition time:
-
-        r(q) = q - phi(q, tau_v)        (1st-order inverse of the pull map r -> r + phi(r))
-
-    i.e. the DVF moves the backprojection COORDINATES, and the ray geometry (u, v, and the
-    1/w^2 distance weight) is evaluated at the moved point r, not at q. This is the correct
-    MC-FDK and it costs NO extra interpolation: the only resampling is the detector
-    `grid_sample` that plain FDK already performs.
-
-    Do NOT go back to `backproject-then-warp-the-volume` (FDK on the reference grid followed
-    by `warp_volume(svbp, -phi)`). It applies the SAME first-order map but pays one trilinear
-    VOLUME resample per view, and at |phi| ~ 1 voxel a trilinear resample destroys ~40% of the
-    Laplacian energy -- measured. The blur then survives the view average.
-
-    `disp=None` (or all-zero) reduces EXACTLY to the uncorrected static FDK: the moved coords
-    are the voxel centers bit-for-bit.
+    RIGID MOTION ONLY, and it enters through `Pmat` -- one per view, so a motion-compensated
+    reconstruction is just this function called with the moved geometry. (A `disp` (B,V,3,
+    D,H,W) DVF argument for DEFORMABLE MC-FDK lived here until 2026-08-04; nothing in this
+    project ever passed it -- the motion model is rigid -- and it forced a second, torch-only
+    backprojection path to stay reachable from production. Removed with the operator cleanup;
+    the 4DCT sibling is where deformable backprojection belongs.)
 
     `view_weight` (V,) or (B,V) REPLACES the uniform `angle_span / V` angular weight with a
     per-view one, in radians. Use `geometry_3d.view_angular_weights(Pmat)` to get the angular
@@ -679,9 +695,8 @@ def fdk_conebeam_3d_batched(
     # is NOT bit-for-bit a no-op, because `ramp_filter` sizes its FFT as the next power of two
     # above 2*nu: widening nu changes N (e.g. 256 -> 512) and hence the ramp's discretization
     # and its circular wraparound. Measured on a non-truncated Shepp-Logan: 6.5e-4 relative.
-    # The longer transform is the more accurate one. It cannot perturb the
-    # `phi=Id MC-FDK == static FDK` gate (verified 2.3e-7): the same filtered sinogram feeds
-    # both paths and `disp` never enters here.
+    # The longer transform is the more accurate one, and it is geometry-independent: nothing
+    # in this half reads Pmat, so the same filtered sinogram feeds every backprojection of y.
     # Half-fan needs NO extrapolation: the Wang weight already tapers the short edge to zero,
     # and the object fits inside the (much larger) offset FOV so the long edge sees nothing.
     # Extrapolating a half-fan projection would invent data the conjugate view already supplies.
@@ -725,9 +740,76 @@ def fdk_conebeam_3d_batched(
     g = out
 
     if _return_filtered:
-        # `fdk_conebeam_3d_tangent`'s single-source front-end: the fully filtered sinogram in
-        # the FINAL element coordinate system (half-fan may have widened nu and zeroed u0).
+        # THE REUSABLE HALF. `fdk_conebeam_3d_tangent` and `fdk_backproject_filtered` both take
+        # this: the fully filtered sinogram in the FINAL element coordinate system (half-fan may
+        # have widened nu and zeroed u0).
+        #
+        # WHY IT IS REUSABLE ACROSS GEOMETRIES, which is the point: NOTHING above this line reads
+        # `Pmat` -- it is cast on entry and never touched again. Cosine, Wang, Ohnesorge and the
+        # ramp are functions of the DETECTOR alone, so ONE filtered sinogram serves every P you
+        # might backproject it with. The per-view angular weight is the only geometry-dependent
+        # factor in this half, and it is a positive per-view SCALAR, so it can equally ride on
+        # the backprojection instead (see `fdk_backproject_filtered`).
         return g, u0
+
+    return fdk_backproject_filtered(
+        g, Pmat, cfg, u0=u0, D=D, H=H, W=W, dx=dx, dy=dy, dz=dz,
+        scale=scale, view_chunk=view_chunk, vox_chunk=vox_chunk, eps=eps,
+        _torch_ref=_torch_ref)
+
+
+def fdk_backproject_filtered(
+    g: torch.Tensor,          # (B,V,nv,nu) ALREADY-FILTERED sinogram (_return_filtered's output)
+    Pmat: torch.Tensor,       # (B, V, 3, 4)
+    cfg: ConeBeam3DConfig,
+    *,
+    u0: float,                # the filtered sinogram's panel-centre offset (half-fan zeroes it)
+    D: int,
+    H: int,
+    W: int,
+    dx: float = 1.0,
+    dy: float = 1.0,
+    dz: float = 1.0,
+    view_weight: torch.Tensor | None = None,
+    scale: float | None = None,
+    view_chunk: int = 8,
+    vox_chunk: int = 2_000_000,
+    eps: float = 1e-8,
+    _torch_ref: bool = False,       # GATE ONLY: force the torch reference loop
+) -> torch.Tensor:
+    """The FDK's BACKPROJECTION HALF, on an already-filtered sinogram. (B, D, H, W).
+
+    `fdk_conebeam_3d_batched` IS `filter -> this`, and calls it, so there is one implementation.
+    It exists separately so ONE filtered sinogram can be backprojected at SEVERAL geometries --
+    which is exactly what a bridge draw needs: the anchor's `FDK(y, P(theta))` and the bridge's
+    `FDK(y, P(t*theta))` are two backprojections of the SAME filtered y. The trainer used to run
+    the ramp twice per draw for that (measured ~0.08 s of a 1.16 s draw).
+
+    `view_weight` (V,) or (B,V) [rad] is applied HERE, after filtering, where
+    `fdk_conebeam_3d_batched` applies it to the RAW sinogram before filtering. The two are
+    identical, not approximately: every stage in between (cosine, Wang, the ramp, the crop) is
+    LINEAR and acts view-by-view, and `ohnesorge_pad`'s only nonlinearity is a `clamp_min(0)`,
+    which commutes with a POSITIVE scalar -- (c*x).clamp_min(0) = c*x.clamp_min(0) for c > 0, and
+    Voronoi angular weights are positive by construction. (This is the same argument
+    `fdk_conebeam_3d_tangent` already relies on to let w_v(s) ride on its backprojection.)
+    """
+    device, dtype = g.device, torch.float32
+    g = g.to(device=device, dtype=dtype)
+    Pmat = Pmat.to(device=device, dtype=dtype)
+    B, V, nv, nu = g.shape
+    du = float(cfg.du)
+    dv = float(cfg.dv)
+    v_off = float(getattr(cfg, "det_offset_v_mm", 0.0))
+
+    if view_weight is not None:
+        w = view_weight.to(device=device, dtype=dtype)
+        if w.ndim == 1:
+            w = w[None]
+        if w.shape[-1] != V:
+            raise ValueError(f"view_weight has {w.shape[-1]} views, sinogram has {V}")
+        # (w / uni) here + the uniform `uni` factor below == the net per-view weight w, i.e. the
+        # identical bookkeeping to the pre-filter path -- so the tail below stays one code path.
+        g = g * (w / (float(cfg.angle_span) / float(V)))[..., None, None]
 
     # detector extent, in the SHIFTED element coordinate system (u0 = panel offset)
     half_u = 0.5 * nu * du
@@ -742,17 +824,20 @@ def fdk_conebeam_3d_batched(
     # fused kernel 3.1e-3 rel / corr 0.999995 / ls-scale 1.000000, and it is FASTER).
     # NOTE: LEAP's own `fbp` cannot do this job -- it refuses modular geometries whose
     # panels tilt past axial alignment, which is precisely the motion-compensated case.
-    needs_grad = torch.is_grad_enabled() and (g.requires_grad or Pmat.requires_grad)
-    if disp is None and not needs_grad and g.is_cuda \
-            and os.environ.get("FM3D_FDK_LEAP", "1") != "0":
+    # `_torch_ref` is the GATE handle (scripts/gate_fdk_fast.py compares the two); the
+    # grad/CPU condition is a SAFETY route, not an operator choice -- `leap_fdk_backproject`
+    # is a raw kernel with no autograd Function, so taking it inside a live graph would hand
+    # back graph-free tensors and silently zero d(loss)/d(sino, P).
+    needs_ref = _torch_ref or not g.is_cuda or (
+        torch.is_grad_enabled() and (g.requires_grad or Pmat.requires_grad))
+    if not needs_ref:
         from .leap_projector import leap_fdk_backproject
         recon = leap_fdk_backproject(
             g, Pmat, D=D, H=H, W=W, dx=dx, dy=dy, dz=dz, du=du, dv=dv,
             u0=u0, v_off=v_off).view(B, Npix)
     else:
-        # torch loop: the differentiable / disp / CPU / FM3D_FDK_LEAP=0 reference path.
         recon = _backproject_static_torch(
-            g, Pmat, disp, D=D, H=H, W=W, dx=dx, dy=dy, dz=dz, du=du, dv=dv,
+            g, Pmat, D=D, H=H, W=W, dx=dx, dy=dy, dz=dz, du=du, dv=dv,
             u0=u0, v_off=v_off, half_u=half_u, half_v=half_v, eps=eps,
             view_chunk=view_chunk, vox_chunk=vox_chunk)
 
@@ -764,13 +849,13 @@ def fdk_conebeam_3d_batched(
     return recon * (_fdk_physical_norm(cfg) if scale is None else scale)
 
 
-def _backproject_static_torch(g, Pmat, disp, *, D, H, W, dx, dy, dz, du, dv,
-                              u0, v_off, half_u, half_v, eps, view_chunk, vox_chunk,
-                              w2=True):
-    """The original torch backprojection loop, chunked over views AND voxels. (B, Npix).
+def _backproject_static_torch(g, Pmat, *, D, H, W, dx, dy, dz, du, dv,
+                              u0, v_off, half_u, half_v, eps, view_chunk, vox_chunk):
+    """The torch backprojection loop, chunked over views AND voxels. (B, Npix).
 
-    Kept verbatim as (a) the `disp` MC path, which the Triton kernel does not cover, and
-    (b) the FM3D_FDK_LEAP=0 fallback / gate reference for the deployed LEAP-backed path."""
+    NOT a production operator: it is the REFERENCE the deployed LEAP-backed FDK is gated
+    against (`_torch_ref=True`, scripts/gate_fdk_fast.py), and the differentiable/CPU route
+    the wrapper falls back to when a live graph or a CPU tensor rules the kernel out."""
     device, dtype = g.device, g.dtype
     B, V, nv, nu = g.shape
 
@@ -783,13 +868,6 @@ def _backproject_static_torch(g, Pmat, disp, *, D, H, W, dx, dy, dz, du, dv,
         [xx.reshape(-1), yy.reshape(-1), zz.reshape(-1),
          torch.ones(D * H * W, device=device, dtype=dtype)], dim=0)  # (4, Npix)
     Npix = D * H * W
-    if disp is not None:
-        if disp.shape[-3:] != (D, H, W) or disp.shape[-4] != 3:
-            raise ValueError(f"disp must be (B,V,3,{D},{H},{W}), got {tuple(disp.shape)}")
-        # (B,V,3,Npix) voxels -> mm, per axis. Channel order is [dx, dy, dz] (warp.py).
-        disp = disp.to(device=device, dtype=dtype).reshape(*disp.shape[:2], 3, Npix)
-        spac = torch.tensor([dx, dy, dz], device=device, dtype=dtype)[None, None, :, None]
-        disp = disp * spac                                           # (B,V,3,Npix) mm
 
     recon = torch.zeros((B, Npix), device=device, dtype=dtype)
     for v0 in range(0, V, view_chunk):
@@ -799,13 +877,7 @@ def _backproject_static_torch(g, Pmat, disp, *, D, H, W, dx, dy, dz, du, dv,
         src = g[:, v0:v1].reshape(B * vc, 1, nv, nu)
         for p0 in range(0, Npix, vox_chunk):
             p1 = min(p0 + vox_chunk, Npix)
-            if disp is None:
-                uvw = torch.einsum("bvij,jp->bvip", P, Xh[:, p0:p1])  # (B, vc, 3, Np)
-            else:
-                # MOTION COMPENSATION: backproject reference voxel q from r = q - phi(q).
-                d = disp[:, v0:v1, :, p0:p1]                          # (B, vc, 3, Np) mm
-                Xc = Xh[None, None, :, p0:p1] - F.pad(d, (0, 0, 0, 1))
-                uvw = torch.einsum("bvij,bvjp->bvip", P, Xc)          # (B, vc, 3, Np)
+            uvw = torch.einsum("bvij,jp->bvip", P, Xh[:, p0:p1])      # (B, vc, 3, Np)
             u_h, v_h, w = uvw[:, :, 0], uvw[:, :, 1], uvw[:, :, 2]
             w_safe = torch.where(w.abs() < eps, torch.full_like(w, eps), w)
             u = u_h / w_safe
@@ -825,8 +897,7 @@ def _backproject_static_torch(g, Pmat, disp, *, D, H, W, dx, dy, dz, du, dv,
             val = val.view(B, vc, p1 - p0)
 
             mask = (w > 0) & ((u - u0).abs() <= half_u) & ((v - v_off).abs() <= half_v)
-            wv = val / (w_safe ** 2) if w2 else val   # w2=False: plain (unmatched-A^T) accumulate
-            contrib = torch.where(mask, wv, torch.zeros_like(val))
+            contrib = torch.where(mask, val / (w_safe ** 2), torch.zeros_like(val))
             recon[:, p0:p1] += contrib.sum(dim=1)
     return recon
 
@@ -839,8 +910,8 @@ def _backproject_tangent_torch(g, Pmat, Pdot, wgt, dwgt, *, D, H, W, dx, dy, dz,
     Same math as the fused kernel, in whatever dtype `g` carries -- float64 is the point:
     scripts/gate_fdk_tangent.py uses this at float64 both to certify the tangent MATH against
     a float64 central difference of `_backproject_static_torch` (isolating the a.e.-Jacobian
-    claim from fp32 noise) and as the reference the fp32 Triton kernel is compared to. Also
-    the FM3D_FDK_TRITON=0 / no-triton fallback for `fdk_conebeam_3d_tangent`.
+    claim from fp32 noise) and as the reference the deployed fp32 kernel is compared to
+    (`_torch_ref=True`). Also `fdk_conebeam_3d_tangent`'s differentiable/CPU route.
 
     Manual bilinear taps (no grid_sample): the tangent needs the interpolant's own ju/jv
     derivative, and grid_sampler ships no forward-AD rule -- the same reason the 2D sibling's
@@ -949,6 +1020,8 @@ def fdk_conebeam_3d_tangent(
     vox_chunk: int = 2_000_000,
     eps: float = 1e-8,
     trunc_pad: int | None = None,
+    filtered: tuple[torch.Tensor, float] | None = None,
+    _torch_ref: bool = False,       # GATE ONLY: force the torch tangent reference
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """FDK(y, P(s)) AND its exact s-derivative, in ONE reconstruction pass.
 
@@ -973,9 +1046,8 @@ def fdk_conebeam_3d_tangent(
     (vs float64 central differences).
 
     `view_weight=None` means the uniform angle_span/V weight (then its derivative is 0 and
-    `view_weight_dot` must be None too). `scale` multiplies BOTH outputs. `disp` is not
-    supported here -- the bridge's motion is rigid and enters through Pmat.
-    Returns (x, dx/ds), each (B, D, H, W), fp32.
+    `view_weight_dot` must be None too). `scale` multiplies BOTH outputs. The bridge's motion
+    is rigid and enters through Pmat. Returns (x, dx/ds), each (B, D, H, W), fp32.
     """
     device = sino.device
     dtype = torch.float32
@@ -997,11 +1069,18 @@ def fdk_conebeam_3d_tangent(
         wgt = view_weight.to(device=device, dtype=dtype).expand(B, V).clone()
         dwgt = view_weight_dot.to(device=device, dtype=dtype).expand(B, V).clone()
 
-    # single-source filtering front-end (UNWEIGHTED -- the weights ride on the BP instead)
-    g, u0 = fdk_conebeam_3d_batched(
-        sino, Pmat, u_coords, v_coords, cfg, D=D, H=H, W=W, dx=dx, dy=dy, dz=dz,
-        window=window, cutoff=cutoff, view_chunk=view_chunk, eps=eps,
-        trunc_pad=trunc_pad, _return_filtered=True)
+    # single-source filtering front-end (UNWEIGHTED -- the weights ride on the BP instead).
+    # `filtered` lets a caller that already has this exact array hand it over: the filtering half
+    # never reads Pmat (see `_return_filtered`), so the SAME array serves this call and any other
+    # backprojection of the same y -- which is how a bridge draw gets one ramp pass instead of two.
+    if filtered is not None:
+        g, u0 = filtered
+        g = g.to(device=device, dtype=dtype)
+    else:
+        g, u0 = fdk_conebeam_3d_batched(
+            sino, Pmat, u_coords, v_coords, cfg, D=D, H=H, W=W, dx=dx, dy=dy, dz=dz,
+            window=window, cutoff=cutoff, view_chunk=view_chunk, eps=eps,
+            trunc_pad=trunc_pad, _return_filtered=True)
     nu = g.shape[-1]                                   # half-fan may have widened the panel
     du = float(cfg.du)
     dv = float(cfg.dv)
@@ -1009,16 +1088,15 @@ def fdk_conebeam_3d_tangent(
     half_u = 0.5 * nu * du
     half_v = 0.5 * nv * dv
 
-    # Same grad-safety gate as the static path above: `backproject_tangent` is a raw kernel
+    # Same routing as the static path above: `_torch_ref` is the gate handle, and the
+    # grad/CPU condition is a safety net -- `leap_fdk_backproject_tangent` is a raw kernel
     # with no autograd Function, so taking it while a graph is live would return graph-free
-    # tensors and d(loss)/d(theta, sino) would come out silently ZERO -- the exact bug class
-    # `_use_triton`'s docstring memorializes. The torch fallback IS differentiable, so route
-    # there whenever anyone is asking for gradients.
-    needs_grad = torch.is_grad_enabled() and (
+    # tensors and d(loss)/d(theta, sino) would come out silently ZERO. The torch reference IS
+    # differentiable, so route there whenever anyone is asking for gradients.
+    needs_ref = _torch_ref or not g.is_cuda or (torch.is_grad_enabled() and (
         g.requires_grad or Pmat.requires_grad or Pdot.requires_grad
-        or wgt.requires_grad or dwgt.requires_grad)
-    if not needs_grad and g.is_cuda \
-            and os.environ.get("FM3D_FDK_TANGENT_LEAP", "1") != "0":
+        or wgt.requires_grad or dwgt.requires_grad))
+    if not needs_ref:
         # dx/ds is the EXACT s-derivative of the DEPLOYED value path: since 2026-07-30 the
         # tangent differentiates LEAP's own VD backprojection (`leap_fdk_backproject_tangent`
         # -- LEAP ships no derivative, so we differentiated its kernel, closing the last

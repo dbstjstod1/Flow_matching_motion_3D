@@ -44,10 +44,11 @@ Gate: scripts/gate_sf_projector.py.
 STATUS (2026-07-30): FULLY RETIRED FROM PRODUCTION. The operator pair is LEAP's
 (`fm3d/leap_projector.py`) and its modular forward is now PINNED TO JOSEPH, so there is no SF
 branch left for `sf_grad_P` to cover either -- the deployed geometry gradient is
-`triton_leap_grad.leap_grad_P` everywhere. This module survives as (a) the gates' independent
-SF-class implementation (`gate_sf_projector.py`, `gate_leap_projector.py` T1) and (b) the
-`leap_projector.GRAD_MODE = "sf"` A/B arm, which is now the gradient of an operator we never
-run. It was briefly load-bearing: LEAP's SF kernel projects ROUNDED voxel centres, and this
+`triton_leap_grad.leap_grad_P` everywhere. This module survives ONLY as the gates' independent
+SF-class implementation (`gate_sf_projector.py`, `gate_leap_projector.py` T1, and the
+`diag_leap_crosscheck` rig). Nothing in production imports it -- the `GRAD_MODE = "sf"` A/B
+arm that used to reach `sf_grad_P` was deleted with the rest of the operator switches on
+2026-08-04. It was briefly load-bearing: LEAP's SF kernel projects ROUNDED voxel centres, and this
 module's continuous-corner gradient was the only one following the loss TREND rather than the
 lattice ripple (ledger in `triton_leap_grad`'s docstring). Pinning the kernel removed the need.
 """

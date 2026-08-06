@@ -45,8 +45,9 @@ import torch
 
 from .geometry_3d import ConeBeam3DConfig, build_conebeam_orbit, detector_coords_3d
 from .filters import calibrate_scale
-from .projector_3d import (adjoint_project_3d_batched, fdk_conebeam_3d_batched,
-                           fdk_conebeam_3d_tangent, forward_project_3d_batched)
+from .projector_3d import (adjoint_project_3d_batched, fdk_backproject_filtered,
+                           fdk_conebeam_3d_batched, fdk_conebeam_3d_tangent,
+                           forward_project_3d_batched)
 from .rigid_motion import params_to_Pmot, random_motion
 
 MU_WATER = 0.02
@@ -192,8 +193,23 @@ class AAPMSlabGenerator:
             D=D, H=H, W=W, dx=self.dx, dy=self.dy, dz=self.dz, **kw)
 
 
-    def fdk(self, sino: torch.Tensor, Pmat: torch.Tensor, *, scale=None, **kw) -> torch.Tensor:
+    def fdk_filtered(self, sino: torch.Tensor, **kw) -> tuple[torch.Tensor, float]:
+        """The FDK's geometry-free filtering half -> (filtered sinogram, u0). See the cq500
+        twin: one call serves every `fdk`/`fdk_tangent` of the same y (pass it as `filtered=`)."""
+        return fdk_conebeam_3d_batched(
+            sino, self.P_nom[None], self.u_coords, self.v_coords, self.cfg,
+            D=1, H=1, W=1, dx=self.dx, dy=self.dy, dz=self.dz,
+            view_chunk=kw.pop("view_chunk", 8), _return_filtered=True, **kw)
+
+    def fdk(self, sino: torch.Tensor, Pmat: torch.Tensor, *, scale=None, filtered=None,
+            **kw) -> torch.Tensor:
         D, H, W = self.shape
+        if filtered is not None:
+            g, u0 = filtered
+            return fdk_backproject_filtered(
+                g, Pmat, self.cfg, u0=u0, D=D, H=H, W=W,
+                dx=self.dx, dy=self.dy, dz=self.dz, scale=scale,
+                view_chunk=kw.pop("view_chunk", 8), **kw)
         return fdk_conebeam_3d_batched(
             sino, Pmat, self.u_coords, self.v_coords, self.cfg,
             D=D, H=H, W=W, dx=self.dx, dy=self.dy, dz=self.dz,

@@ -1,6 +1,6 @@
 """Compact time-conditioned 3D U-Net velocity field for PATCH flow matching (prompt 6).
 
-3D twin of `unet.py`, intended for 3D-PATCH inputs (e.g. 64^3, DiffusionBlend-style
+3D twin of `unet.py`, intended for 3D-PATCH inputs (32^3 deployed, DiffusionBlend-style
 patch prior — the FM prior cannot hold a full volume, so it is trained and evaluated
 on patches and blended by `prior_patch.py`). The FM parameterization is unchanged
 (clean endpoint: x1_hat = x_t + (1-t) * v). Default width is slimmer than the 2D

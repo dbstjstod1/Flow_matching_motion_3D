@@ -1,28 +1,68 @@
-"""Train the 3D flow-matching prior on the GEOMETRY BRIDGE.
+"""Train the 3D flow-matching prior on a MOTION-DECAY BRIDGE.
 
-THE BRIDGE. Instead of interpolating between a corrupted image and a clean one in pixel space,
-every intermediate state is a genuine FDK reconstruction under a PARTIALLY CORRECTED geometry:
+TWO BRIDGES, and `--bridge` picks one. Both decay the motion linearly to zero, so both are paths
+of genuine reconstructions rather than a pixel-space interpolation through images no operator
+produces. They differ in WHERE the motion is attenuated:
 
-    x_t  = FDK(y, P_nom @ T(t * theta))        t = 0 -> the uncorrected recon; t = 1 -> the clean one
-    dx_t = d/dt x_t                            EXACT, fused into the FDK's backprojection pass
-                                               (--tangent fd restores the old central difference)
+    data (DEFAULT since 2026-08-05)   x_t = FDK( A(x; P_nom @ T((1-t)*theta)), P_nom )
+    geom (the original)               x_t = FDK( y, P_nom @ T(t*theta) ) + t*Delta
 
-so the prior is trained on exactly the manifold the inference loop walks: the set of FDK images
-reachable by some geometry. That is the point -- a linear pixel-space bridge passes through images
-that no geometry produces, and the prior then spends its capacity on states inference never visits.
+The `geom` bridge holds the measurement fixed and improves the GEOMETRY, which is literally what
+the inference loop does as theta_hat converges -- that was the argument for it. Its cost is that
+FDK's analytic inverse assumes a CIRCULAR orbit and P(theta) is not one, so its bare endpoint is
+NOT a clean image and has to be pulled onto the static FDK by a linear detrend `Delta` (see
+`bridge_pair`). The `data` bridge attenuates the motion in the MEASUREMENT instead; the geometry
+stays nominal for every t, so the endpoint IS the static FDK by construction -- no anchor, no
+detrend, and no angular-weight derivative in the tangent.
+
+MEASURED BEFORE SWITCHING (scripts/diag_bridge_ab.py, 3 val patients, train amplitude
+15 mm / 20 deg p2p; RMS as % of the net range):
+
+    t      |B - A_anch|   |B - A_bare|   |A_anch - A_bare|
+    0.25       0.79           0.79             0.43
+    0.50       1.05           1.14             0.85
+    0.75       1.06           1.42             1.28
+
+  * the two targets agree to ~1% of range (38-41 dB), so the switch is not a change of regime;
+  * ||Delta|| is 1.16 / 1.63 / 2.33% of range per patient -- the anchor was correcting a ONE
+    PERCENT endpoint error, not a large one;
+  * `geom`+anchor is in fact CLOSER to the bare geometry manifold than `data` is, at every t and
+    every patient (0.43 vs 0.79, 0.85 vs 1.14, 1.28 vs 1.42). So the switch TRADES 0.3%p of
+    proximity-to-the-inference-trajectory for an endpoint that is clean by construction, a path
+    with no hand-tuned detrend in it, and a draw that no longer computes FDK(y, P(theta)).
+    It is not a free win; it is a small, deliberate, user-approved trade (2026-08-05).
+
+THE TANGENT IS EXACT ON BOTH. `geom` differentiates LEAP's VD backprojection
+(`leap_vd_backproject_tangent`, 2026-07-30); `data` differentiates LEAP's pinned Joseph FORWARD
+(`leap_forward_tangent`, 2026-08-05 -- written for this switch, because the central difference it
+started with bottoms out at ~2% of the target and the project does not train on that; the kernel
+is gated against a float64 autograd jvp at rel 2.8e-6, cos 1.00000000).
+
+COST, measured back to back on one GPU: draw 3.4 s for `data` against 2.1-2.4 s for a `geom`
+whose static-anchor memo has warmed (3.4 s while it is still cold, i.e. they are identical early
+in a run). The data draw is LEAP's own projection (1.14 s, the value, kept for the bit-exact
+endpoints) + the tangent kernel (1.52 s) + two FDKs; `geom` is one projection + one fused
+backprojection tangent + the memoized anchor. Amortized over --refresh 12 that is about
++0.1 s per training step.
 
 `t * theta` is a geodesic because the rotation is an axis-angle vector (`rigid_motion.so3_exp`);
 with Euler angles it would not be, and the velocity target would quietly stop pointing where the
-inference ODE travels.
+inference ODE travels. This holds for both bridges.
 
-MEMORY. The network only ever sees 64^3 PATCHES; the operator (one fused FDK+tangent pass per
+MEMORY. The network only ever sees `--patch`^3 PATCHES (32^3 in the deployed run -- the archive
+paper's rule is patch = volume/8, i.e. 32 at our 256^3); the operator (one fused FDK+tangent pass per
 sample, under `no_grad`) runs on the full slab. That split is the whole design -- it is what lets a 3D prior
 train on a 24 GB card. Bridge draws are expensive, so a rolling cache of volume pairs is refreshed
 every `--refresh` steps and each batch mixes patches from several cached draws (so `t` varies
 within a batch). Both tricks are from the 4DCT project. `t` itself is sampled UNIFORMLY
 (`sample_t`), matching arXiv:2512.18161 and the bridge-model default.
 
-    python scripts/train_fm3d.py --iters 20000 --out logs/fm3d_a
+THE DEFAULTS ARE THE DEPLOYED RUN (2026-07-31), exactly -- nothing here is a toy setting any more.
+This one line reproduces the training recipe: CQ500 256^3 @ 1 mm, patch 32 / batch 64 (the archive
+paper's volume/8 rule), cache 8 / refresh 12, 500k iters, cosine lr 1e-4 -> 1e-6, EMA 0.999,
+fp16 AMP, the DATA bridge, native simulation grid, Thies training amplitudes:
+
+    setsid nohup python scripts/train_fm3d.py --out logs/fm3d_next </dev/null >> log 2>&1 &
 """
 
 from __future__ import annotations
@@ -72,9 +112,79 @@ def sample_t(n: int, device) -> torch.Tensor:
 
 
 @torch.no_grad()
+def bridge_pair_data(gen, idx: int, t: torch.Tensor, theta, delta: float = 0.005,
+                     mode: str = "analytic"):
+    """(x_t, dx_t) in NET space for THE DATA BRIDGE -- `--bridge data`, the default.
+
+        x_t = FDK( A(x; P_nom @ T((1-t)*theta)), P_nom )
+
+    The motion decays in the MEASUREMENT, not in the reconstruction geometry. Consequences, all
+    of which are the reason this is now the default (see the module docstring for the numbers):
+
+      * t = 0 -> the motion is full -> x_0 = FDK(y_theta, P_nom), the inference cold start,
+        EXACTLY (measured: 142 dB against the `geom` bridge's t=0, i.e. float noise).
+      * t = 1 -> the motion is gone -> x_1 = FDK(A(x; P_nom), P_nom) = THE STATIC FDK, by
+        construction and to the bit. No anchor, no `Delta`, nothing to detrend. The `geom`
+        bridge needed one because FDK's analytic inverse assumes a circular orbit and
+        P(theta) is not one; here the orbit is P_nom for every t, so that error is identically
+        zero along the whole path.
+      * the reconstruction geometry does not depend on t, so neither does the Voronoi angular
+        weight -- the tangent carries no `view_weight_dot` term (contrast `fdk_tangent`).
+
+    THE TANGENT. FDK is LINEAR in the sinogram and its geometry is t-independent, so d/dt
+    commutes straight through it:
+
+        dx_t/dt = FDK( dy_s/dt, P_nom ),   y_s = A(x; P(s*theta)),  s = 1 - t,  d/dt = -d/ds
+
+    which leaves dy_s/ds, a derivative of the FORWARD projector with respect to the geometry.
+    mode="analytic" (the DEFAULT) takes it EXACTLY, from `gen.simulate_tangent` ->
+    `triton_leap_grad.leap_forward_tangent`: the s-derivative of LEAP's own pinned Joseph
+    kernel, in one fused pass, the forward-projection twin of what `leap_vd_backproject_tangent`
+    already did for the geometry bridge. So both bridges now regress on an exact tangent of the
+    operator they actually run, and nothing in production is a finite difference.
+
+    mode="fd" is the central difference this started as, kept as the gate counterparty. It is
+    NOT good enough to train on, which is why the kernel exists -- measured in
+    scripts/diag_bridge_data_tangent.py (s0 = 0.5, 15 mm / 20 deg p2p), against a Richardson
+    reference, in the IMAGE domain that the loss actually sees:
+
+        delta        0.05    0.02    0.01    0.005   0.002   0.001
+        rel vs ref   0.120   0.022   0.030   0.047   0.061   0.074
+
+    a U-curve that BOTTOMS OUT AT ~2%: truncation above (the projection through the 612^3
+    native volume is genuinely curved in s), fp32 cancellation below, amplified on the way
+    through the ramp filter -- the sinogram-domain optimum is delta = 0.005 but the image-domain
+    one is 0.02, and neither gets under 2%. Two Richardson pairs one octave apart still
+    disagree by 4%. It is NOT grid ripple: the ripple probe in that script shows
+    ||y(s+e)-y(s0)||/e converging smoothly and symmetrically (ratio 1.0004 at e = 5e-4). The
+    fd path clamps to one-sided at s = 0 or 1, exactly as `bridge_pair` does.
+    """
+    tv = float(t)
+    s = 1.0 - tv
+    if mode == "analytic":
+        # bridge_P_and_dP gives P(s) and dP/ds in closed form; the value comes from `simulate`
+        # (the vendored library) so the endpoints stay bit-exact, the derivative from the
+        # transcribed kernel -- the same value/derivative split `fdk_conebeam_3d_tangent` makes.
+        P_s, Pdot_s = bridge_P_and_dP(theta, gen.P_nom, s)
+        x_t = gen.to_net(gen.fdk(gen.simulate(idx, P_s[None]), gen.P_nom[None])[0])
+        _, dy_ds = gen.simulate_tangent(idx, P_s[None], Pdot_s[None])
+    elif mode == "fd":
+        def sim(sv: float):
+            return gen.simulate(idx, params_to_Pmot(sv * theta, gen.P_nom)[None])
+
+        x_t = gen.to_net(gen.fdk(sim(s), gen.P_nom[None])[0])
+        sp, sm = min(s + delta, 1.0), max(s - delta, 0.0)
+        dy_ds = (sim(sp) - sim(sm)) / (sp - sm)
+    else:
+        raise ValueError(f"unknown data-bridge tangent mode: {mode!r}")
+    # d/dt = -d/ds, and the FDK is linear, so ONE backprojection of the sinogram derivative.
+    dx = -gen.to_net_tangent(gen.fdk(dy_ds, gen.P_nom[None])[0])
+    return x_t, dx
+
+
 def bridge_pair(gen, t: torch.Tensor, y, theta, dlt, delta: float = 0.02,
-                mode: str = "analytic"):
-    """(x_t, dx_t) in NET space, for one volume. t: scalar tensor.
+                mode: str = "analytic", filtered=None):
+    """(x_t, dx_t) in NET space, for one volume. t: scalar tensor. `--bridge geom`.
 
     THE ANCHORED GEOMETRY BRIDGE:
 
@@ -98,9 +208,13 @@ def bridge_pair(gen, t: torch.Tensor, y, theta, dlt, delta: float = 0.02,
         the single-kernel, exact-cancellation path.
       * in between the geometry term still dominates, so the path stays the manifold of
         partially-corrected reconstructions -- which is what the inference loop actually walks as
-        theta_hat converges. (The alternative -- attenuating the motion in the DATA,
-        y_t = A(x; P((1-t)theta)) -- also lands clean, but its intermediate images are those of a
-        patient who moved LESS, which inference never sees.)
+        theta_hat converges. This IS measurably true (`geom`+anchor sits 0.43/0.85/1.28% of range
+        off the bare geometry manifold at t = 0.25/0.5/0.75, against 0.79/1.14/1.42% for the data
+        bridge) -- but the margin is 0.3%p, and the two bridges' images agree to ~1% of range
+        overall, which is why `--bridge data` is now the default anyway. The old text here
+        dismissed the data bridge as "images of a patient who moved LESS, which inference never
+        sees"; that is the right intuition but the wrong magnitude, and it was never measured
+        until scripts/diag_bridge_ab.py (2026-08-05).
       * Delta is constant in t, so the velocity target is just  d/dt FDK(y,P(t*theta)) + Delta.
         No extra reconstructions.
 
@@ -119,7 +233,10 @@ def bridge_pair(gen, t: torch.Tensor, y, theta, dlt, delta: float = 0.02,
     tv = float(t)
     if mode == "analytic":
         P, Pdot = bridge_P_and_dP(theta, gen.P_nom, tv)
-        x_mu, dx_mu = gen.fdk_tangent(y, P[None], Pdot[None])
+        # `filtered` = the draw's already-filtered y (`gen.fdk_filtered`), shared with the
+        # anchor's FDK(y, P(theta)). The ramp does not depend on the geometry, so filtering
+        # twice per draw was pure waste; None keeps the self-contained path.
+        x_mu, dx_mu = gen.fdk_tangent(y, P[None], Pdot[None], filtered=filtered)
         x_t = gen.to_net(x_mu[0])                                    # (D,H,W)
         dx = gen.to_net_tangent(dx_mu[0])                            # affine gain, no shift
     elif mode == "fd":
@@ -148,10 +265,61 @@ def main():
     ap.add_argument("--shape", type=int, nargs=3, default=(256, 256, 256))   # cq500, @ 1 mm
     ap.add_argument("--data", default=DATA)                                  # aapm only
     ap.add_argument("--out", default="logs/fm3d_a")
-    ap.add_argument("--iters", type=int, default=20000)
-    ap.add_argument("--batch", type=int, default=8)          # patches per step
-    ap.add_argument("--patch", type=int, default=64)
-    ap.add_argument("--cache", type=int, default=6)          # bridge draws held at once
+    # ---- THE DEFAULTS BELOW ARE THE DEPLOYED RUN (2026-07-31, user's call) ------------------
+    # Everything here used to default to a toy configuration nobody ran, so the real recipe lived
+    # only in a shell command that had to be copied correctly. `python scripts/train_fm3d.py
+    # --out <dir>` now reproduces the deployed training EXACTLY -- no exceptions.
+    ap.add_argument("--iters", type=int, default=500000)
+    # patch 32 / batch 64 = the archive paper's recipe (arXiv:2512.18161), whose invariant is a
+    # DOWNSAMPLE FACTOR OF 8: patch = volume/8, so 32 at Thies' 256^3, and batch 64 comes with it
+    # (their 512 config is patch 64x64x32 / batch 16). Not a GPU-occupancy choice.
+    ap.add_argument("--batch", type=int, default=64)         # patches per step
+    ap.add_argument("--patch", type=int, default=32,
+                    help="patch edge [voxels]. 32 = the archive paper's volume/8 rule at our "
+                         "256^3 grid. Guarded by --resume, so resuming a 64-patch checkpoint "
+                         "without passing --patch 64 fails loudly rather than silently.")
+    # BRIDGE DRAWS HELD AT ONCE. Raised 6 -> 32 on 2026-07-31, and the reason is the RATIO to
+    # --batch, not the number itself. The archive paper's recipe (arXiv:2512.18161, our source
+    # for patch 32 / batch 64) means 64 INDEPENDENT (volume, t) conditions per step -- free for
+    # them, since their x_t is just noise added to a volume. Ours is a 1.2 s FDK, so a batch of
+    # 64 is assembled from `cache` cached draws and t is welded to the draw: at cache 8 the batch
+    # is 8 distinct t x 8 crops each, NOT 64 i.i.d. samples.
+    #
+    # MEASURED (2026-07-31, 512 per-sample gradients at iter 218k, one-way random-effects
+    # decomposition; scratch rig kept out of tree): the cost of that is SMALL, because gradient
+    # variance is dominated by WHERE the patch sits, not by t --
+    #     sigma_w^2 (patch position) = 4.139   sigma_b^2 (t, patient, motion) = 0.291
+    #     intraclass correlation rho = 0.0658  (95% CI [0.013, 0.143], p = 0.006)
+    # so batch-gradient variance vs the i.i.d. ideal is 1.46x at cache 8 (effective batch 43.8,
+    # NOT 8) and 1.07x at 32. It is pure VARIANCE, no bias -- the t marginal stays uniform over
+    # the run -- so 500k steps + cosine lr -> 1e-6 + EMA 0.999 already pay for it. Expect NO
+    # val improvement from this; it is recipe hygiene, not a quality lever.
+    #
+    # SO 8 STAYS (user, 2026-07-31): 1.46x is a VARIANCE cost, not a bias, and 500k steps buy it
+    # back. Raising it to 32 (1.07x, VRAM 4.2 GB, zero compute) was considered and declined for
+    # that reason -- record the option, not a regret.
+    #
+    # AND CACHE CANNOT FIX THE OTHER AXIS ANYWAY. Bigger cache dilutes the shared between-draw
+    # component (amplitude sigma_b^2/cache) but LENGTHENS its correlation time to cache*refresh
+    # steps, so the INTEGRATED noise power is (sigma_b^2/C)*(C*refresh) = sigma_b^2*refresh --
+    # cache CANCELS, only `refresh` sets it. Cache only moves the timescale: 96 steps at 8, 384
+    # at 32, 768 at 64, against EMA 0.999's ~1000-step averaging window -- so 8 is also the
+    # value the EMA averages over most thoroughly (10 full cache turnovers per window).
+    #
+    # NOT AFFECTED BY ANY OF THIS: per-draw coverage. A draw is sampled `batch * refresh` = 768
+    # times over its life whatever the cache (batch/cache patches per step for cache*refresh
+    # steps), covering 83.5% of the reachable region. Only --refresh and --batch move that.
+    # COST: VRAM only, ~130 MB per draw (256^3 x_t + dx, fp32) -> ~1.0 GB at 8.
+    ap.add_argument("--cache", type=int, default=8)          # bridge draws held at once
+    # STEPS BETWEEN REFRESHING ONE DRAW. This is the knob that actually costs: a draw is 1.2 s
+    # against a 0.47 s step, so 12 spends ~18% of the wall clock on data. It is also the ONLY
+    # knob on the integrated gradient-noise power (see --cache) and on how much of each draw is
+    # consumed: 12 steps x 64 patches x 32^3 = 25,165,824 voxel-samples against an 11.0 M-voxel
+    # reachable region = 2.3x oversampling, i.e. 83.5% of the draw is seen before it is evicted.
+    # Halving it to 6 would use only ~58% of each 1.2 s draw and push data to 26% of the run.
+    # (The 4DCT sibling cites this same 25,165,824 figure for its own refresh 12 -- but it cites
+    # OUR live value as the source, so treat "the sibling validated it" as circular: the voxel
+    # arithmetic above is the non-circular part.)
     ap.add_argument("--refresh", type=int, default=12)       # steps between refreshing one draw
     ap.add_argument("--slab", type=int, default=64)          # aapm only
     ap.add_argument("--in_plane", type=int, default=256)     # aapm only
@@ -161,11 +329,13 @@ def main():
                     help="global = the arXiv:2512.18161 conditioning (in_ch=5); "
                          "none = the bare-patch prior (in_ch=1)")
     ap.add_argument("--lr", type=float, default=1e-4)          # the 2D sibling's vanilla-FM lr
-    ap.add_argument("--lr_final", type=float, default=None,
-                    help="if set, COSINE-decay the lr from --lr (at it=0) to this value "
-                         "(at it=--iters). Default None = constant lr (the historical behavior, "
-                         "bit-identical). The schedule is a pure closed-form function of `it`, so "
-                         "--resume needs no scheduler state -- it just continues the same curve.")
+    ap.add_argument("--lr_final", type=float, default=1e-6,
+                    help="COSINE-decay the lr from --lr (at it=0) to this value (at it=--iters). "
+                         "1e-6 = the deployed run. Pass None for the constant lr that was the "
+                         "pre-2026-07-31 default. The schedule is a pure closed-form function of "
+                         "`it`, so --resume needs no scheduler state -- it just continues the "
+                         "same curve. NB it is anchored to --iters: changing --iters moves the "
+                         "whole curve, so a resume must keep both.")
     ap.add_argument("--ema", type=float, default=0.999)
     ap.add_argument("--amp", action="store_true", default=True,
                     help="fp16 AMP, like the 2D sibling. --no-amp for fp32.")
@@ -205,8 +375,36 @@ def main():
     ap.add_argument("--train_rot_deg", type=float, default=20.0,
                     help="max TRAINING rotation, peak-to-peak [deg]. motion_amp=thies only")
 
+    ap.add_argument("--bridge", default="data", choices=["data", "geom"],
+                    help="WHERE THE MOTION DECAYS. data (DEFAULT since 2026-08-05) = in the "
+                         "MEASUREMENT: x_t = FDK(A(x; P((1-t)theta)), P_nom). The reconstruction "
+                         "geometry is nominal for every t, so the endpoint IS the static FDK by "
+                         "construction -- no anchor, no detrend, and no angular-weight derivative "
+                         "in the tangent. geom = the original bridge, which holds y fixed and "
+                         "improves the GEOMETRY, x_t = FDK(y, P(t*theta)) + t*Delta; that path is "
+                         "0.3%% of range closer to what inference walks but needs the --anchor "
+                         "detrend to reach a clean endpoint. The two agree to ~1%% of range at "
+                         "every t (scripts/diag_bridge_ab.py); see the module docstring for the "
+                         "table and for what the switch costs (3 native sims per draw, not 1). "
+                         "--anchor applies to `geom` only; under `data` it selects nothing but "
+                         "the VALIDATION reference, as it always did.")
+    ap.add_argument("--data_tangent", default="analytic", choices=["analytic", "fd"],
+                    help="how the DATA bridge gets dy/ds. analytic (DEFAULT) = the exact "
+                         "s-derivative of LEAP's pinned Joseph forward, one fused pass "
+                         "(triton_leap_grad.leap_forward_tangent). fd = the central difference "
+                         "this started as -- kept as the gate counterparty ONLY: it bottoms out "
+                         "at ~2%% of the target in the image domain whatever --bridge_delta is "
+                         "(scripts/diag_bridge_data_tangent.py), which is why the kernel exists.")
+    ap.add_argument("--bridge_delta", type=float, default=0.02,
+                    help="central-difference step in s for --data_tangent fd. 0.02 is the "
+                         "measured IMAGE-domain U-curve minimum (2.2%% from a Richardson "
+                         "reference); the sinogram-domain optimum is 0.005, but the ramp filter "
+                         "amplifies the fp32 cancellation and moves the image-domain one back "
+                         "up. Ignored under --data_tangent analytic.")
     ap.add_argument("--anchor", default="static", choices=["static", "gt", "none"],
-                    help="what the bridge's t=1 endpoint IS. static (DEFAULT) = the MOTION-FREE "
+                    help="what the GEOM bridge's t=1 endpoint IS (--bridge geom; under --bridge "
+                         "data the endpoint needs no anchor and this only picks the validation "
+                         "reference). static (DEFAULT) = the MOTION-FREE "
                          "FDK -- the same reconstruction operator, the same scan, no motion. It "
                          "is what this scanner can actually produce of a still patient, and it is "
                          "where BOTH sibling projects anchor. Without it the endpoint is FDK(y, "
@@ -224,22 +422,25 @@ def main():
                          "reconstruction grid, i.e. the inverse crime -- pre-2026-07-29 behaviour, "
                          "kept for ablation. See dataset_cq500's simulation-grid note.")
     ap.add_argument("--tangent", default="analytic", choices=["analytic", "fd"],
-                    help="how bridge_pair gets the velocity target dx_t. analytic (DEFAULT) = "
-                         "the exact d/ds FDK(y, P(s*theta)) in one fused pass "
-                         "(fdk_conebeam_3d_tangent); fd = the old central difference, three "
-                         "full FDKs, ~1e-3 off -- kept as an escape hatch and gate counterparty")
+                    help="how bridge_pair gets the velocity target dx_t, --bridge geom ONLY. "
+                         "analytic (DEFAULT) = the exact d/ds FDK(y, P(s*theta)) in one fused "
+                         "pass (fdk_conebeam_3d_tangent); fd = the old central difference, three "
+                         "full FDKs, ~1e-3 off -- kept as an escape hatch and gate counterparty. "
+                         "--bridge data has its own knob, --data_tangent (its analytic path is "
+                         "the exact d/ds of LEAP's Joseph FORWARD, leap_forward_tangent).")
     ap.add_argument("--resume", default=None,
                     help="a ckpt .pth or a run dir (uses ckpt_last.pth): restore model+EMA+"
                          "optimizer+loss history+RNG and continue to --iters")
-    ap.add_argument("--seed", type=int, default=None,
-                    help="seed torch+numpy at startup (default None = unseeded, the historical "
-                         "behavior). Also routes the motion draw through a dedicated seeded "
-                         "generator so the Akima spline nodes become reproducible too.")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="seed torch+numpy at startup (0 = the deployed run; pass None for the "
+                         "unseeded pre-2026-07-31 default). Also routes the motion draw through "
+                         "a dedicated seeded generator so the Akima spline nodes become "
+                         "reproducible too.")
     ap.add_argument("--save_every", type=int, default=2000)
     ap.add_argument("--keep_ckpts", type=int, default=0,
                     help="keep only the newest N numbered ckpt_iterNNNNNN.pth (0 = keep all, "
                          "the historical behavior). ckpt_last.pth is never pruned.")
-    ap.add_argument("--val_every", type=int, default=5000)
+    ap.add_argument("--val_every", type=int, default=10000)
     ap.add_argument("--val_patients", type=int, default=3)
     ap.add_argument("--val_ode_steps", type=int, default=50)   # the deploy loop's count
     ap.add_argument("--no_tb", action="store_true", help="disable the tensorboard writer")
@@ -254,6 +455,13 @@ def main():
 
     dev = "cuda"
     os.makedirs(args.out, exist_ok=True)
+
+    # The data bridge simulates its own sinograms from a patient INDEX (`gen.simulate`); aapm
+    # slabs have no stable key and are the retired stand-in, so fail loudly instead of quietly
+    # running a half-tested path.
+    if args.bridge == "data" and args.dataset != "cq500":
+        raise SystemExit("--bridge data needs cq500's simulate(idx, P) path; the aapm stand-in "
+                         "has no stable per-volume key. Use --bridge geom for --dataset aapm.")
 
     # --seed None keeps the historical unseeded behavior (and the historical RNG call sequence).
     # `motion_gen` stays None when unseeded, which is exactly what random_motion/sample_motion
@@ -297,7 +505,7 @@ def main():
         raise RuntimeError("no patch fits inside the measured region; shrink --patch")
     print(f"valid patch origins: {len(ok)}")
 
-    # GLOBAL CONTEXT (arXiv:2512.18161). A 64^3 patch of a head cannot tell whether it is
+    # GLOBAL CONTEXT (arXiv:2512.18161). A 32^3 patch of a head cannot tell whether it is
     # orbit or posterior fossa, nor what the rest of the slab looks like, so the bare-patch
     # prior can only learn LOCAL structure. Four conditioning channels close that: the whole
     # x_t resampled onto the patch grid, and the patch voxels' absolute (z,y,x) in the volume.
@@ -351,8 +559,14 @@ def main():
         def _cmp(v):
             return tuple(v) if isinstance(v, (list, tuple)) else v
 
-        for k in ("base", "patch", "context", "anchor", "shape", "views", "dataset",
-                  "tangent", "trans_mm", "rot_deg", "sim_grid",
+        # Checkpoints written before 2026-08-05 have no 'bridge' key and were ALL trained on the
+        # geometry bridge. The loop below only compares keys the checkpoint HAS, so without this
+        # a resume of an old run would silently adopt the new `data` default and continue the
+        # weights on a different manifold.
+        prev.setdefault("bridge", "geom")
+
+        for k in ("base", "patch", "context", "bridge", "anchor", "shape", "views", "dataset",
+                  "tangent", "data_tangent", "trans_mm", "rot_deg", "sim_grid",
                   "motion_amp", "train_trans_mm", "train_rot_deg"):
             if k in prev and k in vars(args) and _cmp(prev[k]) != _cmp(vars(args)[k]):
                 raise SystemExit(f"--resume mismatch on '{k}': checkpoint has {prev[k]!r}, "
@@ -396,6 +610,13 @@ def main():
     print(f"motion (ALL PEAK-TO-PEAK): train={args.motion_amp} {_mx}{mot_trans:g} mm / "
           f"{mot_rot:g} deg  |  val=fixed {args.trans_mm:g} mm / {args.rot_deg:g} deg"
           f"   [Thies: train max 10/15, eval 5/5]")
+    print("bridge: " + (f"DATA  x_t = FDK(A(x; P((1-t)theta)), P_nom)  -- endpoint = static FDK "
+                        f"by construction, no anchor; tangent={args.data_tangent}"
+                        + (f" (delta {args.bridge_delta:g})" if args.data_tangent == "fd" else
+                           " (exact d/ds of LEAP's Joseph forward)")
+                        if args.bridge == "data" else
+                        f"GEOM  x_t = FDK(y, P(t*theta)) + t*Delta  -- anchor={args.anchor}, "
+                        f"tangent={args.tangent}"))
 
     next_idx = [None]        # the NEXT cq500 patient, sampled one draw ahead so `prefetch_fine`
                              # can load its native-grid volume under the training steps
@@ -409,13 +630,18 @@ def main():
         cropped from this volume. At inference `predict_x1_patched` rebuilds it the same way
         from the evolving x_t, so train and infer see the same channel.
 
-        The ANCHOR (see `bridge_pair`) is also a property of the draw. On cq500 its motion-free
-        static FDK is MEMOIZED per volume (`gen.static_anchor_net`), since it depends on neither
-        the motion nor t -- that removes one forward projection (~0.9 s) and one FDK (~0.18 s) from
-        every draw after a volume's first, and the cache refreshes a draw only every `--refresh`
-        steps. To reach the memo we sample the volume INDEX ourselves here (cq500's `volume(idx)`
-        is a clean per-patient lookup); aapm slabs have no such stable key, so they keep the old
-        inline path via `sample_motion`."""
+        Under `--bridge data` (the default) the draw does NOT simulate the full-motion y at all:
+        every sinogram it needs is a partially-moved one at s = 1-t, and it needs three of them
+        (the value plus a central difference) -- see `bridge_pair_data`. The anchor block below
+        is skipped entirely; the endpoint is clean by construction.
+
+        Under `--bridge geom` the ANCHOR (see `bridge_pair`) is a property of the draw. On cq500
+        its motion-free static FDK is MEMOIZED per volume (`gen.static_anchor_net`), since it
+        depends on neither the motion nor t -- that removes one forward projection (~0.9 s) and one
+        FDK (~0.18 s) from every draw after a volume's first, and the cache refreshes a draw only
+        every `--refresh` steps. To reach the memo we sample the volume INDEX ourselves here
+        (cq500's `volume(idx)` is a clean per-patient lookup); aapm slabs have no such stable key,
+        so they keep the old inline path via `sample_motion`."""
         _tm: dict[str, float] = {}
         _tk = [time.time()]
 
@@ -438,18 +664,51 @@ def main():
             next_idx[0] = int(torch.randint(gen.n_slabs, (1,)).item())
             gen.prefetch_fine(next_idx[0])
             _tick("rng")
-            vol = gen.volume(idx)
+            # THE COARSE VOLUME IS ONLY THE `gt` ANCHOR'S TARGET, so it is loaded LAZILY. Under
+            # the deployed --anchor static it is never read (the anchor comes from the memoized
+            # `static_anchor_net`, the measurement from `simulate`'s NATIVE-grid volume), and
+            # loading it anyway cost 0.11 s of a 1.16 s draw -- 9.6% of the draw for nothing.
+            # `gen.volume` consumes no RNG, so deferring it is bit-identical.
+            vol = None
             _tick("vol")
             th = random_motion(gen.cfg.n_views, trans_mm=mot_trans, rot_deg=mot_rot,
                                amp_mode=args.motion_amp, device=dev, generator=motion_gen)[None]
             _tick("motion")
             # y is simulated on the NATIVE grid (`gen.simulate`, see the simulation-grid note in
             # dataset_cq500.__init__); `vol` above is the coarse inversion-grid target/anchor.
-            y = gen.simulate(idx, params_to_Pmot(th[0], gen.P_nom)[None])
+            # The DATA bridge never needs the full-motion sinogram -- it simulates its own three
+            # partially-moved ones at s = 1-t -- so skip this entirely there.
+            y = None if args.bridge == "data" else \
+                gen.simulate(idx, params_to_Pmot(th[0], gen.P_nom)[None])
             _tick("sim_y")
         else:
             y, th, vol = gen.sample_motion(1, trans_mm=mot_trans, rot_deg=mot_rot,
                                            amp_mode=args.motion_amp, generator=motion_gen)
+
+        if args.bridge == "data":
+            # THE DATA BRIDGE: motion decays in the MEASUREMENT, geometry stays P_nom, endpoint
+            # is the static FDK by construction. No anchor, no Delta, no shared ramp pass (each
+            # of the three sinograms is its own).
+            t = sample_t(1, dev)[0]
+            x_t, dx = bridge_pair_data(gen, idx, t, th[0], delta=args.bridge_delta,
+                                       mode=args.data_tangent)
+            _tick("bridge")
+            x_t = x_t[None, None]                                    # (1,1,D,H,W)
+            ctx = volume_context(x_t, (p, p, p)) if in_ch == 5 else None
+            _tick("ctx")
+            if prof_draw:
+                print("[draw]", " ".join(f"{k} {v:.3f}" for k, v in _tm.items()),
+                      f"| total {sum(_tm.values()):.3f}", flush=True)
+            return x_t, dx, t, ctx
+
+        # ---- --bridge geom from here ----------------------------------------------------
+        # ONE ramp pass per draw, shared by the anchor's FDK(y, P(theta)) and the bridge's
+        # FDK(y, P(t*theta)) below. The filtering half of the FDK never reads Pmat (cosine /
+        # Wang / Ohnesorge / ramp are detector-only), so this is EXACT, not an approximation --
+        # see `projector_3d.fdk_backproject_filtered`. Costs ~0.08 s of a 1.16 s draw to run twice.
+        filt = gen.fdk_filtered(y) if args.dataset == "cq500" else None
+        _tick("filter")
+
         dlt = None
         if args.anchor != "none":
             if args.anchor == "gt":
@@ -460,6 +719,8 @@ def main():
                 # the data: y is the projection of the true volume, so the image the data supports
                 # is the GT. Anchoring at the static FDK would teach the prior to PAINT IN cone
                 # artefacts it is supposed to remove.
+                if vol is None:               # the lazy load above -- `gt` is its only consumer
+                    vol = gen.volume(idx)
                 x_anchor = gen.to_net(vol[0, 0])
             elif idx is not None:             # "static", cq500: the memoized motion-free recon
                 x_anchor = gen.static_anchor_net(idx)
@@ -467,11 +728,12 @@ def main():
                 y0 = gen.project(vol, gen.P_nom[None])
                 x_anchor = gen.to_net(gen.fdk(y0, gen.P_nom[None])[0])
             _tick("anchor")
-            x1_geo = gen.to_net(gen.fdk(y, params_to_Pmot(th[0], gen.P_nom)[None])[0])
+            x1_geo = gen.to_net(gen.fdk(y, params_to_Pmot(th[0], gen.P_nom)[None],
+                                        filtered=filt)[0])
             dlt = x_anchor - x1_geo
             _tick("x1_fdk")
         t = sample_t(1, dev)[0]
-        x_t, dx = bridge_pair(gen, t, y, th[0], dlt, mode=args.tangent)
+        x_t, dx = bridge_pair(gen, t, y, th[0], dlt, mode=args.tangent, filtered=filt)
         _tick("bridge")
         x_t = x_t[None, None]                                        # (1,1,D,H,W)
         ctx = volume_context(x_t, (p, p, p)) if in_ch == 5 else None
@@ -588,6 +850,10 @@ def main():
             # PRIOR-ONLY ODE from the cold start on the val split -- what the loss cannot tell us.
             # EMA weights, eval mode, then straight back to training.
             ema.eval()
+            # The patch->volume scheme is left at run_validation's DEFAULT on purpose: that
+            # default IS the deployed inference scheme (uniform K=2, run_posterior3d.fm_predict),
+            # so there is one place to change it and the inline curve can never drift away from
+            # what the posterior loop runs.
             run_validation(ema, val_gen, meas, val_dir, it=it, patients=args.val_patients,
                            patch=args.patch, ode_steps=args.val_ode_steps, anchor=args.anchor,
                            trans_mm=args.trans_mm, rot_deg=args.rot_deg, writer=writer, dev=dev)
