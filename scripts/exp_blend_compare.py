@@ -20,7 +20,7 @@ fixed -- same patients, same motion seeds (1000+i), same checkpoint, ONE process
 starts come out of the shared _VAL_CACHE and are bit-identical across configs.
 
     CUDA_VISIBLE_DEVICES=0 python scripts/exp_blend_compare.py \
-        --ckpt logs/fm3d_cq500/ckpt_iter500000.pth
+        --ckpt logs/fm3d_cq500_leap/ckpt_iter500000.pth
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ CONFIGS = [
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="logs/fm3d_cq500/ckpt_iter500000.pth")
+    ap.add_argument("--ckpt", default="logs/fm3d_cq500_leap/ckpt_iter500000.pth")
     ap.add_argument("--root", default=None, help="default: the checkpoint's --root")
     ap.add_argument("--split", default="val")
     ap.add_argument("--out", default="data/blend_cmp")

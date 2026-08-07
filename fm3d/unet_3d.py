@@ -14,11 +14,29 @@ channels are [patch x_t, downsampled full x_t, coord z, coord y, coord x] — bu
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .unet import timestep_embedding
+
+def timestep_embedding(t: torch.Tensor, dim: int, max_period: float = 10000.0) -> torch.Tensor:
+    """Sinusoidal embedding of a continuous time t in [0, 1]. t: (B,) -> (B, dim).
+
+    Lived in fm3d/unet.py (the 2D-era velocity net) until 2026-08-07, when that module was
+    deleted as dead; this pure function was its one live symbol. Verbatim move -- it has no
+    parameters, so checkpoints are untouched.
+    """
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(half, device=t.device, dtype=torch.float32) / half
+    )
+    args = t.float()[:, None] * freqs[None, :]
+    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2:
+        emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
+    return emb
 
 
 class ResBlock3D(nn.Module):

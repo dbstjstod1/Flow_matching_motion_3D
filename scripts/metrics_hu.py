@@ -42,7 +42,7 @@ def main():
     if not paths:
         raise SystemExit(__doc__)
     dev = "cuda"
-    ck = torch.load("logs/fm3d_cq500/ckpt_iter500000.pth", map_location=dev, weights_only=False)
+    ck = torch.load("logs/fm3d_cq500_leap/ckpt_iter500000.pth", map_location=dev, weights_only=False)
     ca = ck["args"]
     cfg = ConeBeam3DConfig.thies(n_views=ca["views"])
     gen = CQ500Generator(ca["root"], cfg=cfg, device=dev, split="val",

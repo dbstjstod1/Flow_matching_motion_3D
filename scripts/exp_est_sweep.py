@@ -75,6 +75,9 @@ from fm3d.rigid_motion import (make_motion, motion_error, params_to_Pmot,
 # `isocost`: the original efficiency sweep (fewer views buys proportionally more iterations,
 # lncc/basis controls included) -- kept for the follow-up question of where to SPEND.
 FULLBAND = dict(n_levels=16, base_resolution=16, per_level_scale=1.5)   # stock NGP, AI_Geocal
+# The 2D band-limited preset. Was the CONSTRUCTOR DEFAULT until 2026-08-07 (rows passing {}
+# meant hashbl); the deployed encoder is now fullband, so hashbl rows must say so explicitly.
+HASHBL = dict(n_levels=4, base_resolution=2, per_level_scale=2.0)
 # Headroom on the net's tanh output bounds. The default is trans 15 mm / rot 8 deg, chosen when
 # the simulated motion peaked at 3 mm / 2 deg (|tanh arg| ~ 0.25, gradient factor 1-tanh^2 ~ 0.94
 # -- effectively linear). At the CORRECT akima 5/5 setting the measured peaks are 5.23 mm /
@@ -93,7 +96,7 @@ SUITES = {
     # tells us whether 2500 iterations can reach a good theta AT ALL.
     "akima55": [
         ("deployed",      "net", 24, 1e-3, "l2si", 9, FULLBAND),          # the baseline row
-        ("hashbl_lr1e-2", "net", 24, 1e-2, "l2si", 9, {}),                # the other anchor
+        ("hashbl_lr1e-2", "net", 24, 1e-2, "l2si", 9, HASHBL),                # the other anchor
         # --- lr on the DEPLOYED band (fullband); earlier lr sweeps only varied it on hashbl ---
         ("fb_lr3e-3",     "net", 24, 3e-3, "l2si", 9, FULLBAND),
         ("fb_lr1e-2",     "net", 24, 1e-2, "l2si", 9, FULLBAND),
@@ -182,26 +185,26 @@ SUITES = {
         ("l2_lr1e-2",     "net", 24, 1e-2, "l2",   9, FULLBAND),
     ],
     "oracle": [
-        ("base24",        "net", 24, 1e-2, "l2si", 9, {}),   # the deployed point
+        ("base24",        "net", 24, 1e-2, "l2si", 9, HASHBL),   # the deployed point
         # --- views axis, UP ---
-        ("views48",       "net", 48, 1e-2, "l2si", 9, {}),
-        ("views96",       "net", 96, 1e-2, "l2si", 9, {}),
+        ("views48",       "net", 48, 1e-2, "l2si", 9, HASHBL),
+        ("views96",       "net", 96, 1e-2, "l2si", 9, HASHBL),
         # --- lr axis ---
-        ("lr3e-3",        "net", 24, 3e-3, "l2si", 9, {}),
-        ("lr3e-2",        "net", 24, 3e-2, "l2si", 9, {}),
-        ("lr1e-3",        "net", 24, 1e-3, "l2si", 9, {}),
+        ("lr3e-3",        "net", 24, 3e-3, "l2si", 9, HASHBL),
+        ("lr3e-2",        "net", 24, 3e-2, "l2si", 9, HASHBL),
+        ("lr1e-3",        "net", 24, 1e-3, "l2si", 9, HASHBL),
         # --- encoder bandwidth (user #4): band-UNlimited, at our lr and AI_Geocal's ---
         ("fullband",      "net", 24, 1e-2, "l2si", 9, FULLBAND),
         ("fullband_lr1e-3", "net", 24, 1e-3, "l2si", 9, FULLBAND),
     ],
     "isocost": [
-        ("ours",          "net", 24, 1e-2, "l2si", 9, {}),
-        ("aigeocal",      "net",  4, 1e-3, "lncc", 31, {}),
-        ("views8",        "net",  8, 1e-2, "l2si", 9, {}),
-        ("views4",        "net",  4, 1e-2, "l2si", 9, {}),
-        ("lncc9",         "net", 24, 1e-2, "lncc", 9, {}),
-        ("lncc31",        "net", 24, 1e-2, "lncc", 31, {}),
-        ("views4_lr3e-3", "net",  4, 3e-3, "l2si", 9, {}),
+        ("ours",          "net", 24, 1e-2, "l2si", 9, HASHBL),
+        ("aigeocal",      "net",  4, 1e-3, "lncc", 31, HASHBL),
+        ("views8",        "net",  8, 1e-2, "l2si", 9, HASHBL),
+        ("views4",        "net",  4, 1e-2, "l2si", 9, HASHBL),
+        ("lncc9",         "net", 24, 1e-2, "lncc", 9, HASHBL),
+        ("lncc31",        "net", 24, 1e-2, "lncc", 31, HASHBL),
+        ("views4_lr3e-3", "net",  4, 3e-3, "l2si", 9, HASHBL),
         ("basis",       "basis", 24,  0.3, "l2si", 9, {}),
     ],
 }
@@ -209,7 +212,7 @@ SUITES = {
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="logs/fm3d_cq500/ckpt_iter500000.pth",
+    ap.add_argument("--ckpt", default="logs/fm3d_cq500_leap/ckpt_iter500000.pth",
                     help="read ONLY for the geometry/dataset/scale -- the prior net is not used")
     ap.add_argument("--split", default="val")
     ap.add_argument("--run", type=int, default=0)

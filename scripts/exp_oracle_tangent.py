@@ -49,7 +49,7 @@ def cos(a, b):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="logs/fm3d_cq500/ckpt_iter500000.pth")
+    ap.add_argument("--ckpt", default="logs/fm3d_cq500_leap/ckpt_iter500000.pth")
     ap.add_argument("--split", default="val")
     ap.add_argument("--patients", type=int, default=2)
     ap.add_argument("--seed", type=int, default=3)

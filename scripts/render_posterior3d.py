@@ -69,7 +69,7 @@ def main():
 
     dev = args.device
     world = build_world(ckpt=a["ckpt"], dev=dev, root=a.get("root"), split=a.get("split", "val"),
-                        data=a.get("data"), run=a["run"], z0=a.get("z0", 0),
+                        run=a["run"],
                         motion_kind=a["motion_kind"], seed=a["seed"],
                         # .get, not [...]: snapshots written before the amplitude flags existed
                         # have no such key, and None reproduces make_motion's old defaults --

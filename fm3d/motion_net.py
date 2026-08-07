@@ -9,14 +9,13 @@ rigid pose on every view and explaining the data with jitter. AI_Geocal's answer
 net: the hash grid + MLP is a low-capacity continuous function of the normalized view coordinate,
 so smoothness is structural rather than a penalty term (it carries no explicit smoothness loss).
 
-But the 2D project MEASURED that the stock Instant-NGP settings do not deliver that. With
-`n_levels=16, base_resolution=16, per_level_scale=1.5` the finest grid is ~16 * 1.5^15 ~= 7000
-cells across a scan of a few hundred views: the encoder has far more bandwidth than the signal,
-and the recovered trajectory jitters view-to-view. The fix that won there was not a different
-architecture but simply LESS BANDWIDTH -- `enc="hash"` with `n_levels=4, base_resolution=2,
-per_level_scale=2.0` gives a finest grid of 16 cells ("hashbl"), which matches a B-spline basis
-in accuracy and is the deployed default. Keep it that way; the knobs are exposed so the band
-limit can be re-tuned when the real scan's view count and motion bandwidth are known.
+DEFAULTS ARE THE DEPLOYED FULLBAND ONES (stock Instant-NGP 16/16/1.5, as in AI_Geocal), paired
+with lr 3e-3 downstream. The 2D project's band-limited preset ("hashbl", 4/2/2.0 -- a 16-cell
+finest grid) was this file's default until 2026-08-07, when the preset and its `--est_band`
+switch were REMOVED (user's call): the 3D oracle sweep showed bandwidth x lr is ONE knob and
+fullband @ small lr beats hashbl @ its own lr 5x (rot 0.035 vs 0.173 deg at equal cost), and it
+transferred in-loop. The knobs stay exposed so any band limit can be re-tuned when the real
+scan's view count and motion bandwidth are known; git history has the preset.
 """
 
 from __future__ import annotations
@@ -113,13 +112,13 @@ class MotionNet6DoF(nn.Module):
 
     `enc`:
       "hash"    multiresolution hash grid (tcnn if available, else the torch fallback).
-                DEFAULT SETTINGS ARE THE BAND-LIMITED ONES ("hashbl"), not Instant-NGP's stock.
+                DEFAULTS = the deployed FULLBAND settings (stock Instant-NGP).
       "fourier" explicit M-term Fourier features.
     """
 
     def __init__(self, n_views: int, *, enc: str = "hash",
-                 n_levels: int = 4, n_features_per_level: int = 2, log2_hashmap_size: int = 15,
-                 base_resolution: int = 2, per_level_scale: float = 2.0, fourier_m: int = 8,
+                 n_levels: int = 16, n_features_per_level: int = 2, log2_hashmap_size: int = 15,
+                 base_resolution: int = 16, per_level_scale: float = 1.5, fourier_m: int = 8,
                  width: int = 64, depth: int = 4,
                  trans_max_mm: float = 15.0, rot_max_deg: float = 8.0):
         super().__init__()

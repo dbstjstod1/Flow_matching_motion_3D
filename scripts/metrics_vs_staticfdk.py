@@ -41,7 +41,7 @@ from fm3d.rigid_motion import params_to_Pmot
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="logs/fm3d_cq500/ckpt_iter500000.pth")
+    ap.add_argument("--ckpt", default="logs/fm3d_cq500_leap/ckpt_iter500000.pth")
     ap.add_argument("--runs", nargs="+", default=["cg_v0", "cg_v1", "cg_v2"])
     ap.add_argument("--patients", nargs="+", type=int, default=[0, 1, 2],
                     help="val-patient index per run, same order")

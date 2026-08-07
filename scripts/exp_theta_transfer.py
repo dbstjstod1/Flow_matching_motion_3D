@@ -46,7 +46,7 @@ from fm3d.rigid_motion import make_motion, motion_error, params_to_Pmot, reproje
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="logs/fm3d_cq500/ckpt_iter500000.pth")
+    ap.add_argument("--ckpt", default="logs/fm3d_cq500_leap/ckpt_iter500000.pth")
     ap.add_argument("--from", dest="src", default="data/runs/akima55/thies_v0/result.pt",
                     help="a finished run: supplies theta_hat (its residual is the error SHAPE)")
     ap.add_argument("--split", default="val")

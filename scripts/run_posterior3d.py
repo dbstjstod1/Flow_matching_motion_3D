@@ -56,7 +56,6 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fm3d.dataset_cq500 import CQ500Generator
-from fm3d.dataset_slab import AAPMSlabGenerator
 from fm3d.geometry_3d import (ConeBeam3DConfig, detector_coords_3d,
                               measured_region_mask)
 from fm3d.motion_estimation import make_estimator
@@ -67,7 +66,6 @@ from fm3d.tv import (div_adjoint_3d, grad_forward_3d, shrink, sidky_dtv_denoise_
                      sidky_dtv_grad_3d)
 from fm3d.unet_3d import UNet3D
 
-DATA = "/home/mirlab/Desktop/Flow_matching_motion/data/AAPM_head_data"
 
 
 @torch.no_grad()
@@ -416,8 +414,8 @@ def montage(path, gt, x0, x, xt, ceil, step, t, title,
     plt.close(fig)
 
 
-def build_world(*, ckpt, dev="cuda", root=None, split="val", data=DATA,
-                run=0, z0=0, motion_kind="akima", seed=3, trans_mm=10.0, rot_deg=10.0):
+def build_world(*, ckpt, dev="cuda", root=None, split="val",
+                run=0, motion_kind="akima", seed=3, trans_mm=10.0, rot_deg=10.0):
     """Rebuild the EXACT world the prior was trained in, plus the simulated corrupted scan.
 
     The dataset choice, geometry and grid all come off the checkpoint, not off script defaults:
@@ -434,12 +432,13 @@ def build_world(*, ckpt, dev="cuda", root=None, split="val", data=DATA,
     ck = torch.load(ckpt, map_location=dev, weights_only=False)
     ca = ck["args"]
     ds = ca.get("dataset")
-    if ds is None:
-        if "shape" in ca or "root" in ca:
-            raise SystemExit("checkpoint has no 'dataset' key but carries CQ500-style args "
-                             "(shape/root) -- refusing to guess which generator it trained on")
-        ds = "aapm"        # checkpoints predating --dataset could only be AAPM slab runs
-    if ds == "cq500":
+    if ds != "cq500":
+        # The aapm stacked-slice stand-in (and dataset_slab.py) was REMOVED 2026-08-07 --
+        # only Thies/CQ500 will ever be used (user's standing call). Pre---dataset checkpoints
+        # could only be AAPM slab runs, so they are refused by the same check.
+        raise SystemExit(f"checkpoint dataset {ds!r}: only 'cq500' is supported (AAPM support "
+                         "removed 2026-08-07; see git history)")
+    if True:
         cfg = ConeBeam3DConfig.thies(n_views=ca["views"])            # the trainer's geometry
         root = root or ca.get("root")
         if not root or not os.path.isdir(root):
@@ -453,12 +452,6 @@ def build_world(*, ckpt, dev="cuda", root=None, split="val", data=DATA,
         gen = CQ500Generator(root, cfg, device=dev, split=split,
                              shape=tuple(ca["shape"]), voxel_mm=1.0,
                              sim_native=(ca.get("sim_grid", "native") == "native"))
-    elif ds == "aapm":
-        cfg = ConeBeam3DConfig(det_bin=2, n_views=ca["views"])
-        gen = AAPMSlabGenerator(data, cfg, device=dev, slab=ca["slab"],
-                                in_plane=ca["in_plane"])
-    else:
-        raise SystemExit(f"unknown dataset {ds!r} in checkpoint")
     # No FBP scale to reconcile: the FDK is self-normalized by SOD*SDD/2
     # (projector_3d._fdk_physical_norm), so the operator constant is identical in the
     # trainer and here by construction rather than by injection.
@@ -473,7 +466,7 @@ def build_world(*, ckpt, dev="cuda", root=None, split="val", data=DATA,
     # GT in every montage/metric (vs GT and vs static FDK rank output-vs-x_t oppositely, and
     # only the vs-static number is comparable to Thies' 0.94); (2) itself an honest CEILING
     # panel (the best FDK can do with a perfect, motion-free orbit). Computed once.
-    gt = gen.volume(run) if ds == "cq500" else gen.volume(run, z0)   # (1,1,D,H,W) mu
+    gt = gen.volume(run)                                             # (1,1,D,H,W) mu
     # AMPLITUDE IS AN EXPLICIT ARGUMENT, because leaving it implicit silently changed how hard
     # the task was. make_motion's own defaults are (3,3,2) mm / (1.5,1.5,2) deg -- a head-scale
     # range we picked -- while THIES EVALUATES AT 5 mm / 5 deg on Akima splines. Every number this
@@ -489,15 +482,11 @@ def build_world(*, ckpt, dev="cuda", root=None, split="val", data=DATA,
         amp["rot_deg"] = rot_deg
     theta_true = make_motion(motion_kind, cfg.n_views, device=dev, seed=seed, **amp)
     with torch.no_grad():
-        if ds == "cq500":
-            # THE DATA comes off the NATIVE simulation grid (dataset_cq500.simulate); everything
-            # downstream -- the estimator's forward model, CG, the FDKs -- keeps inverting on the
-            # coarse grid, exactly as in training. aapm slabs have no native source, so they stay.
-            y = gen.simulate(run, params_to_Pmot(theta_true, gen.P_nom)[None])
-            y_static = gen.simulate(run, gen.P_nom[None])
-        else:
-            y = gen.project(gt, params_to_Pmot(theta_true, gen.P_nom)[None])
-            y_static = gen.project(gt, gen.P_nom[None])
+        # THE DATA comes off the NATIVE simulation grid (dataset_cq500.simulate); everything
+        # downstream -- the estimator's forward model, CG, the FDKs -- keeps inverting on the
+        # coarse grid, exactly as in training.
+        y = gen.simulate(run, params_to_Pmot(theta_true, gen.P_nom)[None])
+        y_static = gen.simulate(run, gen.P_nom[None])
         static_fdk = gen.fdk(y_static, gen.P_nom[None])[0]
     return dict(ck=ck, ca=ca, ds=ds, cfg=cfg, gen=gen, spacing=spacing, meas=meas,
                 gt3=gt[0, 0], theta_true=theta_true, y=y, static_fdk=static_fdk)
@@ -506,15 +495,12 @@ def build_world(*, ckpt, dev="cuda", root=None, split="val", data=DATA,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--data", default=DATA, help="AAPM data dir (aapm checkpoints only)")
     ap.add_argument("--root", default=None,
                     help="CQ500 root (cq500 checkpoints); default: the checkpoint's --root")
     ap.add_argument("--split", default="val",
                     help="CQ500 split to draw the test patient from (cq500 checkpoints only)")
     ap.add_argument("--out", default="data/posterior3d")
-    ap.add_argument("--run", type=int, default=0,
-                    help="volume index: patient index (cq500) / run index (aapm)")
-    ap.add_argument("--z0", type=int, default=0, help="slab start slice (aapm only)")
+    ap.add_argument("--run", type=int, default=0, help="patient index within the split")
     # AKIMA 5 mm / 5 deg IS THE DEFAULT, because that is what the REST OF THIS PIPELINE ALREADY
     # USES and what the field evaluates on:
     #     val_fm3d.py     make_motion("akima", ...), --trans_mm 10 --rot_deg 10 (p2p)
@@ -587,7 +573,7 @@ def main():
     # undoes the geometry that got baked into x_t. Do not cut below 200 without re-running the
     # 3-patient A/B.
     ap.add_argument("--per", type=int, default=200)          # motion iters per ODE step
-    ap.add_argument("--estimator", default="net")            # net = hashbl, the 2D default
+    ap.add_argument("--estimator", default="net")            # net = the fullband NGP estimator
     # PLAIN L2 (user's call, 2026-07-28). `l2si` was inherited from the 2D project, where the
     # flow-matching push and the data-residual update disagreed about the image's overall
     # brightness and a plain L2 sinogram term charged that scale drift to the motion parameters.
@@ -601,9 +587,8 @@ def main():
     ap.add_argument("--loss", default="l2")                  # l2 | l2si | lncc | ncc | ramp | l1
     ap.add_argument("--lncc_win", type=int, default=9)
     ap.add_argument("--lr", type=float, default=None,
-                    help="estimator lr; default None = the encoder's matched lr (see "
-                         "--est_band: fullband 1e-3, hashbl 1e-2) or the estimator's own "
-                         "default (direct/basis 0.3)")
+                    help="estimator lr; default None = the net encoder's matched 3e-3, or the "
+                         "estimator's own default (direct/basis 0.3)")
     # ---- ENCODER BANDWIDTH, and why it comes WITH a learning rate ------------------------
     # Oracle sweep, 2026-07-24 (scripts/exp_est_sweep.py --suite oracle --ref gt, 2500 iters =
     # the loop's own N50 x PER50 budget, CQ500 val 0, l2si, rot RMSE):
@@ -619,14 +604,11 @@ def main():
     # is the OTHER cure for the same disease (and remains correct at lr 1e-2, which is what
     # [[motion-estimator-direction]] measured in 2D) -- it is simply the weaker of the two here,
     # and it cannot be run at 1e-3 because its small capacity then needs more than 2500 iters.
-    # So bandwidth and lr are ONE knob and `--est_band` sets both; override lr explicitly only
-    # if you mean to break the pair.
-    # Cost is unchanged (both ran ~8 min at views 24), so this is free accuracy.
-    ap.add_argument("--est_band", default="fullband", choices=["fullband", "hashbl"],
-                    help="motion-encoder bandwidth. fullband (DEFAULT) = stock Instant-NGP "
-                         "16/16/1.5 as in AI_Geocal, paired with lr 1e-3. hashbl = the 2D "
-                         "band-limited 4/2/2.0, paired with lr 1e-2. The lr comes with the "
-                         "choice unless --lr is given.")
+    # So bandwidth and lr are ONE knob; override lr explicitly only if you mean to break the
+    # pair. Cost is unchanged (both ran ~8 min at views 24), so this is free accuracy.
+    # (`--est_band hashbl` -- the 2D band-limited 4/2/2.0 preset, lr 1e-2 -- was REMOVED
+    # 2026-08-07 with the rest of the dead paths; fullband IS the encoder now, and
+    # `exp_est_sweep.py` keeps an explicit-kwargs HASHBL row for reproducing the sweep.)
     ap.add_argument("--views_per_iter", type=int, default=24)
     # SOFT-DC STEP. `alpha` is a FIXED fraction of ||z|| along a NORMALIZED direction, so it does
     # not shrink as the data term converges -- it overshoots and ping-pongs. MEASURED on val 0
@@ -944,7 +926,7 @@ def main():
     torch.manual_seed(args.seed)
 
     world = build_world(ckpt=args.ckpt, dev=dev, root=args.root, split=args.split,
-                        data=args.data, run=args.run, z0=args.z0,
+                        run=args.run,
                         motion_kind=args.motion_kind, seed=args.seed,
                         trans_mm=args.trans_mm, rot_deg=args.rot_deg)
     ck, ca, cfg, gen = world["ck"], world["ca"], world["cfg"], world["gen"]
@@ -985,28 +967,25 @@ def main():
 
     est_kw = dict(dx=gen.dx, dy=gen.dy, dz=gen.dz, loss=args.loss, lncc_win=args.lncc_win,
                   views_per_iter=args.views_per_iter)
-    # bandwidth and its matched lr travel together -- see --est_band. Only `net` has an encoder;
-    # direct/basis have no bandwidth to set, so they keep their own defaults.
+    # bandwidth and its matched lr travel together. Only `net` has an encoder; direct/basis have
+    # no bandwidth to set, so they keep their own defaults.
     if args.estimator.lower() == "basis":
         est_kw["n_ctrl"] = args.n_ctrl
-    if args.estimator.lower() in ("net", "mlp", "hashbl"):
-        band = dict(fullband=dict(n_levels=16, base_resolution=16, per_level_scale=1.5),
-                    hashbl=dict(n_levels=4, base_resolution=2, per_level_scale=2.0))[args.est_band]
-        est_kw.update(band)
-        # fullband's 3e-3 replaced 1e-3 on 2026-07-27: the akima55 bench put it at rot 0.093 deg
-        # against 1e-3's 0.159 at equal cost, and it transferred in-loop (x_t 34.25 -> 35.85 dB,
-        # rot 0.456 -> 0.259, ALL FOUR metric cells improved). hashbl keeps its own pairing.
-        est_kw["lr"] = {"fullband": 3e-3, "hashbl": 1e-2}[args.est_band]
+    if args.estimator.lower() in ("net", "mlp"):
+        # fullband (stock NGP 16/16/1.5 -- now the constructor default) at lr 3e-3: 3e-3
+        # replaced 1e-3 on 2026-07-27 (rot 0.093 vs 0.159 deg at equal cost on the akima55
+        # bench, transferred in-loop: x_t 34.25 -> 35.85 dB, ALL FOUR metric cells improved).
+        est_kw["lr"] = 3e-3
     # THE MATCHED lr IS TUNED FOR L2 (and equivalently for l2si: their gradients differ by a
     # measured factor of 1.00 +- 0.01 in norm, and Adam normalises per parameter anyway).
     # lncc/ncc/ramp are a different story -- their gradient MAGNITUDES differ by orders, so this
-    # lr does not transfer: measured 2026-07-25, `--loss lncc --est_band fullband` left theta
+    # lr does not transfer: measured 2026-07-25, `--loss lncc` (fullband) left theta
     # FROZEN at its init (rot 2.08 deg for all 50 steps, fit stuck at ~0.71) -- lncc's gradient is
     # too small for 1e-3 to move the estimator. Changing to one of THOSE losses without re-tuning
     # lr is a confound, not an ablation; pass an explicit --lr with them.
     if args.lr is not None:                    # explicit --lr overrides the matched pair
         est_kw["lr"] = args.lr
-    print(f"estimator: {args.estimator} band={args.est_band} lr={est_kw.get('lr')} "
+    print(f"estimator: {args.estimator} (fullband NGP) lr={est_kw.get('lr')} "
           f"views/iter={args.views_per_iter} loss={args.loss}")
     # ---- the grid the ESTIMATOR works on, which need not be the reconstruction grid ------------
     # Thies fits motion on 128^3 @ 2 mm and reconstructs at 256^3 @ 1 mm. A rigid 6-DoF trajectory
@@ -1310,7 +1289,7 @@ def main():
                   f"| dc/fm {ratio:.1f}x | {sec:.1f}s", flush=True)
             montage(os.path.join(args.out, f"step{k:03d}.png"), gt3, x0_input, x_fdk_al, x_al,
                     ceil_aligned, k, t,
-                    f"dc_op={args.dc_op} kappa={args.kappa:g} est={args.est_band} | theta rot "
+                    f"dc_op={args.dc_op} kappa={args.kappa:g} est={args.estimator} | theta rot "
                     f"{me['rot_rmse_deg']:.2f} deg, trans_obs {me['trans_obs_mm']:.2f} mm",
                     m_in=m_cold, m_out=m, m_xt=mx,
                     ms_in=ms_cold, ms_out=ms_out, ms_xt=ms_xt, m_ceil=m_ceil)
@@ -1377,7 +1356,7 @@ def main():
                 "x_final": x_final.half().cpu(), "x_t": x.half().cpu()},
                os.path.join(args.out, "result.pt"))
     montage(os.path.join(args.out, "final.png"), gt3, x0_input, x_final_al, x_al, ceil_aligned,
-            N, 1.0, f"FINAL | dc_op={args.dc_op} kappa={args.kappa:g} est={args.est_band} "
+            N, 1.0, f"FINAL | dc_op={args.dc_op} kappa={args.kappa:g} est={args.estimator} "
             f"N={N} PER={args.per} {args.loss} | val {args.run} seed {args.seed}",
             m_in=m_cold, m_out=fm, m_xt=mx_final,
             ms_in=ms_cold, ms_out=fm_s, ms_xt=mx_final_s, m_ceil=m_ceil)

@@ -11,7 +11,7 @@ no TV, walk the uncorrected FDK toward a clean head?
 
 Run it on the FREE gpu against the latest checkpoint, in a loop if you like:
 
-    CUDA_VISIBLE_DEVICES=1 python scripts/val_fm3d.py --ckpt logs/fm3d_cq500/ckpt_last.pth
+    CUDA_VISIBLE_DEVICES=1 python scripts/val_fm3d.py --ckpt logs/fm3d_cq500_leap/ckpt_last.pth
     CUDA_VISIBLE_DEVICES=1 python scripts/val_fm3d.py --ckpt logs/fm3d_cq500 --watch
 """
 

@@ -81,7 +81,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))          # for val_fm3d
 
 from fm3d.dataset_cq500 import CQ500Generator
-from fm3d.dataset_slab import AAPMSlabGenerator
 from fm3d.geometry_3d import ConeBeam3DConfig, measured_region_mask
 from fm3d.prior_patch import make_tile_inputs, volume_context
 from fm3d.rigid_motion import (AMP_UNITS, bridge_P_and_dP, params_to_Pmot,
@@ -89,7 +88,6 @@ from fm3d.rigid_motion import (AMP_UNITS, bridge_P_and_dP, params_to_Pmot,
 from fm3d.unet_3d import UNet3D
 from val_fm3d import run_validation
 
-DATA = "/home/mirlab/Desktop/Flow_matching_motion/data/AAPM_head_data"
 
 
 def sample_t(n: int, device) -> torch.Tensor:
@@ -257,13 +255,16 @@ def bridge_pair(gen, t: torch.Tensor, y, theta, dlt, delta: float = 0.02,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="cq500", choices=["cq500", "aapm"],
+    # `--dataset` is kept (single choice) because checkpoints carry it and
+    # run_posterior3d.build_world dispatches on it. The aapm stacked-slice stand-in was REMOVED
+    # 2026-08-07 (user's call: only Thies/CQ500 will ever be used); its dataset_slab.py went
+    # with it -- see git history if a second dataset ever returns.
+    ap.add_argument("--dataset", default="cq500", choices=["cq500"],
                     help="cq500 = the literature's dataset in the literature's geometry "
-                         "(SID 785 / SDD 1200); aapm = the old stacked-slice stand-in")
+                         "(SID 785 / SDD 1200)")
     ap.add_argument("--root", default="data/CQ500")
     ap.add_argument("--split", default="train")
-    ap.add_argument("--shape", type=int, nargs=3, default=(256, 256, 256))   # cq500, @ 1 mm
-    ap.add_argument("--data", default=DATA)                                  # aapm only
+    ap.add_argument("--shape", type=int, nargs=3, default=(256, 256, 256))   # @ 1 mm
     ap.add_argument("--out", default="logs/fm3d_a")
     # ---- THE DEFAULTS BELOW ARE THE DEPLOYED RUN (2026-07-31, user's call) ------------------
     # Everything here used to default to a toy configuration nobody ran, so the real recipe lived
@@ -321,8 +322,6 @@ def main():
     # OUR live value as the source, so treat "the sibling validated it" as circular: the voxel
     # arithmetic above is the non-circular part.)
     ap.add_argument("--refresh", type=int, default=12)       # steps between refreshing one draw
-    ap.add_argument("--slab", type=int, default=64)          # aapm only
-    ap.add_argument("--in_plane", type=int, default=256)     # aapm only
     ap.add_argument("--views", type=int, default=360)
     ap.add_argument("--base", type=int, default=32)
     ap.add_argument("--context", default="global", choices=["global", "none"],
@@ -456,13 +455,6 @@ def main():
     dev = "cuda"
     os.makedirs(args.out, exist_ok=True)
 
-    # The data bridge simulates its own sinograms from a patient INDEX (`gen.simulate`); aapm
-    # slabs have no stable key and are the retired stand-in, so fail loudly instead of quietly
-    # running a half-tested path.
-    if args.bridge == "data" and args.dataset != "cq500":
-        raise SystemExit("--bridge data needs cq500's simulate(idx, P) path; the aapm stand-in "
-                         "has no stable per-volume key. Use --bridge geom for --dataset aapm.")
-
     # --seed None keeps the historical unseeded behavior (and the historical RNG call sequence).
     # `motion_gen` stays None when unseeded, which is exactly what random_motion/sample_motion
     # received before it existed.
@@ -473,19 +465,12 @@ def main():
         motion_gen = torch.Generator().manual_seed(args.seed + 1)
         print(f"seeded torch+numpy with {args.seed} (motion generator: {args.seed + 1})")
 
-    if args.dataset == "cq500":
-        cfg = ConeBeam3DConfig.thies(n_views=args.views)
-        gen = CQ500Generator(args.root, cfg, device=dev, split=args.split,
-                             shape=tuple(args.shape), voxel_mm=1.0,
-                             sim_native=(args.sim_grid == "native"))
-        print(f"CQ500 '{args.split}': {gen.n_slabs} patients | grid {gen.shape} @ 1 mm | "
-              f"self-normalized FDK (SOD*SDD/2)")
-    else:
-        cfg = ConeBeam3DConfig(det_bin=2, n_views=args.views)
-        gen = AAPMSlabGenerator(args.data, cfg, device=dev, slab=args.slab,
-                                in_plane=args.in_plane)
-        print(f"slabs: {gen.n_slabs} from {len(gen.runs)} runs | grid {gen.shape} @ "
-              f"({gen.dz}, {gen.dy}, {gen.dx}) mm | self-normalized FDK (SOD*SDD/2)")
+    cfg = ConeBeam3DConfig.thies(n_views=args.views)
+    gen = CQ500Generator(args.root, cfg, device=dev, split=args.split,
+                         shape=tuple(args.shape), voxel_mm=1.0,
+                         sim_native=(args.sim_grid == "native"))
+    print(f"CQ500 '{args.split}': {gen.n_slabs} patients | grid {gen.shape} @ 1 mm | "
+          f"self-normalized FDK (SOD*SDD/2)")
     print(f"detector {cfg.nv}x{cfg.nu} @ {cfg.du:.3f} mm | FOV {cfg.fov_diameter_mm():.0f} mm | "
           f"{cfg.n_views} views")
 
@@ -640,8 +625,7 @@ def main():
         depends on neither the motion nor t -- that removes one forward projection (~0.9 s) and one
         FDK (~0.18 s) from every draw after a volume's first, and the cache refreshes a draw only
         every `--refresh` steps. To reach the memo we sample the volume INDEX ourselves here
-        (cq500's `volume(idx)` is a clean per-patient lookup); aapm slabs have no such stable key,
-        so they keep the old inline path via `sample_motion`."""
+        (cq500's `volume(idx)` is a clean per-patient lookup)."""
         _tm: dict[str, float] = {}
         _tk = [time.time()]
 
@@ -650,8 +634,7 @@ def main():
                 torch.cuda.synchronize()
                 now = time.time(); _tm[name] = now - _tk[0]; _tk[0] = now
 
-        idx = None
-        if args.dataset == "cq500":
+        if True:  # noqa: SIM115 -- kept one indent level so the diff to the two-dataset era stays readable
             # The patient for THIS draw was sampled by the PREVIOUS draw (and its native-grid
             # volume has been prefetching on a worker thread ever since -- see
             # `CQ500Generator.prefetch_fine` for the measured stall this hides). Sample the
@@ -681,9 +664,6 @@ def main():
             y = None if args.bridge == "data" else \
                 gen.simulate(idx, params_to_Pmot(th[0], gen.P_nom)[None])
             _tick("sim_y")
-        else:
-            y, th, vol = gen.sample_motion(1, trans_mm=mot_trans, rot_deg=mot_rot,
-                                           amp_mode=args.motion_amp, generator=motion_gen)
 
         if args.bridge == "data":
             # THE DATA BRIDGE: motion decays in the MEASUREMENT, geometry stays P_nom, endpoint
@@ -706,7 +686,7 @@ def main():
         # FDK(y, P(t*theta)) below. The filtering half of the FDK never reads Pmat (cosine /
         # Wang / Ohnesorge / ramp are detector-only), so this is EXACT, not an approximation --
         # see `projector_3d.fdk_backproject_filtered`. Costs ~0.08 s of a 1.16 s draw to run twice.
-        filt = gen.fdk_filtered(y) if args.dataset == "cq500" else None
+        filt = gen.fdk_filtered(y)
         _tick("filter")
 
         dlt = None
@@ -722,11 +702,8 @@ def main():
                 if vol is None:               # the lazy load above -- `gt` is its only consumer
                     vol = gen.volume(idx)
                 x_anchor = gen.to_net(vol[0, 0])
-            elif idx is not None:             # "static", cq500: the memoized motion-free recon
+            else:                             # "static": the memoized motion-free recon
                 x_anchor = gen.static_anchor_net(idx)
-            else:                             # "static", aapm: compute inline (no stable key)
-                y0 = gen.project(vol, gen.P_nom[None])
-                x_anchor = gen.to_net(gen.fdk(y0, gen.P_nom[None])[0])
             _tick("anchor")
             x1_geo = gen.to_net(gen.fdk(y, params_to_Pmot(th[0], gen.P_nom)[None],
                                         filtered=filt)[0])

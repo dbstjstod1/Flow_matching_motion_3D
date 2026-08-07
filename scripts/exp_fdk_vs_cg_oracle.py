@@ -48,7 +48,7 @@ from run_posterior3d import cg_dc_step                                   # noqa:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="logs/fm3d_cq500/ckpt_iter500000.pth")
+    ap.add_argument("--ckpt", default="logs/fm3d_cq500_leap/ckpt_iter500000.pth")
     ap.add_argument("--run", type=int, default=0)
     ap.add_argument("--seed", type=int, default=3)
     ap.add_argument("--cg_iters", type=int, default=60)

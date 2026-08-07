@@ -60,7 +60,7 @@ def montage(path, panels, title):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="logs/fm3d_cq500/ckpt_iter500000.pth")
+    ap.add_argument("--ckpt", default="logs/fm3d_cq500_leap/ckpt_iter500000.pth")
     ap.add_argument("--split", default="val")
     ap.add_argument("--run", type=int, default=0)
     ap.add_argument("--out", default="data/pure_ode_val0")

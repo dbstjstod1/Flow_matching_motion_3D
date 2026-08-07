@@ -38,7 +38,7 @@ from fm3d.motion_estimation import make_estimator
 from fm3d.projector_3d import forward_project_3d_batched
 from fm3d.rigid_motion import make_motion, motion_error, params_to_Pmot
 
-CKPT = "logs/fm3d_cq500/ckpt_iter500000.pth"
+CKPT = "logs/fm3d_cq500_leap/ckpt_iter500000.pth"
 COARSE = 2
 ok = True
 

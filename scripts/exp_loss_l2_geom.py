@@ -50,7 +50,7 @@ from fm3d.rigid_motion import (amp_from_run_args, make_motion,           # noqa:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="logs/fm3d_cq500/ckpt_iter500000.pth")
+    ap.add_argument("--ckpt", default="logs/fm3d_cq500_leap/ckpt_iter500000.pth")
     ap.add_argument("--from", dest="src", default="data/runs/akima55/c2f_v0",
                     help="a finished run whose snapshots supply the loop's own reference images")
     ap.add_argument("--views", type=int, default=24, help="the estimator's minibatch size")

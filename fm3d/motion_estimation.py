@@ -22,8 +22,9 @@ independent rigid pose on every view:
              explicit (n_ctrl control points) and the waveform is not assumed -- unlike a Fourier
              basis, which on a sinusoidal simulation is handed the answer and scores beautifully
              for the wrong reason.
-    net      MotionNet6DoF, the AI_Geocal architecture, with the 2D project's BAND-LIMITED hash
-             settings ("hashbl"). This is the deployed default there.
+    net      MotionNet6DoF, the AI_Geocal architecture, at the deployed FULLBAND settings
+             (stock NGP 16/16/1.5, lr 3e-3; the 2D-era band-limited "hashbl" preset was removed
+             2026-08-07 -- bandwidth and lr are ONE knob, see motion_net.py).
 
 NOTE ON THE PROJECTOR. Motion estimation needs d(loss)/dP. The forward is LEAP's modular-beam
 projector, PINNED to its Joseph kernel (`leap_projector._model` -> `set_forceJosephModular`;
@@ -297,8 +298,8 @@ class BasisMotionEstimator(_BaseEstimator):
 class NetMotionEstimator(_BaseEstimator):
     """MotionNet6DoF (AI_Geocal's architecture, band-limited settings). Deployed default in 2D."""
 
-    def __init__(self, *a, lr=1e-2, enc="hash", n_levels=4, base_resolution=2,
-                 per_level_scale=2.0, fourier_m=8, trans_max_mm=15.0, rot_max_deg=8.0, **kw):
+    def __init__(self, *a, lr=3e-3, enc="hash", n_levels=16, base_resolution=16,
+                 per_level_scale=1.5, fourier_m=8, trans_max_mm=15.0, rot_max_deg=8.0, **kw):
         super().__init__(*a, **kw)
         self.net = MotionNet6DoF(
             self.V, enc=enc, n_levels=n_levels, base_resolution=base_resolution,
@@ -318,6 +319,6 @@ def make_estimator(name: str, cfg, P_nom, u, v, device, **kw) -> _BaseEstimator:
         return DirectMotionEstimator(cfg, P_nom, u, v, device, **kw)
     if n == "basis":
         return BasisMotionEstimator(cfg, P_nom, u, v, device, **kw)
-    if n in ("net", "mlp", "hashbl"):
+    if n in ("net", "mlp"):
         return NetMotionEstimator(cfg, P_nom, u, v, device, **kw)
     raise ValueError(f"unknown estimator '{name}' (direct|basis|net)")
