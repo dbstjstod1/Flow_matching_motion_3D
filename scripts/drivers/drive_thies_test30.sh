@@ -39,7 +39,7 @@ set -u
 cd /home/mirlab/Desktop/Flow_matching_motion_3D
 PY=/home/mirlab/anaconda3/envs/flow_matching/bin/python
 export CUDA_VISIBLE_DEVICES=0
-QM=logs/bench_thies_qm/qmnet_best.pth
+QM=logs/bench_thies_qm2/qmnet_best.pth
 mkdir -p logs/bench_thies_test30 logs/bench_thies_test30_amp55 \
          data/bench_thies_test30 data/bench_thies_test30_amp55
 

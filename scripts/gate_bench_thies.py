@@ -14,6 +14,7 @@ quality network -- so it can be run before either bench script is launched, and 
     G8  the Eq. 6 optimizer loop runs end to end (untrained net)              f finite, x moves
     G9  the FAST kernels reproduce the VENDORED ones (value and dI/dP)        rel < 1e-3, cos > 1-1e-6
     G10 the float32 VIF* reproduces the float64 one                           rel < 1e-3
+    G11 the stage-1 pair is the PAPER's pair (static data, perturbed P)       target >> consistent-pair target
 
 G6 IS THE ONE THAT MATTERS. A projector whose geometry gradient is wrong (or zero) does not
 raise -- it silently makes the optimizer wander, which is exactly the failure mode this repo has
@@ -377,6 +378,96 @@ def g9_fast_kernels(cfg, P_nom, y):
           "ThiesConeRecon(fast=None) takes the fast kernels; FM3D_THIES_VENDOR_BP=1 reverts")
 
 
+def g11_training_pair(cfg, P_nom, vol_gt, y_static):
+    """THE STAGE-1 PAIR (TMI III, p.1103): the MOTION-FREE projection data reconstructed with
+    PERTURBED matrices. The regression this check exists to catch was real: until 2026-08-06
+    `QMSampleSource.sample` simulated y WITH the perturbed matrices and backprojected with the
+    SAME matrices -- a consistent pair whose motion cancels, so the net trained on near-oracle
+    volumes (batch target mean never above 0.44 over 7000 iterations) and then saturated at the
+    x=0 states of stage 2 (true VIF* ~0.8). Three assertions:
+
+      * the paper pair at a training-scale motion has a HIGH VIF* mean (the volume really is
+        corrupted), and it sits well above the consistent pair's;
+      * **the production `sample()` itself** (run against a stub generator wrapping the gate's
+        phantom, so no CQ500 is needed) returns a target NUMERICALLY EQUAL to the paper-pair
+        construction -- if the consistent-pair bug ever returns, this equality breaks by the
+        full gap, not by a threshold;
+      * `TRAIN_AMP` carries `amp_mode="thies_hn"` and the mode draws within its bound -- the
+        clipped half-normal transcribed from their released sampler, i.e. the paper's
+        "perturb the data only slightly" clause is present in the training distribution.
+
+    NOTE the consistent pair is NOT identical to the static recon even in principle: their
+    backprojection has no angular weight, so rz motion makes the effective view spacing uneven
+    and leaves real artifacts in the consistent pair too (VIF* ~0.5 on the reduced config).
+    That is why the detector is equality-to-the-paper-pair, not a ratio between the two.
+    """
+    print("G11 the stage-1 training pair is the PAPER's pair (static data, perturbed matrices)")
+    import tempfile
+    from bench.thies.data import QMSampleSource, TRAIN_AMP, THIES_TRAIN_AMP
+    from bench.thies.recon import to_unit
+
+    recon = ThiesConeRecon(cfg)
+    grid = VolumeGrid.centred(64, 4.0)
+    amp = dict(trans_mm=10.0, rot_deg=10.0, amp_mode="fixed")        # deterministic given seed
+    th = akima_motion(cfg.n_views, n_nodes=10, device=DEV, seed=3, zero_centre=True, **amp)
+    P_mot = params_to_Pmot(th, P_nom)
+
+    g_static = recon.filter(y_static)
+    with torch.no_grad():
+        ref = recon.backproject(g_static, P_nom, grid)               # unperturbed recon
+        v_paper = recon.backproject(g_static, P_mot, grid)           # THE pair: static data + P*
+        y_mot = forward_project_3d_batched(vol_gt, P_mot[None], recon_u(cfg), recon_v(cfg),
+                                           dx=1.0, dy=1.0, dz=1.0)
+        v_bug = recon.backproject(recon.filter(y_mot), P_mot, grid)  # the consistent pair (bug)
+
+    r = to_unit(ref)[None, None]
+    t_paper = float(vif_star_map_3d(to_unit(v_paper)[None, None], r).mean())
+    t_bug = float(vif_star_map_3d(to_unit(v_bug)[None, None], r).mean())
+    check("G11 paper pair is corrupted, and more so than the consistent pair",
+          t_paper > 0.15 and (t_paper - t_bug) > 0.1,
+          f"VIF* mean: paper pair {t_paper:.4f}, consistent pair {t_bug:.4f} at 10 mm / 10 deg "
+          f"p2p (the paper pair must carry the motion; the consistent pair largely cancels it)")
+
+    # -- the REAL detector: run the production sample() and pin it to the paper construction --
+    class _StubGen:
+        """`CQ500Generator`'s 3-method surface as `sample()` consumes it, over the phantom.
+        (`P_nom` is attached after the class body -- class bodies cannot see function locals.)"""
+        records = [{"patient": 0}]
+
+        def simulate(self, idx, Pmat, **kw):
+            P = Pmat if Pmat.dim() == 4 else Pmat[None]
+            return forward_project_3d_batched(vol_gt, P, recon_u(cfg), recon_v(cfg),
+                                              dx=1.0, dy=1.0, dz=1.0)
+
+        def prefetch_fine(self, idx):
+            pass
+
+    _StubGen.P_nom = P_nom
+    src = object.__new__(QMSampleSource)                 # skip __init__: no CQ500 on a gate box
+    src.gen, src.cfg, src.device = _StubGen(), cfg, DEV
+    src.grid, src.recon, src.amp, src.n_nodes = grid, recon, amp, 10
+    src.cache_dir = tempfile.mkdtemp(prefix="gate_thies_g11_")
+    src._gfilt, src._static = {}, {}                     # the RAM caches __init__ would build
+    got = float(src.sample(0, seed=3)["target"].mean())  # same seed -> the SAME theta as above
+    check("G11 sample() builds the paper pair", abs(got - t_paper) < 5e-3,
+          f"sample() target mean {got:.4f} vs the paper-pair construction {t_paper:.4f} "
+          f"(the consistent-pair bug would land at {t_bug:.4f} -- the full gap away)")
+
+    for name, amp in (("TRAIN_AMP", TRAIN_AMP), ("THIES_TRAIN_AMP", THIES_TRAIN_AMP)):
+        check(f"G11 {name} mode", amp.get("amp_mode") == "thies_hn",
+              f"amp_mode = {amp.get('amp_mode')!r} (their released clipped-half-normal sampler; "
+              f"'thies' is the pre-2026-08-06 U(0,1) reading, 8x poorer mild-motion coverage)")
+    th_hn = torch.stack([akima_motion(cfg.n_views, n_nodes=10, seed=100 + i, zero_centre=True,
+                                      **TRAIN_AMP) for i in range(8)])
+    p2p_t = float((th_hn[..., :3].amax(1) - th_hn[..., :3].amin(1)).max())
+    p2p_r = float(torch.rad2deg(th_hn[..., 3:].amax(1) - th_hn[..., 3:].amin(1)).max())
+    # Akima overshoots its node bound by up to ~1.5x; the node bound itself is the p2p amplitude.
+    ok = p2p_t <= 1.6 * TRAIN_AMP["trans_mm"] and p2p_r <= 1.6 * TRAIN_AMP["rot_deg"]
+    check("G11 thies_hn respects the bound", ok,
+          f"max realized p2p over 8 draws: {p2p_t:.2f} mm / {p2p_r:.2f} deg against maxima "
+          f"{TRAIN_AMP['trans_mm']:g} / {TRAIN_AMP['rot_deg']:g} (x1.6 Akima-overshoot allowance)")
+
+
 # -- helpers ----------------------------------------------------------------------------------
 _UV = {}
 
@@ -428,6 +519,7 @@ def main():
     g8_loop(cfg, P_nom, vol)
     g9_fast_kernels(cfg, P_nom, y)
     g10_vif_precision()
+    g11_training_pair(cfg, P_nom, vol, y)
 
     print()
     if FAILED:

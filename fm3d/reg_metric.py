@@ -145,15 +145,24 @@ def aligned_metrics(recon: torch.Tensor, gt: torch.Tensor, spacing, *,
     volume next to the GT compares DIFFERENT ANATOMICAL PLANES while the title quotes an aligned
     metric. Returning it is free; the alignment was computed either way.
     """
+    def _rmse(a, b):
+        d = (a - b)[mask] if mask is not None else (a - b)
+        return float((d ** 2).mean().sqrt())
+
     peak = float(gt[mask].max()) if mask is not None else float(gt.max())
     dr = peak
     out = {
         "psnr_raw": psnr(recon, gt, mask, peak),
         "ssim_raw": ssim(recon, gt, data_range=dr, mask=mask),
+        # RMSE in the INPUT's units (mu [1/mm] everywhere in this repo; a caller quoting HU
+        # divides by its mu_water and scales by 1000). Added for Thies' Table I, whose image
+        # metrics are RMSE / SSIM / VIF after rigid registration.
+        "rmse_raw": _rmse(recon, gt),
     }
     al, th = rigid_align(recon, gt, spacing, mask=mask, iters=iters, init=init)
     out["psnr_aligned"] = psnr(al, gt, mask, peak)
     out["ssim_aligned"] = ssim(al, gt, data_range=dr, mask=mask)
+    out["rmse_aligned"] = _rmse(al, gt)
     out["gauge_shift_mm"] = float(th[:3].norm())
     out["gauge_rot_deg"] = float(torch.rad2deg(th[3:].norm()))
     if return_theta and return_aligned:

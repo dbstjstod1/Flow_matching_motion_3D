@@ -59,6 +59,7 @@ non-obvious choice is annotated in-place with the paper line it comes from, and 
 | motion enters as | `P*_j = P_j · T_j(x)`, i.e. inverse object motion on the geometry | L207-215 | `motion.ThiesSplineMotion` → `fm3d.rigid_motion.params_to_Pmot` |
 | motion model | Akima splines, **10 nodes to simulate, 30 nodes to estimate**, evenly spaced, one node at each end | L288-292 | `motion.ThiesSplineMotion(n_nodes=30)` |
 | quality target | `VIF* = 1 − K·VIF(I_dist, I_ref)`, spatially resolved per Shao et al. | L326-334 | `vif.vif_star_map_3d` |
+| net training data | the **MOTION-FREE** projections reconstructed with the **PERTURBED** matrices ("The filtered projection data is reconstructed from these perturbed matrices") | L490-493 | `data.QMSampleSource.sample` — **fixed 2026-08-06, see §4.9; everything trained before that date is VOID** |
 | quality net | 3D U-Net, ReLU, feature maps **8·l for l = 1..4**, final 1×1 conv, no activation | L334-341 | `qmnet.QualityMetricUNet3D` |
 | net training | L1 loss, Adam, **lr 1e-3, batch 16**, 128³ in and out | L341-343 | `scripts/bench_thies_train_qm.py` |
 | net input norm | "fixed, **sample-independent** offset and slope" to ≈[0,1] | L493-496 | `recon.MU_LO/MU_HI` affine |
@@ -85,8 +86,15 @@ We run this benchmark at **our** amplitudes instead, so the number is comparable
 
 | | Thies | **this bench (= ours)** | ratio |
 |---|---|---|---|
-| quality-net / prior TRAINING | 10 mm / 15° p2p, `amp_mode="thies"` | **15 mm / 20° p2p, `amp_mode="thies"`** | 1.5× / 1.33× |
+| quality-net TRAINING | 10 mm / 15° p2p, `amp_mode="thies_hn"` | **15 mm / 20° p2p, `amp_mode="thies_hn"`** | 1.5× / 1.33× |
 | EVALUATION | 5 mm / 5° p2p, `amp_mode="fixed"` | **10 mm / 10° p2p, `amp_mode="fixed"`** | **2× / 2×** |
+
+`amp_mode="thies_hn"` (2026-08-06) is THEIR released per-DoF sampler — a clipped half-normal,
+`a_d = A_d·min(|N(0, u_d)|, 1)`, `u_d~U(0,1)` — transcribed from
+`refs/thies_moco_diff_likelihood/autofocus_data_set.py`. Its mass near zero is the paper's
+"motion patterns that perturb the data only slightly" clause: severity < 0.5 in 12.5% of draws,
+against 1.5% under the older `"thies"` U(0,1) reading (which remains what OUR PRIOR was trained
+with; its meaning is frozen).
 
 Those are exactly the values on our deployed prior
 (`logs/fm3d_cq500_leap/ckpt_iter500000.pth` → `args["train_trans_mm"]=15`,
@@ -272,6 +280,9 @@ cancellation). `vif_map_3d(..., dtype=torch.float64)` restores the old precision
 
 ### 4.7. The stage-1 run has ONE seam, at iter 2000 (2026-08-04)
 
+> **SUPERSEDED by §4.9 (2026-08-06): the whole `logs/bench_thies_qm` run — both sides of this
+> seam — is VOID (trained on the wrong pair). Kept for the record of what the seam was.**
+
 `logs/bench_thies_qm` is **not** a single trajectory from a single code version, and it is **not**
 bit-continuous across the seam. Iterations 0–2000 ran the pre-2026-08-04 code; 2000 onward runs
 everything in §4.5–4.6. Three things changed under it:
@@ -303,6 +314,130 @@ everything in §4.5–4.6. Three things changed under it:
    code, or 2000→ under the new code from `qmnet_iter002000.pth`, but not one continuous
    trajectory. A clean single-version run needs a fresh launch; nothing about the *method*
    requires one.
+
+### 4.9. 2026-08-06 — the stage-1 pair was the WRONG pair; the second run is VOID too
+
+**The bug.** `QMSampleSource.sample` simulated `y` with the perturbed matrices AND backprojected
+with the same perturbed matrices. That is a CONSISTENT pair: the motion cancels between
+simulation and reconstruction, so the "motion-affected" input the net trained on was in fact the
+CONVERGED point of Eq. 6 — an oracle reconstruction with mild residual artifacts — not a
+motion-corrupted volume. The paper's construction (III, p.1103, confirmed against the published
+IEEE PDF in `docs/`) perturbs the **backprojection matrices only**: *"The filtered projection
+data is reconstructed from these perturbed matrices."* The filtered projection data is the
+motion-free circular scan.
+
+**Measured, before the fix** (2 patients, TRAIN_AMP):
+
+| | consistent pair (what the net saw) | paper pair / Eq. 6 x=0 (what it should see) |
+|---|---|---|
+| PSNR vs static recon | 34.8 / 41.3 dB | 27.0 / 24.2 dB |
+| VIF* mean | 0.39 / 0.21 | **0.75 / 0.79** |
+
+Over the 7000 logged iterations of `logs/bench_thies_qm`, the batch target mean stayed in
+0.30–0.44 (never above 0.44); at stage 2 the frozen net emitted f ≈ 0.45–0.48 at x=0 —
+saturated at its training range's edge — against a true VIF* of ~0.8, and reached RPE
+5.33 → 2.68 mm where the paper reports 3.00 → 0.61 mm.
+
+**Voided by this finding:** the ENTIRE `logs/bench_thies_qm` run (both sides of the §4.7 seam),
+every `qmnet_*.pth` in it, and every stage-2 number scored with them — including all of
+`data/qm_stopcrit/*` (the stop-criterion sweep measured a net trained on the wrong pair).
+The `data/bench_thies_cache` static recons remain VALID (the reference side never changed).
+
+**Fixed the same day**, plus the amplitude-shape correction (`amp_mode="thies_hn"`, §3). Gate
+**G11** now reconstructs the same filtered static sinogram both ways and asserts the paper pair's
+VIF* is high while the consistent pair's is at least 2× lower — the construction cannot silently
+regress. Retraining goes to a NEW directory so no seam ambiguity attaches to the corrected run.
+
+### 4.9b. Full re-verification pass (2026-08-06, after §4.9) — what was checked and what came out
+
+A second line-by-line pass over the vendored kernels, the released 2D repo, and the PUBLISHED
+PDF (not the txt dump), at the user's request. Confirmed one-to-one, at code level:
+
+* `fast_backprojector` ↔ `backprojector_cone.py`/`helper.py`: all twelve backward expressions,
+  the `int()`-truncating 4-tap interpolation, `torch.gradient(sino, dim=(2,1))`, the axis map
+  (`point2`←axis0), and Eq. 4/5 of the PDF (p.1101). G9 pins the numerics every gate run.
+* motion enters as **P·T** (right multiplication): their released `rigid_2d` does
+  `einsum('ijn,jkn->ikn', P, T)`; ours is `apply_rigid_motion = P_nom @ T_obj`. Same side.
+* zero-centering: theirs subtracts the mean of the **interpolated per-view curve**
+  (`rigid_2d` with the resampled values), not of the nodes; `akima_motion` does exactly that
+  (`s - s.mean()` on the per-view spline).
+* the training pair: their released `autofocus_data_set.load_data` backprojects
+  `filtered_projections.tif` — data from DISK, never re-simulated — with `proj_mat_perturbed`.
+  Static data + perturbed matrices, i.e. the §4.9 fix is their released construction verbatim.
+* `amp_mode="thies_hn"` ↔ their `(rand(n)−0.5) · min(|N(0, A·rand(1))|, A)`: same distribution,
+  per-DoF, p2p convention; their radians/degrees plumbing bug NOT propagated.
+* RPE: `fm3d.rigid_motion.reprojection_error` = 300 fixed points (Fibonacci lattice, the paper
+  does not specify the arrangement), radii 25/50/100 mm, detector-domain mm, recovered vs target
+  geometry — the PDF's own definition (p.1104). Fp64 end to end since today.
+* Eq. 6 loop, grids (128³@2mm est / 256³@1mm out), s0/decay/iters, x⁽⁰⁾=0, frozen net,
+  map-then-average: all as published.
+
+Remaining KNOWN deviations (all documented above, none silent): ramp discretization (|f|
+frequency-sampled; their pyronn build unpublished — cancels inside the VIF pair), the [0,1]
+window constants (theirs unpublished), VIF-P vs Shao localization (§4.10), the U-Net block
+detail (paper says only "3D conv + ReLU"; the cited plant-seg fork's default block is
+GroupNorm8-conv-ReLU with encoder mid-channel halving — ours is plain conv+ReLU at full width,
+`--norm group` exists for the A/B), axis-angle rotations, and the deliberate 2× amplitude.
+
+### 4.11. In-training RPE probe (2026-08-06) — the convergence criterion, in tensorboard
+
+`bench_thies_train_qm.py --rpe_every N` (default 500) runs the paper's own Eq. 6 (100 GD steps,
+s0=100, t=0.97) on `--rpe_patients` (default 3) FIXED val scans against the current net and logs
+`rpe/mean`, `rpe/zero_centred_mean`, `rpe/p{i}`, `rpe/init_mean` to TB. The probe instances are
+(val patient i, seed **2000+i**, 10/10 p2p `fixed`) — bit-identical to
+`bench_thies_estimate --split val --run i --seed 2000+i`, so a TB point and a stage-2 run measure
+the same problem. Val L1 remains what selects `qmnet_best.pth`; RPE is what decides the budget.
+The gradient is taken with `autograd.grad(f, mot.x)` so nothing accumulates into the net's
+parameters. Setup keeps 3 filtered sinograms on CPU (504 MB each); one probe ≈ 2–3 min.
+
+**Result metrics were extended the same day** (for the fm3d head-to-head): `result.json` now
+carries fp64 RPE (+`rpe_init`), per-DoF MAE in the PDF's Fig. 4 axes (in-plane tx/ty/rz,
+out-of-plane tz/rx/ry; mm and degrees), and `rmse_hu_*` / `vif_aligned` per reference block —
+the paper's Table I axes (RMSE/SSIM/VIF after rigid registration). `aligned_metrics` itself
+gained `rmse_raw`/`rmse_aligned` (native mu units). `cmp_thies_vs_ours.py` recomputes BOTH
+sides' RPE in fp64 from the saved thetas rather than trusting a json.
+
+### 4.12. The filtered-sinogram RAM cache (2026-08-07) — performance-only, bit-exact
+
+A consequence of §4.9: stage-1's sinogram is now the MOTION-FREE scan, a per-patient constant,
+so `QMSampleSource` caches the filtered sinogram in host RAM (`_gfilt`, 504 MB/patient fp32;
+150 train + 50 val ≈ 100 GB against 220 GB available) and gates `prefetch` so a cache hit loads
+no native volume. Measured: warm sample **0.84 → 0.19 s** (miss unchanged); the cached tensor is
+the same deterministic kernel output, verified **bitwise identical** hit vs miss, so the
+mid-run redeploy (killed at iter 3800, resumed from `qmnet_last.pth` with its saved RNG state)
+is an exact continuation, not a seam. One real bug fixed on the way: the checkpoint's RNG state
+is loaded with `map_location=dev` and must come back to CPU before `Generator.set_state`.
+
+### 4.10. Cross-check against the published Table I, and two things it settled (2026-08-06)
+
+The published PDF (`docs/IEEE Xplore Full-Text PDF_.pdf`, TMI 44(2), p.1104 — the txt dump in
+`refs/` drops this table) gives the **Init** row at 5 mm / 5°, 30 test patients, metrics on
+256³ @ 1 mm after rigid registration: **RMSE 120.75 HU | SSIM 0.83 | VIF 0.48**. Ours, measured
+at the same operating point (test patients 0–2, x=0, 128³ @ 2 mm, unregistered):
+
+| | RMSE [HU] | SSIM | VIF |
+|---|---|---|---|
+| paper Init (5/5) | 120.75 | 0.830 | 0.480 |
+| ours x=0 (5/5) | **118.92** | 0.873 | **0.328** |
+| ours x=0 (10/10, deployed) | 179.70 | 0.733 | 0.189 |
+
+Two conclusions:
+
+1. **RMSE agrees to 1.5%** (different 30 patients, different grid, no registration — and still
+   1.5%): the simulation + geometry + reconstruction chain sits on the paper's operating point.
+   Any future gap to the paper is not the recon chain.
+2. **Our VIF runs ~0.15 LOW at the same state.** `vif.py` is a VIF-P decomposition (§4.5 of the
+   spec list; we do not have Shao et al.), and the probe grid/registration differ, so the exact
+   offset is indicative — but absolute VIF values are NOT comparable to the paper's. Monotone
+   transformations do not move Eq. 6's minimizer, so this is a *reporting* constraint, not a
+   fairness problem. Never quote our VIF against their 0.70.
+
+**Step size is tunable by THEIR OWN protocol.** p.1106: for the clinical scans *"we adjust the
+step size for the gradient descent to s0 = 10"* — the authors themselves recalibrate s0 when the
+objective's scale changes. Our objective (retrained net, our VIF calibration, 2× amplitude) is
+not their objective, so an s0 sweep after stage 1 is protocol-conformant, not a departure. The
+CLI default stays 100 (the paper's simulation setting); `bench_thies_estimate.py` already prints
+the first-step magnitude to read before trusting any run.
 
 ---
 
@@ -352,9 +487,11 @@ difference of two ~1e5 sums dominates, so the LARGEST eps in the table is the tr
 
 ```
 setsid nohup /home/mirlab/anaconda3/envs/flow_matching/bin/python \
-  scripts/bench_thies_train_qm.py --out logs/bench_thies_qm --device cuda \
-  </dev/null > logs/bench_thies_qm.log 2>&1 &
+  scripts/bench_thies_train_qm.py --out logs/bench_thies_qm2 --device cuda \
+  </dev/null > logs/bench_thies_qm2.log 2>&1 &
 ```
+
+(`logs/bench_thies_qm` is the VOID first run — §4.9. Do not resume from it or write into it.)
 
 Defaults are the paper's everywhere except the amplitude, which is **ours** (15 mm / 20 deg p2p,
 per-DoF unequal). `--amp thies` gives the published 10 mm / 15 deg.

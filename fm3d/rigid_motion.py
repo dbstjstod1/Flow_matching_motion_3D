@@ -339,20 +339,33 @@ def akima_motion(
                different methods and optimization algorithms."* Never change this for a reported
                number: it is what makes our SSIM comparable to their 0.94.
 
-      "thies"  (the TRAINING protocol) -- the given amplitudes are a MAXIMUM and each DoF draws
-               its own fraction of it. Thies II-B: *"The spline-based motion model with 10 nodes
-               per spline is used with a maximal amplitude of 10 mm for translation parameters
-               and 15 deg for rotation parameters. To ensure that all motion states that could be
-               encountered during optimization are represented in the training data, we include
-               motion patterns with unequal amplitude across the different motion parameters as
-               well as motion patterns that perturb the data only slightly."*
+      "thies"  (the TRAINING protocol, OUR reading) -- the given amplitudes are a MAXIMUM and
+               each DoF draws its own fraction of it. Thies II-B: *"The spline-based motion model
+               with 10 nodes per spline is used with a maximal amplitude of 10 mm for translation
+               parameters and 15 deg for rotation parameters. To ensure that all motion states
+               that could be encountered during optimization are represented in the training
+               data, we include motion patterns with unequal amplitude across the different
+               motion parameters as well as motion patterns that perturb the data only
+               slightly."*
                Realized as `a_d = A_d * u_d`, `u_d ~ U(0,1)` INDEPENDENTLY PER DoF -- the "unequal
-               amplitude" clause. The paper defers its exact sampler to a supplementary
-               pseudo-code we do not have, so the U(0,1) shape is OUR reading; the clause it
-               implements is verbatim.
+               amplitude" clause only. This is what OUR PRIOR was trained with
+               (`logs/fm3d_cq500_leap`); its meaning is frozen for reproducibility.
 
-    THE THIRD CLAUSE, *"motion patterns that perturb the data only slightly"*, IS DELIBERATELY
-    NOT IMPLEMENTED -- and the reason is not that it is trivially covered. It is a real mechanism
+      "thies_hn" (the TRAINING protocol, THEIR RELEASED SAMPLER -- use this for the Thies bench)
+               -- `a_d = A_d * min(|N(0, u_d)|, 1)`, `u_d ~ U(0,1)` per DoF: a CLIPPED
+               HALF-NORMAL whose std is itself uniform. Transcribed from their released 2D
+               sibling (`refs/thies_moco_diff_likelihood/autofocus_data_set.py:64-87`:
+               `min(abs(normal(0., max_amp*rand(1))), max_amp)`), which is the closest public
+               code to the TMI paper's unreleased supplementary pseudo-code. Its mass near zero
+               IS the paper's third clause, *"motion patterns that perturb the data only
+               slightly"*: measured over 2e5 draws, severity (max frac over 6 DoF) < 0.5 in
+               12.5% of draws vs 1.5% under "thies" -- an 8x difference, and it is exactly the
+               mid-optimization states Eq. 6 walks through. (Their file also carries a
+               radians-vs-degrees unit bug, `0.26 rad` passed as degrees; NOT propagated --
+               see the 2D PROVENANCE.)
+
+    THE THIRD CLAUSE IS DELIBERATELY NOT IMPLEMENTED IN "thies" (our prior's mode) -- and the
+    reason is not that it is trivially covered. It is a real mechanism
     in Thies' setting: a pattern's severity is the MAX over six independent uniforms, which
     concentrates near 1, so the per-DoF draw above produces globally mild patterns essentially
     never (MEASURED over 4000 draws: median severity 0.86, **0.00%** below 20% severity, 0.10%
@@ -374,6 +387,9 @@ def akima_motion(
     (Implemented as a `p_slight` knob on 2026-07-28, then DELETED the same day once the bridge
     equivalence above was worked out -- a knob whose only justification is fidelity to a mechanism
     we already have structurally. Gate `gate_motion_amp.py` check 4 asserts the equivalence.)
+    THE THIES BENCH IS THE OPPOSITE CASE: its frozen quality net has no bridge -- one static
+    corrupted volume per sample IS its whole world -- so there the clause must be explicit,
+    which is what "thies_hn" is for (`bench/thies/data.py` uses it as of 2026-08-06).
 
     WHY THE TRAINING MODE MATTERS HERE and not only for Thies' quality-metric net: a common
     amplitude bound is not the same as equal realized amplitudes, but it nearly is -- the max of
@@ -409,10 +425,18 @@ def akima_motion(
 
     # Per-DoF amplitude fractions. amp_mode="fixed" consumes NOTHING from the stream, so it stays
     # BIT-IDENTICAL to every seeded draw this repo has ever made (gates, val_fm3d's seed 1000+i,
-    # every reproduction in data/).
-    if amp_mode not in ("fixed", "thies"):
-        raise ValueError(f"amp_mode must be fixed|thies, got {amp_mode!r}")
-    frac = np.ones(6) if amp_mode == "fixed" else rng.uniform(0.0, 1.0, 6)
+    # every reproduction in data/); "thies" consumes exactly uniform(6) as it always has, so the
+    # deployed prior's draws are likewise untouched. "thies_hn" consumes uniform(6) + normal(6).
+    if amp_mode == "fixed":
+        frac = np.ones(6)
+    elif amp_mode == "thies":
+        frac = rng.uniform(0.0, 1.0, 6)
+    elif amp_mode == "thies_hn":
+        # Their released sampler: amp = min(|N(0, A*u)|, A), u ~ U(0,1) per DoF, normalized by A.
+        # The half-normal's mass near zero is the paper's "perturb the data only slightly".
+        frac = np.minimum(np.abs(rng.normal(0.0, rng.uniform(0.0, 1.0, 6))), 1.0)
+    else:
+        raise ValueError(f"amp_mode must be fixed|thies|thies_hn, got {amp_mode!r}")
 
     cols = []
     for d in range(6):
@@ -553,7 +577,10 @@ def _fit_gauge(t_h, R_h, t_t, R_t, iters: int = 400):
     Returns (g, t_corrected, R_corrected) with g the 6-vector [t | w] of G. Shared by
     `motion_error` and `reprojection_error` so the two never disagree about what the gauge is.
     """
-    g = torch.zeros(6, device=t_h.device, requires_grad=True)
+    # dtype FROM THE INPUT, not the default. An fp64 caller (the RPE comparison runs in double --
+    # the raw RPE is a difference of two nearly-equal projected point sets) otherwise dies in the
+    # first matmul, and a silently-fp32 gauge would cap the very digit being compared.
+    g = torch.zeros(6, device=t_h.device, dtype=t_h.dtype, requires_grad=True)
     opt = torch.optim.Adam([g], lr=0.05)
     for _ in range(iters):
         opt.zero_grad(set_to_none=True)

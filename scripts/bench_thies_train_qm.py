@@ -6,8 +6,16 @@
 WHAT THE PAPER PRESCRIBES (all of it is a default below)
 --------------------------------------------------------
   L341-343   L1 loss, Adam, lr 1e-3, batch 16, input and output volumes 128 x 128 x 128
-  L334-341   3D U-Net, feature maps 8l for l=1..4, ReLU, final 1x1 conv, no final activation
-  L479-489   a NEW random motion per sample use; 10-node splines; zero-centred per spline
+  L334-341   3D U-Net, feature maps 8^l for l=1..4, ReLU, final 1x1 conv, no final activation
+  L479-489   a NEW random motion per sample use; 10-node splines; zero-centred per spline;
+             amplitudes drawn per DoF from THEIR released clipped-half-normal sampler
+             (`amp_mode="thies_hn"`), whose mass near zero is the paper's "perturb the data
+             only slightly" clause
+  L490-493   **the pair**: the MOTION-FREE projection data is reconstructed with the PERTURBED
+             matrices ("The filtered projection data is reconstructed from these perturbed
+             matrices"). The data is never simulated with motion in stage 1 -- getting this
+             backwards trains the net on oracle reconstructions and voided the first run;
+             see bench/thies/data.py point 0 and PROVENANCE.md "2026-08-06".
   L505-507   the reconstruction grid for motion estimation is 128^3 at 2 mm  <- so the net is
              trained on exactly the volumes it will later be asked to score
   L493-496   volumes affinely mapped to ~[0,1] with fixed, sample-independent constants
@@ -15,11 +23,12 @@ WHAT THE PAPER PRESCRIBES (all of it is a default below)
 
 WHAT IS DELIBERATELY *NOT* THE PAPER
 ------------------------------------
-The training amplitude. `--amp ours` (the default) uses **15 mm / 20 deg peak-to-peak, per-DoF
-unequal** -- the amplitude our own prior was trained at
+The training amplitude LEVEL. `--amp ours` (the default) uses **15 mm / 20 deg peak-to-peak**
+maxima -- the maxima our own prior was trained at
 (`logs/fm3d_cq500_leap/ckpt_iter500000.pth`: train_trans_mm=15, train_rot_deg=20,
-motion_amp="thies", amp_units="p2p"), which is 1.5x / 1.33x the paper's 10 mm / 15 deg. Pass
+amp_units="p2p"), which is 1.5x / 1.33x the paper's 10 mm / 15 deg. Pass
 `--amp thies` to train the published operating point instead. See bench/thies/PROVENANCE.md §3.
+(The amplitude SHAPE is theirs under both flags: `amp_mode="thies_hn"`.)
 
 WHAT THE PAPER SIMPLY DOES NOT SAY -- and what we chose instead
 ---------------------------------------------------------------
@@ -70,9 +79,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bench.thies.data import (EVAL_AMP, FINE_WORKERS, QMSampleSource,             # noqa: E402
                               THIES_TRAIN_AMP, TRAIN_AMP)
+from bench.thies.motion import ThiesSplineMotion                                   # noqa: E402
 from bench.thies.qmnet import QualityMetricUNet3D, THIES_F_MAPS                    # noqa: E402
-from bench.thies.recon import ThiesConeRecon, VolumeGrid                           # noqa: E402
+from bench.thies.recon import ThiesConeRecon, VolumeGrid, to_unit                  # noqa: E402
 from fm3d.geometry_3d import ConeBeam3DConfig                                      # noqa: E402
+from fm3d.rigid_motion import (akima_motion, params_to_Pmot,                       # noqa: E402
+                               reprojection_error, zero_centre_gauge)
 
 
 def build_args(argv=None):
@@ -102,8 +114,10 @@ def build_args(argv=None):
 
     # -- THE AMPLITUDE (see the module docstring) --------------------------------------------
     ap.add_argument("--amp", default="ours", choices=["ours", "thies"],
-                    help="'ours' = 15 mm / 20 deg p2p (our deployed prior's training amplitude, "
-                         "the 2x-harder setting); 'thies' = the paper's 10 mm / 15 deg p2p")
+                    help="amplitude MAXIMA: 'ours' = 15 mm / 20 deg p2p (our deployed prior's "
+                         "training maxima, the harder setting); 'thies' = the paper's 10 mm / "
+                         "15 deg p2p. Both draw per-DoF amplitudes from THEIR released "
+                         "clipped-half-normal sampler (amp_mode='thies_hn')")
     ap.add_argument("--sim_nodes", type=int, default=10,
                     help="TMI L482-484: 10 spline nodes for SIMULATED motion (the estimator uses "
                          "30; that lives in bench_thies_estimate.py)")
@@ -136,6 +150,21 @@ def build_args(argv=None):
                          "qmnet_best.pth. A positive value truncates it, for smoke tests only.")
     ap.add_argument("--no_tb", action="store_true",
                     help="disable the tensorboard writer (same flag as scripts/train_fm3d.py)")
+
+    # -- the RPE probe: the CONVERGENCE CRITERION (2026-08-06) --------------------------------
+    ap.add_argument("--rpe_every", type=int, default=500,
+                    help="every N iters, run the paper's OWN optimizer (Eq. 6, 100 GD steps) on "
+                         "--rpe_patients fixed val scans against the CURRENT net and log the RPE "
+                         "to tensorboard. Val L1 is a regression score on VIF*; what stage 2 "
+                         "consumes is the gradient field it induces, and the two can decouple -- "
+                         "RPE is the paper's headline metric and is what decides the training "
+                         "budget. 0 disables. Cost ~2-3 min per probe at the defaults.")
+    ap.add_argument("--rpe_patients", type=int, default=3,
+                    help="val patients 0..N-1, probe motion seed RPE_SEED0+i -- the SAME "
+                         "(split=val, run=i, seed=2000+i) triples the stage-2 stop-criterion "
+                         "runs use, so a TB point is directly comparable to a "
+                         "bench_thies_estimate run at the deployed 10/10 amplitude")
+    ap.add_argument("--rpe_iters", type=int, default=100, help="Eq. 6 iterations per probe run")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--resume", default=None)
     return ap.parse_args(argv)
@@ -205,6 +234,72 @@ def draw_batch(src, gen, n, device):
 
 
 VAL_SEED0 = 900_000        # patient i's fixed validation motion is seed VAL_SEED0 + i
+RPE_SEED0 = 2_000          # probe patient i's motion seed -- MUST stay 2000+i: it is the seed
+                           # base of the stage-2 stop-criterion runs (drive_qm_stopcrit.sh), and
+                           # `make_motion("akima", seed=s)` == `akima_motion(seed=s)` bit for bit,
+                           # so the TB rpe curve and a bench_thies_estimate run measure the SAME
+                           # problem instance. (Test-cohort seeds are 1000+i -- never these.)
+
+
+class RPEProbe:
+    """Eq. 6 run END TO END on a few fixed val scans against the CURRENT net -> RPE to TB.
+
+    Setup simulates each probe patient's corrupted scan once (native grid) and keeps the
+    FILTERED sinogram on CPU (504 MB each); a probe then costs `iters` backprojections + net
+    passes per patient (~40-70 s each at 128^3 on an idle A6000).
+
+    The descent uses `torch.autograd.grad(f, mot.x)` rather than `f.backward()` ON PURPOSE:
+    backward() would also accumulate gradients into the (trainable, non-frozen) net parameters,
+    and although the training loop's `opt.zero_grad()` runs before the next `loss.backward()`,
+    the probe must not depend on that ordering to be harmless.
+    """
+
+    def __init__(self, src, recon, grid, *, n_patients: int, iters: int, device):
+        self.recon, self.grid, self.iters = recon, grid, int(iters)
+        self.device = device
+        self.P_nom = src.gen.P_nom
+        self.n_views = recon.cfg.n_views
+        self.worlds = []
+        for i in range(n_patients):
+            # bit-identical to build_world(split="val", run=i, seed=2000+i) at the deployed
+            # 10/10 p2p: make_motion's akima path forwards to akima_motion with these defaults,
+            # and amp_mode="fixed" consumes nothing from the RNG stream.
+            theta = akima_motion(self.n_views, n_nodes=10, seed=RPE_SEED0 + i,
+                                 zero_centre=True, device=device, **EVAL_AMP)
+            y = src.gen.simulate(i, params_to_Pmot(theta, self.P_nom)[None])
+            g_filt = recon.filter(y).cpu()
+            del y
+            init = reprojection_error(torch.zeros(self.n_views, 6, dtype=torch.float64,
+                                                  device=device),
+                                      theta.double(), self.P_nom.double())["rpe_mm"]
+            self.worlds.append(dict(idx=i, theta=theta, g_filt=g_filt, rpe_init=init))
+        self.rpe_init_mean = sum(w["rpe_init"] for w in self.worlds) / max(len(self.worlds), 1)
+
+    def __call__(self, net, *, s0: float = 100.0, decay: float = 0.97) -> dict[str, float]:
+        net.eval()
+        out = {}
+        rpes, rpes_zc = [], []
+        for w in self.worlds:
+            g = w["g_filt"].to(self.device)
+            mot = ThiesSplineMotion(self.n_views, n_nodes=30, device=self.device)
+            for n in range(self.iters):
+                vol = self.recon.backproject(g, mot.Pmot(self.P_nom), self.grid)
+                f = net.score(to_unit(vol)[None, None]).mean()
+                mot.x.grad = torch.autograd.grad(f, mot.x)[0]
+                mot.gd_step(s0 * decay ** n)
+            th64 = mot.theta().detach().double()
+            tt64 = w["theta"].double()
+            P64 = self.P_nom.double()
+            r = reprojection_error(th64, tt64, P64)["rpe_mm"]
+            rz = reprojection_error(zero_centre_gauge(th64), tt64, P64)["rpe_mm"]
+            out[f"rpe/p{w['idx']}"] = r
+            rpes.append(r)
+            rpes_zc.append(rz)
+            del g
+        out["rpe/mean"] = sum(rpes) / len(rpes)
+        out["rpe/zero_centred_mean"] = sum(rpes_zc) / len(rpes_zc)
+        net.train()
+        return out
 
 
 @torch.no_grad()
@@ -261,6 +356,15 @@ def main(argv=None):
     n_par = sum(p.numel() for p in net.parameters())
     print(f"[bench-thies] U-Net f_maps={tuple(a.f_maps)} norm={a.norm} | {n_par/1e6:.2f} M params")
 
+    probe = None
+    if a.rpe_every:
+        probe = RPEProbe(va, recon, grid, n_patients=a.rpe_patients, iters=a.rpe_iters,
+                         device=dev)
+        print(f"[bench-thies] RPE probe: {a.rpe_patients} val patients, seeds "
+              f"{RPE_SEED0}..{RPE_SEED0 + a.rpe_patients - 1}, {EVAL_AMP['trans_mm']:g} mm / "
+              f"{EVAL_AMP['rot_deg']:g} deg p2p, every {a.rpe_every} iters | "
+              f"initial (theta=0) RPE {probe.rpe_init_mean:.3f} mm")
+
     opt = torch.optim.Adam(net.parameters(), lr=a.lr)     # L341-343: Adam, lr 1e-3
     it0 = 0
     resumed_best = float("inf")
@@ -299,7 +403,9 @@ def main(argv=None):
     # we derive a fresh, still-deterministic seed from the resume point and say so.
     g_tr = torch.Generator()
     if resumed_rng is not None:
-        g_tr.set_state(resumed_rng)
+        # the checkpoint is loaded with map_location=dev, which drags the saved RNG state onto
+        # the GPU too -- set_state requires a CPU ByteTensor.
+        g_tr.set_state(resumed_rng.cpu())
         print("[bench-thies] restored the sampling RNG from the checkpoint "
               "(the draw sequence continues rather than replaying)")
     else:
@@ -348,6 +454,19 @@ def main(argv=None):
             if writer is not None:
                 writer.add_scalar("val/l1", v, it)
                 writer.add_scalar("val/l1_best", best, it)
+
+        if probe is not None and it % a.rpe_every == 0:
+            t_p = time.time()
+            scores = probe(net)
+            per = "  ".join("p%d %.3f" % (w["idx"], scores["rpe/p%d" % w["idx"]])
+                            for w in probe.worlds)
+            print(f"it {it:6d}  RPE {scores['rpe/mean']:.3f} mm  (zc {scores['rpe/zero_centred_mean']:.3f}; "
+                  f"init {probe.rpe_init_mean:.3f}; {per})  [{time.time()-t_p:.0f} s]",
+                  flush=True)
+            if writer is not None:
+                for k, s in scores.items():
+                    writer.add_scalar(k, s, it)
+                writer.add_scalar("rpe/init_mean", probe.rpe_init_mean, it)
 
         if it % a.save_every == 0 or it == a.iters:
             _save(f"qmnet_iter{it:06d}.pth")

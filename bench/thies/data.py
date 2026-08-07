@@ -1,6 +1,6 @@
 """Paired (motion-affected reconstruction, VIF* map) samples for the quality-metric net.
 
-TMI L479-497:
+TMI III (published PDF p.1103; txt dump L479-497):
 
     "To train the quality metric network, we dynamically sample a new random motion perturbation
      each time a sample is used for training and apply it to the projection matrices. The
@@ -10,8 +10,22 @@ TMI L479-497:
      projection data is reconstructed from these perturbed matrices and the training target VIF*
      is computed from the perturbed and unperturbed reconstruction."
 
-Three things that follow from that last sentence and are easy to get wrong:
+Four things that follow from those sentences and are easy to get wrong -- the first one WAS
+gotten wrong here and voided a full stage-1 run:
 
+  0. **THE PERTURBATION GOES INTO THE BACKPROJECTION MATRICES ONLY; THE PROJECTION DATA IS
+     MOTION-FREE.** Their training data is forward projected on the clean circular trajectory
+     (III, p.1102: "Each volume is forward projected on a circular trajectory...") and the
+     perturbed matrices enter at reconstruction time only ("The filtered projection data is
+     reconstructed from these perturbed matrices"). Until 2026-08-06 `sample()` simulated y WITH
+     the perturbed matrices and then backprojected with the SAME matrices -- a CONSISTENT pair
+     whose motion cancels, i.e. the CONVERGED point of Eq. 6, not a motion-corrupted volume.
+     Measured consequence: the net's inputs sat at VIF* 0.21-0.39 where the true x=0 states it
+     is asked to score at inference sit at 0.75-0.79; over 7000 logged training iterations the
+     batch target mean never exceeded 0.44, and stage 2 started every descent at f ~ 0.45-0.48
+     (saturated at the training range's edge) against a true VIF* of ~0.8. The run in
+     `logs/bench_thies_qm` and every number scored with its checkpoints are VOID.
+     See PROVENANCE.md "2026-08-06".
   1. the VIF reference is the **unperturbed RECONSTRUCTION**, not the ground-truth volume. Both
      sides of the pair therefore carry the same cone-beam and discretization artifacts, and the
      target isolates motion alone.
@@ -22,9 +36,12 @@ Three things that follow from that last sentence and are easy to get wrong:
      and the blind-motion gauge note in the repo docs), so leaving it in would make the target
      depend on an unrecoverable quantity.
 
-AMPLITUDE: ours, not theirs -- see PROVENANCE.md section 3. The defaults here are the deployed
-prior's training amplitude (15 mm / 20 deg peak-to-peak, per-DoF unequal), i.e. 1.5x / 1.33x the
-paper's, so the baseline is trained on the same distribution our prior was.
+AMPLITUDE LEVEL: ours, not theirs -- see PROVENANCE.md section 3. The defaults here are the
+deployed prior's training amplitude (15 mm / 20 deg peak-to-peak), i.e. 1.5x / 1.33x the
+paper's. AMPLITUDE SHAPE: theirs -- `amp_mode="thies_hn"`, the clipped half-normal transcribed
+from their released sampler, which carries the paper's "motion patterns that perturb the data
+only slightly" clause (see `fm3d.rigid_motion.akima_motion`'s docstring; the earlier
+`amp_mode="thies"` U(0,1) reading reached severity < 0.5 in only 1.5% of draws vs their 12.5%).
 
 THE SINOGRAM IS THE ONE OUR OWN PIPELINE USES. `CQ500Generator.simulate` projects the NATIVE
 0.4187 mm volume through the LEAP operator, exactly as in `scripts/train_fm3d.py` and
@@ -86,8 +103,12 @@ FINE_WORKERS = 4
 
 
 # Peak-to-peak, `fm3d.rigid_motion.AMP_UNITS`. See PROVENANCE.md section 3 for the ledger.
-TRAIN_AMP = dict(trans_mm=15.0, rot_deg=20.0, amp_mode="thies")     # OURS (deployed prior)
-THIES_TRAIN_AMP = dict(trans_mm=10.0, rot_deg=15.0, amp_mode="thies")   # the paper's
+# "thies_hn" (2026-08-06) = THEIR released amplitude sampler, clipped half-normal per DoF; it is
+# what implements the paper's "perturb the data only slightly" clause. NOTE our own prior was
+# trained with the older "thies" U(0,1) shape at the same 15/20 maxima -- a shape the half-normal
+# is strictly milder than, so the change cannot overtrain the baseline relative to the prior.
+TRAIN_AMP = dict(trans_mm=15.0, rot_deg=20.0, amp_mode="thies_hn")     # OURS (deployed prior's maxima)
+THIES_TRAIN_AMP = dict(trans_mm=10.0, rot_deg=15.0, amp_mode="thies_hn")   # the paper's
 EVAL_AMP = dict(trans_mm=10.0, rot_deg=10.0, amp_mode="fixed")      # OURS (2x the paper)
 THIES_EVAL_AMP = dict(trans_mm=5.0, rot_deg=5.0, amp_mode="fixed")      # the paper's
 
@@ -121,12 +142,26 @@ class QMSampleSource:
                                                  f"{'x'.join(map(str, self.grid.shape))}_"
                                                  f"{self.grid.spacing[0]:g}mm")
         os.makedirs(self.cache_dir, exist_ok=True)
+        # THE FILTERED-SINOGRAM RAM CACHE (2026-08-07). A consequence of the 08-06 pair fix:
+        # `sample()`'s sinogram is now the MOTION-FREE scan, i.e. a per-patient CONSTANT, so the
+        # native 612^3 forward projection (~0.55 s) + ramp filter (~0.05 s) that used to be ~70%
+        # of a sample's GPU work is paid once per patient and then served from host RAM (504 MB
+        # per patient at 360 x 500 x 700 fp32; 150 train + 50 val ~= 100 GB against 220 GB
+        # available on this box -- measured before deploying). PERFORMANCE-ONLY: the cached
+        # tensor is the same deterministic kernel output, so a resumed run is a bit-exact
+        # continuation. `_static` mirrors the tiny (8 MB) reconstructed reference the same way.
+        self._gfilt: dict[int, torch.Tensor] = {}
+        self._static: dict[int, torch.Tensor] = {}
 
     def __len__(self) -> int:
         return len(self.gen.records)
 
     def prefetch(self, idx: int) -> None:
         """Start loading patient `idx`'s NATIVE 612^3 volume on the dataset's worker thread.
+
+        A CACHE HIT NEEDS NO VOLUME: once `_gfilt` holds the patient's filtered sinogram,
+        `sample()` never touches the native volume again, so prefetching it would be a pure
+        1.2-2.2 s CPU/disk waste per sample -- gated out first.
 
         WHY THIS IS NOT OPTIONAL HERE. `CQ500Generator.volume_fine` keeps a SINGLE-SLOT RAM
         cache, and this sampler draws a random patient every sample, so the slot misses
@@ -140,33 +175,71 @@ class QMSampleSource:
         a no-op when the volume is cached or already in flight, and its futures live in a dict
         keyed by patient, so prefetching one ahead cannot clobber the one being consumed.
         """
+        if self._pid(idx) in self._gfilt:
+            return
         self.gen.prefetch_fine(idx)
+
+    def _pid(self, idx: int) -> int:
+        return self.gen.records[idx % len(self)]["patient"]
+
+    def static_gfilt(self, idx: int) -> torch.Tensor:
+        """(V,nv,nu) the FILTERED motion-free sinogram of patient `idx`, RAM-cached (see
+        `__init__`). The miss path returns the freshly computed GPU tensor directly so the first
+        touch pays no CPU round trip on top of the simulate it already paid."""
+        pid = self._pid(idx)
+        g = self._gfilt.get(pid)
+        if g is None:
+            g = self.recon.filter(self.gen.simulate(idx, self.gen.P_nom[None]))
+            self._gfilt[pid] = g.cpu()
+            return g
+        return g.to(self.device)
 
     # -- the motion-free half, cached -----------------------------------------------------
     @torch.no_grad()
-    def static_recon(self, idx: int) -> torch.Tensor:
+    def static_recon(self, idx: int, g_filt: torch.Tensor | None = None) -> torch.Tensor:
         """(D,H,W) mu. Thies' `I_ref`, and separately the reference every metric in the repo is
         quoted against (see the metrics note in the repo docs: our numbers are vs the GT volume,
-        Thies' are vs the motion-free static reconstruction)."""
-        pid = self.gen.records[idx % len(self)]["patient"]
+        Thies' are vs the motion-free static reconstruction).
+
+        `g_filt`: the FILTERED motion-free sinogram, if the caller already has it (`sample()`
+        always does now that the training data is the motion-free scan) -- saves the one native
+        simulate a cache miss would otherwise pay twice."""
+        pid = self._pid(idx)
+        v = self._static.get(pid)
+        if v is not None:
+            return v
         f = os.path.join(self.cache_dir, f"static_p{pid:04d}.pt")
         if os.path.exists(f):
-            return torch.load(f, map_location=self.device)
-        y = self.gen.simulate(idx, self.gen.P_nom[None])
-        v = self.recon(y, self.gen.P_nom, self.grid)
-        torch.save(v.cpu(), f)
-        return v
+            v = torch.load(f, map_location=self.device)
+        else:
+            if g_filt is None:
+                g_filt = self.recon.filter(self.gen.simulate(idx, self.gen.P_nom[None]))
+            v = self.recon.backproject(g_filt, self.gen.P_nom, self.grid)
+            torch.save(v.cpu(), f)
+        self._static[pid] = v.to(self.device)
+        return self._static[pid]
 
     # -- one training pair -----------------------------------------------------------------
     @torch.no_grad()
     def sample(self, idx: int, *, generator: torch.Generator | None = None, seed=None):
-        """-> dict(vol=(1,1,D,H,W) in ~[0,1], target=(1,1,D,H,W) VIF*, theta=(V,6), idx=int)."""
+        """-> dict(vol=(1,1,D,H,W) in ~[0,1], target=(1,1,D,H,W) VIF*, theta=(V,6), idx=int).
+
+        THE PAIR IS THE PAPER'S PAIR (point 0 of the module docstring): the sinogram is the
+        MOTION-FREE scan and `theta` enters through the BACKPROJECTION matrices only -- the
+        mismatch between data geometry and reconstruction geometry is what makes the volume
+        motion-corrupted. Backprojecting with the same matrices the data was simulated with
+        (the pre-2026-08-06 code) cancels the motion and hands the net an oracle reconstruction.
+
+        The motion-free sinogram is a per-patient CONSTANT, served from the `_gfilt` RAM cache
+        (see `__init__`): after a patient's first touch, a sample costs one backprojection plus
+        the H2D copy of the cached sinogram instead of a native simulate + filter.
+        """
         theta = akima_motion(self.cfg.n_views, n_nodes=self.n_nodes,
                              device=self.device, generator=generator, seed=seed,
                              zero_centre=True, **self.amp)
-        y = self.gen.simulate(idx, params_to_Pmot(theta, self.gen.P_nom)[None])
-        moving = self.recon(y, params_to_Pmot(theta, self.gen.P_nom), self.grid)
-        static = self.static_recon(idx).to(self.device)
+        g = self.static_gfilt(idx)                                  # motion-FREE data, cached
+        moving = self.recon.backproject(g, params_to_Pmot(theta, self.gen.P_nom), self.grid)
+        static = self.static_recon(idx, g_filt=g).to(self.device)
 
         dist = to_unit(moving)[None, None]
         ref = to_unit(static)[None, None]

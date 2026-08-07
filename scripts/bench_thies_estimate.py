@@ -219,15 +219,45 @@ def main(argv=None):
         del y_static
 
     # ---- 6. metrics ---------------------------------------------------------------------------
+    # RPE in fp64: at the paper's 0.61 mm on a 0.64 mm pixel, the raw RPE is a difference of two
+    # nearly-equal projected point sets and fp32 cancellation is a percent-level effect on the
+    # very digit being compared (same reasoning as cmp_thies_vs_ours, which computes OUR side in
+    # fp64 -- the two sides of the paired table must not differ in precision).
     sp = (a.out_voxel_mm,) * 3
     res = {"args": vars(a), "est_seconds": est_sec, "history": hist}
-    res["rpe"] = reprojection_error(theta_hat, theta_true, P_nom)
-    res["rpe_zero_centred"] = reprojection_error(zero_centre_gauge(theta_hat), theta_true, P_nom)
+    th64, tt64, P64 = theta_hat.double(), theta_true.double(), P_nom.double()
+    res["rpe"] = reprojection_error(th64, tt64, P64)
+    res["rpe_zero_centred"] = reprojection_error(zero_centre_gauge(th64), tt64, P64)
+    res["rpe_init"] = reprojection_error(torch.zeros_like(tt64), tt64, P64)
+
+    # Per-DoF MAE of the motion parameters, the axes of the paper's Fig. 4 / Table I: mean |error|
+    # over views, translations in mm and rotations in DEGREES, split by the plane the source
+    # rotates in (our gantry rotates in xy): IN-plane = tx, ty, rz; OUT-of-plane = tz, rx, ry.
+    # Raw (no gauge fit), which is the paper's own convention. Caveat for any cross-paper quote:
+    # our rotation parameterization is axis-angle where the paper never says which; at <=5 deg the
+    # difference from Euler angles is second order.
+    err = (th64 - tt64).abs().mean(0)                                 # (6,)
+    mae = dict(tx=float(err[0]), ty=float(err[1]), tz=float(err[2]),
+               rx=float(torch.rad2deg(err[3])), ry=float(torch.rad2deg(err[4])),
+               rz=float(torch.rad2deg(err[5])))
+    mae["inplane_t_mm"] = 0.5 * (mae["tx"] + mae["ty"]); mae["inplane_r_deg"] = mae["rz"]
+    mae["outplane_t_mm"] = mae["tz"]; mae["outplane_r_deg"] = 0.5 * (mae["rx"] + mae["ry"])
+    res["mae"] = mae
+
+    # Image metrics per reference: PSNR/SSIM/RMSE from aligned_metrics, plus VIF computed on the
+    # ALIGNED volume (the paper registers before scoring, p.1103) -- with the standing caveat
+    # that our VIF-P reads ~0.15 below the paper's VIF at the same state (PROVENANCE 4.10):
+    # comparable across OUR methods, never against the paper's absolute VIF column.
+    from bench.thies.vif import vif_scalar_3d                       # local: bench-only metric
     for tag, ref in (("vs_gt", gt), ("vs_thies_static", ref_vol)):
-        res[tag] = {
-            "output": aligned_metrics(out_vol, ref, sp),
-            "input": aligned_metrics(init_vol, ref, sp),
-        }
+        res[tag] = {}
+        for name, vol_ in (("output", out_vol), ("input", init_vol)):
+            m, al = aligned_metrics(vol_, ref, sp, return_aligned=True)
+            m["rmse_hu_raw"] = m["rmse_raw"] / 0.02 * 1000.0        # mu_water = 0.02 1/mm
+            m["rmse_hu_aligned"] = m["rmse_aligned"] / 0.02 * 1000.0
+            m["vif_aligned"] = float(vif_scalar_3d(to_unit(al)[None, None],
+                                                   to_unit(ref)[None, None]))
+            res[tag][name] = m
     print(json.dumps({k: v for k, v in res.items() if k not in ("args", "history")},
                      indent=1, default=float))
 

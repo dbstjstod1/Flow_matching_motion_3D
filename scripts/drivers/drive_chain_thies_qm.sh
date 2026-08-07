@@ -26,7 +26,7 @@ set -u
 cd /home/mirlab/Desktop/Flow_matching_motion_3D
 PY=/home/mirlab/anaconda3/envs/flow_matching/bin/python
 export CUDA_VISIBLE_DEVICES=0
-QM_DIR=logs/bench_thies_qm
+QM_DIR=logs/bench_thies_qm2
 MIN_ITER=${MIN_ITER:-9000}
 FM3D_OUT=${FM3D_OUT:-logs/fm3d_databridge}
 
