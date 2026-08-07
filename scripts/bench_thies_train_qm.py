@@ -48,15 +48,18 @@ protocol":
 Neither choice can favour the baseline unfairly: a longer budget and a real checkpoint-selection
 rule both make it stronger, which is the direction a baseline should err in.
 
-COST, BEFORE YOU LAUNCH
------------------------
-Every sample costs ONE native-grid simulation (612^3 volume, 360 views) -- the same operator and
-the same price our own trainer pays per draw, ~1 s. At `--batch 16` that is ~16-20 s per
-optimizer step and the U-Net step itself is noise next to it. The motion-FREE half of each pair
-is cached to disk on first touch (8 MB/patient), so it is paid once per patient, not per sample.
+COST, BEFORE YOU LAUNCH (rewritten 2026-08-07, after the filtered-sinogram cache)
+---------------------------------------------------------------------------------
+The sinogram is the MOTION-FREE scan = a per-patient constant, so `QMSampleSource` RAM-caches
+the filtered sinogram (504 MB/patient; 150 train + 50 val ~= 100 GB host RAM -- check `free`
+before launching elsewhere). A patient's FIRST touch pays the native 612^3 simulation (~2 s);
+every sample after is ~0.19 s (one 128^3 backprojection + the H2D copy). Measured on this box:
+~4 s/it warm at batch 16 (was 13.5 pre-cache, 36.4 pre-prefetch), so
 
-    --iters 5000 --batch 16  =  80k samples  ~=  530 epochs over the 150 training patients
-                             ~=  22-24 h on one A6000.
+    --iters 10000 --batch 16  =  160k samples  ~=  11-12 h on one A6000
+    (plus the RPE probe: ~155 s per --rpe_every, ~2-3% overhead).
+
+The motion-free RECONSTRUCTION (8 MB/patient) is additionally disk-cached across runs.
 
 Launch it the way every long job in this repo is launched (Bash background jobs are killed at
 session teardown):

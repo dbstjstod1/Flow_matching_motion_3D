@@ -70,6 +70,12 @@ __all__ = ["QMSampleSource", "TRAIN_AMP", "THIES_TRAIN_AMP", "EVAL_AMP", "THIES_
 # The two numbers are the same number and must not drift, which is why the prefetch depth is
 # read from here rather than hard-coded in the training script.
 #
+# >>> 2026-08-07: the `_gfilt` RAM cache (see `QMSampleSource.__init__`) made most of this block
+# >>> HISTORICAL. After each patient's first touch no native volume is loaded at all (`prefetch`
+# >>> gates on the cache) and a warm sample is ~0.19 s, so the workers only matter during the
+# >>> first sweep over a split. The measurements below describe the pre-cache regime and remain
+# >>> the record of why 4 workers; nothing about them constrains the cached steady state.
+#
 # Measured on this box (2026-08-04), batch 16:
 #   0 workers (no prefetch at all)   36.4 s/it   45% GPU duty -- every sample blocks 1.231 s
 #   1 worker,  depth 1               22.5 s/it   87% duty     -- LOADER-bound (load 1.23 s > GPU 0.9 s)

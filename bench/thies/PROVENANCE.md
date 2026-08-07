@@ -511,6 +511,11 @@ already existed (the trainer shipped it in commit 3fafd9a for the identical symp
 simply never called it. Wiring it plus a second loader thread took the run from 36.4 to 20.7
 s/iter, i.e. **~17 h off a 5000-iteration run**.
 
+> **2026-08-07: the whole table above is the PRE-CACHE regime.** The §4.12 filtered-sinogram RAM
+> cache (possible only because §4.9 made the sinogram a per-patient constant) supersedes it:
+> **~4 s/iter warm** (~0.19 s/sample), native volumes load only on each patient's first touch,
+> and ~100 GB host RAM is the price. 10000 iters ≈ 11–12 h.
+
 Beware when profiling this: timing `gen.simulate(0, ...)` in a loop measures a permanent cache
 HIT and reports ~0.9 s/sample, hiding the entire 1.231 s load. Draw random patients, or watch the
 duty cycle. Likewise a first smoke looks ~5x slow — that is numba JIT plus the static-recon cache
