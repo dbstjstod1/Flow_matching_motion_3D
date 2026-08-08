@@ -67,7 +67,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fm3d.geometry_3d import ConeBeam3DConfig, build_conebeam_orbit   # noqa: E402
 from fm3d.rigid_motion import reprojection_error, zero_centre_gauge   # noqa: E402
 
-OURS = "data/fm3d_test30"
+# FM3D_TEST30 selects WHICH of our cohorts to pair (default: the deployed prior's).
+# data/fm3d_test30_databridge is the databridge-prior rerun of the same (run, seed) triples.
+OURS = os.environ.get("FM3D_TEST30", "data/fm3d_test30")
 THEIRS = "data/bench_thies_test30"
 N = 30
 
