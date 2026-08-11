@@ -16,6 +16,14 @@ is asserted on theta_true before anything is scored.
 
     CUDA_VISIBLE_DEVICES=0 python scripts/cmp_fdk_vs_oracle_ceiling.py \
         [--ours data/fm3d_test30_databridge] [--theirs data/bench_thies_test30] [--n 30]
+
+VANILLA IS THE DEFAULT (user's call, 2026-08-11): our FDK is evaluated WITHOUT the Voronoi
+angular weight -- cosine + ramp + 1/w^2 with the uniform angle_span/V weight, i.e. the textbook
+FDK a reader recognizes. The Voronoi weight is OUR repair for motion-perturbed non-equiangular
+views (worth ~+1-2 dB there) and stays in the LOOP (it shapes x_t through the bridge/training);
+only the REPORTED FDK-class evaluation drops it. Because the cohorts' saved x_final was
+reconstructed WITH the weight, the output is re-reconstructed here from the saved theta_hat
+under the selected weighting. --angle_weight voronoi restores the previous reading.
 """
 
 from __future__ import annotations
@@ -55,8 +63,11 @@ def main():
     ap.add_argument("--theirs", default="data/bench_thies_test30")
     ap.add_argument("--n", type=int, default=30)
     ap.add_argument("--out", default=None, help="json out; default <theirs>/vs_oracle_fdk.json")
+    ap.add_argument("--angle_weight", default="vanilla", choices=["vanilla", "voronoi"],
+                    help="our FDK's per-view angular weight (see the module docstring)")
     a = ap.parse_args()
     dev = "cuda"
+    aw = a.angle_weight == "voronoi"
 
     rows = []
     recon_t = None
@@ -79,11 +90,12 @@ def main():
             recon_t = ThiesConeRecon(cfg)
 
         P_true = params_to_Pmot(th_true, gen.P_nom)
+        P_hat = params_to_Pmot(o["theta"].to(dev), gen.P_nom)
         with torch.no_grad():
-            oracle_ours = gen.fdk(y, P_true[None])[0]                      # our FDK, true theta
+            oracle_ours = gen.fdk(y, P_true[None], angle_weight=aw)[0]     # our FDK, true theta
+            out_ours = gen.fdk(y, P_hat[None], angle_weight=aw)[0]         # our FDK, theta_hat
             oracle_thies = recon_t(y, P_true, grid256)                     # their BP, true theta
         sp = (1.0, 1.0, 1.0)
-        out_ours = o["x_final"].to(dev).float()
         out_thies = t["out_vol"].to(dev).float()
         r = dict(tag=tag)
         # each output vs ITS OWN operator's true-theta ceiling
@@ -92,6 +104,9 @@ def main():
         # the ceiling heights themselves, vs GT (context: the operators' ceilings differ)
         r["oracle_ours_vs_gt"] = aligned_metrics(oracle_ours, gt, sp)
         r["oracle_thies_vs_gt"] = aligned_metrics(oracle_thies, gt, sp)
+        # and the output itself vs GT under this weighting (replaces the cohort's saved column,
+        # which was reconstructed with the Voronoi weight)
+        r["ours_vs_gt"] = aligned_metrics(out_ours, gt, sp)
         rows.append(r)
         print(f"{tag}  ours->ceiling {r['ours_vs_ceiling']['ssim_aligned']:.4f} "
               f"({r['ours_vs_ceiling']['psnr_aligned']:.2f} dB) | "
@@ -123,7 +138,12 @@ def main():
         print(f"  {name:34s} SSIM {s.mean():.4f} +- {s.std(ddof=1):.4f}   "
               f"PSNR {p_.mean():6.2f} +- {p_.std(ddof=1):.2f} dB")
 
-    out = a.out or os.path.join(a.theirs, "vs_oracle_fdk.json")
+    s_, p_ = col("ours_vs_gt"), col("ours_vs_gt", "psnr_aligned")
+    print(f"\n  ours FDK(theta_hat) vs GT ({a.angle_weight}):  SSIM {s_.mean():.4f} +- "
+          f"{s_.std(ddof=1):.4f}   PSNR {p_.mean():6.2f} +- {p_.std(ddof=1):.2f} dB"
+          f"   (Thies output vs GT: 0.7537 +- 0.0397 / 30.62 dB, unchanged)")
+
+    out = a.out or os.path.join(a.theirs, f"vs_oracle_fdk_{a.angle_weight}.json")
     json.dump([{k: (v if isinstance(v, str) else {m: float(x) for m, x in v.items()})
                 for k, v in r.items()} for r in rows], open(out, "w"), indent=1)
     print(f"\nwrote {out}")
