@@ -32,7 +32,7 @@
 \newcommand{\Pnom}{P_{\mathrm{nom}}}
 
 \title{\bfseries Rigid-Motion Correction in Head Cone-Beam CT with a 3D Flow-Matching
-Prior on the Geometry Bridge}
+Prior on the Geometry Bridge\thanks{An earlier version of this work, without the comparative evaluation, was submitted to SPIE Medical Imaging 2027.}}
 
 \author{%
 Sungho Yun \and Seungryong Cho\\[2pt]
@@ -160,10 +160,9 @@ a plug-and-play predictor-corrector framework that alternates the learned prior,
 hash-encoded motion estimator and a conjugate-gradient data-consistency step, so that the
 volume and motion estimates bootstrap one another through progressive joint refinement
 (Sec.~\ref{sec:loop}). We evaluate the method on 30 held-out patients under a fully
-specified CBCT geometry against representative autofocus and diffusion-based joint
-motion-correction approaches (Sec.~\ref{sec:results-cmp}). The source code is available at
-\mbox{\url{https://github.com/dbstjstod1/Flow_matching_motion_3D}}.\footnote{An earlier version of this work, without the
-comparative evaluation, was submitted to SPIE Medical Imaging 2027.}
+specified CBCT geometry against a learned-autofocus and a diffusion-based joint method
+(Sec.~\ref{sec:results-cmp}). The source code is available at
+\mbox{\url{https://github.com/dbstjstod1/Flow_matching_motion_3D}}.
 
 \section{Methods}
 \label{sec:method}
