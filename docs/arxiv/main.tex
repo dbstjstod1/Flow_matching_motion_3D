@@ -161,7 +161,8 @@ hash-encoded motion estimator and a conjugate-gradient data-consistency step, so
 volume and motion estimates bootstrap one another through progressive joint refinement
 (Sec.~\ref{sec:loop}). We evaluate the method on 30 held-out patients under a fully
 specified CBCT geometry against representative autofocus and diffusion-based joint
-motion-correction approaches (Sec.~\ref{sec:results-cmp}).\footnote{An earlier version of this work, without the
+motion-correction approaches (Sec.~\ref{sec:results-cmp}). The source code is available at
+\url{https://github.com/dbstjstod1/Flow_matching_motion_3D}.\footnote{An earlier version of this work, without the
 comparative evaluation, was submitted to SPIE Medical Imaging 2027.}
 
 \section{Methods}
@@ -325,8 +326,7 @@ projector of LEAP~\cite{leap23}; the bridge tangent and the pose gradient are ex
 derivatives of that same operator. At inference the estimator runs 200 Adam
 iterations per flow step on 24 randomly drawn views, at half volume resolution until
 $t=0.5$; the data step uses five CG iterations with the TV relaxation weight
-$\kappa = 0.3$ and step size 0.015 over five TV iterations. The source code is available at
-\url{https://github.com/dbstjstod1/Flow_matching_motion_3D}.
+$\kappa = 0.3$ and step size 0.015 over five TV iterations.
 
 \section{Experiments}
 \label{sec:setup}
