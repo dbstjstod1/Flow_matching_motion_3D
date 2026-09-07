@@ -277,3 +277,16 @@ step) — stated in the text; do not attribute the 30x to the iteration count al
   translations and rotations separately, global rigid gauge removed). The table itself is
   not yet in the manuscript; the numbers must be computed from the stored theta of each arm
   (NOT from p00 alone, see the earlier Table-2 MAE mistake).
+
+**Proofreading pass (2026-09-07, user request; both outputs rebuilt, 14 pages)**: code URL added at
+the end of II.D (`\url{https://github.com/dbstjstod1/Flow_matching_motion_3D}`, repository still
+private); Fig. 3 caption now names the fourth column (FDK at the true motion, which IV.A cites);
+Fig. 5 caption corrected (the figure is two patients x {axial, coronal}, not a mid-brain/skull-base
+pair of rows); "compares ... with the autofocus baseline" -> "with the two comparison methods";
+Table 3 "No compensation" -> "Uncorrected"; the 80%-estimator clause and the 4.6 h sentence
+removed from IV.A/IV.B (they live in IV.C / Table 4); JRM-ADM per-DoF sentence made consistent
+with Table 3 (r_z 0.68 vs 0.23 is not "about as well"); "matches" -> "is comparable to" for the
+pixel-linear arm; Discussion states the 2x amplitude behind the autofocus RPE gap; the uncited
+`sdedit22` bibitem dropped ({19} -> {17}). Repository restructured the same day: `main` is now the
+compact public tree (separate worktree `~/Desktop/Flow_matching_motion_3D_public`), `dev` keeps the
+full history including this directory.
