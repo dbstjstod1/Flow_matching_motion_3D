@@ -290,3 +290,32 @@ pixel-linear arm; Discussion states the 2x amplitude behind the autofocus RPE ga
 `sdedit22` bibitem dropped ({19} -> {17}). Repository restructured the same day: `main` is now the
 compact public tree (separate worktree `~/Desktop/Flow_matching_motion_3D_public`), `dev` keeps the
 full history including this directory.
+
+**Native-JRM audit + Codex review pass (2026-09-07, user request)**: every JRM-ADM statement
+(III.C, Tables 2-4, IV.B, IV.C, Discussion, abstract) was checked to describe the NATIVE run
+(authors' code as published). Two residues of the retired prior-swap arm were fixed: (i) the
+IV.B conclusion "the difference lies mainly in the prior" (valid only when the loop was shared)
+is now "the pipelines differ in prior, estimator and solver alike, so this comparison does not
+attribute the gap to a single component; the bridge ablation isolates the path"; (ii) the
+body-ROI sentence, whose 08-21 audit covered the prior-swap W3DM arm, was re-measured with the
+native JRM-ADM output added to `scripts/roi_body_metrics.py` (GPU1, 30 patients; the 08-21 json
+is preserved as `data/roi_body_metrics_0821.json`): body-ROI fm 32.17/0.975, linear 30.70/0.965,
+jrm 25.06/0.910, thies 25.24/0.880, w3dm 24.28/0.865; fm vs jrm +7.10 dB (29/30, p=3.7e-9) /
++0.066 SSIM (30/30); fm vs linear +1.47 dB (23/30, p=7.9e-5). The two baselines' PSNR order
+flips inside the body ROI (thies 25.24 > jrm 25.06, a near-tie), so the sentence now claims only
+"the ordering and significance of all comparisons involving the final iterate" and was moved to
+the end of IV.B. Also: III.C "we apply it to our data without modification" was inaccurate (224^3
+grid, prior weight rescaled) and now states both adaptations in one clause.
+Codex (OpenAI) editorial review of the 16:30 version, found misplaced in the 4DCT sibling's
+docs, now lives in `codex_review/` (plan `arxiv_editorial_plan_20260907.md`, full rewrite
+`arxiv_by_codex/main_by_codex.tex` + PDF/DOCX). Adopted from it: "bilinearly" -> "linear in
+the volume but nonlinear in the poses" (P0 factual); the DPS critique no longer calls each
+clean prediction a "stochastic sample" (JRM-ADM samples with DDIM eta = 0,
+`refs/jrm-adm/config/adm_jrm.yaml:41`; now "a generative extrapolation from a partially noised
+state"); Algorithm 1 writes the data step as CG_5 warm-started at x_pred; Table 3 bold = column
+minima (pixel-linear wins t_x, t_y); Table 4 header "Network evaluations" with a caption
+definition and "(reported)" on the autofocus runtime; "one motion realization per patient" in
+the limitations; Discussion "competitive" -> "accurate" for the JRM-ADM motion estimate. NOT
+adopted (user's prose, or user decisions on record): Codex's abstract/introduction rewrite, the
+removal of the "first" claim, re-adding the Wilcoxon sentence, the Eq. 1 -> data-fidelity-only
+reformulation, and the motion-free-FDK conclusion rewording (still pending the user's call).

@@ -54,9 +54,9 @@ surrogate, whose fidelity limits their robustness under severe motion, while
 diffusion-based methods place a generative prior inside an alternating volume-motion loop.
 A diffusion prior, however, is trained along a noise-to-clean trajectory rather than one
 that reflects the progressive removal of motion artifacts, so it can act on an
-intermediate volume only through re-noising and a stochastic clean-image prediction, which
-interrupts the correction and leaves the data-consistency step to undo deviations that
-change from step to step. We
+intermediate volume only through re-noising and a clean-image prediction from the noised
+state, which interrupts the correction and leaves the data-consistency step to undo
+deviations that change from step to step. We
 instead train a 3D flow-matching prior on a geometry bridge, the family of FDK
 reconstructions of the same scan with the motion amplitude attenuated linearly to zero,
 so that the learned path itself runs through progressively corrected volumes. Its
@@ -85,8 +85,8 @@ motion is well approximated as rigid, the corruption can be modeled by a
 six-degree-of-freedom (6-DoF) pose for each projection view. Recovering those poses from
 the projections alone is nevertheless challenging. Writing the scan as
 $y = A_{P(\theta)}x$, neither the volume $x$ nor the pose trajectory $\theta$ is known, and
-the measurement depends bilinearly on the pair, so that estimating the geometry requires a
-clean image while reconstructing one requires the correct geometry. The joint objective is
+the measurement is linear in the volume but nonlinear in the poses, so that estimating the
+geometry requires a clean image while reconstructing one requires the correct geometry. The joint objective is
 therefore non-convex, and it is further complicated by an exact SE(3) gauge ambiguity,
 because a global rigid transform applied simultaneously to the object and the orbit leaves
 the sinogram unchanged; the motion is identifiable only up to a rigid transform.
@@ -115,9 +115,9 @@ trained along a noise-to-clean generative trajectory rather than along one that 
 the progressive removal of motion artifacts, so it cannot act on a partially corrected
 volume directly. Diffusion posterior sampling closes this gap by re-noising the current
 volume and predicting a clean image from it at every iteration, but each such prediction
-is a stochastic sample from the generative model, whose structural deviations vary from
-step to step and need not agree with the measurements, so the data-consistency step must
-repeatedly undo them. Inside an alternating volume-motion loop this detour interrupts the
+is a generative extrapolation from a partially noised state, whose structural deviations
+vary from step to step and need not agree with the measurements, so the data-consistency
+step must repeatedly undo them. Inside an alternating volume-motion loop this detour interrupts the
 continuity between successive volume and motion updates and adds substantial
 computational overhead.
 
@@ -277,7 +277,7 @@ terms are enforced at the new geometry.
 \For{$k = 1,\dots,N$}
   \State $x_{\mathrm{pred}} \gets x + \Delta t\, v_\phi(x,t)$ \Comment{predict: one Euler step of the prior}
   \State $\thetahat \gets \arg\min_\theta \|A_{\Pnom T(\theta)}\,x_{\mathrm{pred}} - y\|_2^2$ \Comment{estimate: hash-encoded MLP, warm-started Adam}
-  \State $z \gets \arg\min_z \|A_{\Pnom T(\thetahat)}\,z - y\|_2^2$ \Comment{correct: five CG iterations}
+  \State $z \gets \mathrm{CG}_5\big(A_{\Pnom T(\thetahat)},\,y;\ z_0 = x_{\mathrm{pred}}\big)$ \Comment{correct: five CG iterations, warm-started}
   \State $z \gets z + \kappa\,(D_{\mathrm{TV}}(z) - z)$ \Comment{relaxed TV update}
   \State $x \gets z$,\quad $t \gets t + \Delta t$
 \EndFor
@@ -406,8 +406,9 @@ motion, parameterized by cubic B-spline control points, on the same residual. We
 authors' publicly released implementation as published, keeping their sampler,
 optimizers, motion model and prior unchanged, with the prior retrained on our 150 training
 patients under their noise schedule. The method was designed for sparse-view acquisitions;
-since full-view data only provide it with more measurements, we apply it to our data
-without modification.
+since full-view data only provide it with more measurements, we apply it to our data with
+its reconstruction grid enlarged to cover our field of view and its prior weight rescaled to
+keep the authors' data-to-prior balance under 360 views.
 
 \paragraph{Bridge ablation (pixel-linear bridge).}
 To isolate what the bridge itself contributes, we trained an identically configured prior,
@@ -528,9 +529,7 @@ accuracy is visible even before the prior contributes to the image. The final it
 adds 4.9\,dB and 0.225 SSIM on top of that, surpassing the autofocus output on all 30
 patients in both metrics. As can be seen in Fig.~\ref{fig:bench}, the autofocus baseline
 removes much of the motion but keeps residual streaks, whereas the final iterate recovers
-both geometry and texture. Re-scoring all outputs inside a body region of interest that
-excludes the air background and the patient table preserves every ordering and
-significance in Table~\ref{tab:cmp}.
+both geometry and texture.
 
 \begin{figure}[H]
 \centering
@@ -545,7 +544,7 @@ the zero-mean gauge. Translations in mm, rotations in degrees.}
 \begin{table}[H]
 \centering
 \caption{Per-DoF mean absolute error of the recovered motion over the 30 patients, on the
-zero-mean gauge. Translations in mm, rotations in degrees.}
+zero-mean gauge. Translations in mm, rotations in degrees; bold marks the column minimum.}
 \label{tab:dof}
 \small
 \begin{tabular}{lcccccc}
@@ -555,8 +554,8 @@ Method & $t_x$ & $t_y$ & $t_z$ & $r_x$ & $r_y$ & $r_z$ \\
 Uncorrected & 1.93 & 2.08 & 1.95 & 2.01 & 1.90 & 2.17 \\
 Learned autofocus~\cite{thies25} & 1.30 & 1.33 & 0.36 & 0.95 & 0.98 & 1.09 \\
 JRM-ADM~\cite{depaepe25} & 2.17 & 1.97 & 0.06 & 0.09 & 0.07 & 0.68 \\
-Proposed, pixel-linear bridge (ablation) & 0.71 & 0.69 & 0.04 & 0.04 & 0.05 & 0.40 \\
-\textbf{Proposed} & \textbf{0.79} & \textbf{0.78} & \textbf{0.03} & \textbf{0.04} & \textbf{0.04} & \textbf{0.23} \\
+Proposed, pixel-linear bridge (ablation) & \textbf{0.71} & \textbf{0.69} & 0.04 & \textbf{0.04} & 0.05 & 0.40 \\
+\textbf{Proposed} & 0.79 & 0.78 & \textbf{0.03} & \textbf{0.04} & \textbf{0.04} & \textbf{0.23} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -592,9 +591,9 @@ in Fig.~\ref{fig:bench}, it removes the motion but returns an over-smoothed volu
 which fine texture is lost. The loss is most visible in soft tissue: the grey-white matter
 differentiation and the low-contrast structures that our final iterate restores are
 flattened into a nearly uniform parenchyma, so its soft-tissue restoration is markedly
-weaker despite the accurate motion estimate. The difference between the two methods
-therefore lies mainly in the prior and in how the loop applies it, rather than in the
-motion estimate.
+weaker despite the accurate motion estimate. Because the two pipelines differ in prior,
+estimator and solver alike, this comparison does not attribute the gap to a single
+component; the bridge ablation below isolates the training path.
 
 The pixel-linear row of Table~\ref{tab:cmp} isolates what the bridge itself contributes. The
 pixel-linear arm, trained with an identical recipe between identical endpoints, lands
@@ -606,6 +605,11 @@ intermediate image buys a better motion fit, which buys a cleaner data step, com
 over the 50 sweeps. In Fig.~\ref{fig:motion} the two bridge-trained arms track the
 trajectory similarly, the geometry bridge more closely on the gantry-axis rotation.
 
+Re-scoring the final iterates and the baseline outputs inside a body region of interest
+that excludes the air background and the patient table lowers every PSNR by several
+decibels but leaves the ordering and the significance of all comparisons involving the
+final iterate unchanged.
+
 \FloatBarrier
 \subsection{Computational cost}
 \label{sec:cost}
@@ -615,15 +619,17 @@ trajectory similarly, the geometry bridge more closely on the gantry-axis rotati
 \caption{Computational cost per patient on one NVIDIA RTX A6000 GPU, for the
 configurations used in the comparison (360 views, $256^3$ volume). The third column counts
 projector-gradient evaluations in full-view equivalents, one unit being one pass over all
-360 views (an evaluation on 24 views counts 24/360); counts are approximate. The runtime of
-the learned autofocus is the value stated by its authors.}
+360 views (an evaluation on 24 views counts 24/360); counts are approximate. Network evaluations count complete prior or quality-network
+evaluations of the volume (patch-wise for the proposed method). The runtimes of the proposed
+method and JRM-ADM were measured; that of the learned autofocus is the value stated by its
+authors.}
 \label{tab:cost}
 \small
 \begin{tabular}{lccc}
 \toprule
-Method & Network calls & Full-view projector-gradient evaluations & Time \\
+Method & Network evaluations & Projector-gradient evaluations & Time \\
 \midrule
-Learned autofocus~\cite{thies25} & 100 & $\sim$100 & $<2$\,min \\
+Learned autofocus~\cite{thies25} & 100 & $\sim$100 & $<2$\,min (reported) \\
 JRM-ADM~\cite{depaepe25} & 100 & $\sim$1{,}600 & 4.6\,h \\
 Proposed & 50 & $\sim$900 & 9.3\,min \\
 \bottomrule
@@ -662,15 +668,15 @@ motion amplitude, both its estimator and ours recover the geometry well enough t
 analytic reconstructions differ by far less than either differs from the final iterate,
 so the practically relevant distinction between methods has shifted from how well the
 motion is estimated to what kind of image is returned. The comparison with JRM-ADM points
-the same way: its motion estimate is competitive, but its output loses the texture that
+the same way: its motion estimate is accurate, but its output loses the texture that
 the bridge-trained prior preserves. An analytic reconstruction
 inherits the ceiling of its operator; the loop's own iterate does not, and ours ends above
 the motion-free analytic reference. Returning both outputs keeps the method auditable, since
 the analytic one certifies the geometry that the learned one builds on.
 
 Several limitations bound these claims. The projections are simulated noiseless line
-integrals, so photon statistics, scatter and beam hardening, all present in real
-acquisitions, are outside the present evidence, and no public head-CBCT projection data
+integrals with one motion realization per patient, so photon statistics, scatter and beam
+hardening, all present in real acquisitions, are outside the present evidence, and no public head-CBCT projection data
 with genuine patient motion exists to our knowledge; clinical validation is the essential
 next step. The motion model is rigid, which suits the skull but not the mandible or the
 neck. The autofocus baseline runs the authors' code with a quality network retrained on our

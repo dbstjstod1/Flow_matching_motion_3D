@@ -10,7 +10,7 @@ intersected with the measured region.
 
 The ALIGNMENT is unchanged (mask=measured region, iters=200 -- the loop's own convention), so
 this changes only WHERE the score is read, not the gauge fit. Volumes scored: the four
-x_t-class deliverables (ours / linear bridge / W3DM loop / Thies output).
+x_t-class deliverables (ours / linear bridge / W3DM loop / Thies output / native JRM-ADM).
 """
 from __future__ import annotations
 
@@ -29,7 +29,22 @@ from fm3d.reg_metric import aligned_metrics, psnr, ssim   # noqa: E402
 
 CKPT = "logs/fm3d_databridge/ckpt_iter500000.pth"
 ARMS = [("fm", "data/fm3d_test30_databridge"), ("linear", "data/linbridge_test30"),
-        ("w3dm", "data/w3dm_test30"), ("thies", "data/bench_thies_test30")]
+        ("w3dm", "data/w3dm_test30"), ("thies", "data/bench_thies_test30"),
+        ("jrm", "refs/jrm-adm/data/recon_ours_v2")]      # native JRM-ADM (added 2026-09-07)
+JRM_MU_RATIO = 0.02 / 0.0193          # their mu_water -> ours, as in score_jrm_native.py
+
+
+def load_arm(name: str, d: str, tag: str, dev: str) -> torch.Tensor:
+    """The x_t-class deliverable of one arm, in OUR frame (256^3, mu 1/mm)."""
+    if name == "jrm":
+        r = torch.load(os.path.join(d, f"{tag}_result.pt"), map_location=dev, weights_only=False)
+        v = r["x_est"][0, 0].float().to(dev) * JRM_MU_RATIO          # their 224^3 grid
+        out = torch.zeros((256, 256, 256), dtype=v.dtype, device=dev)
+        o = [(256 - n) // 2 for n in v.shape]
+        out[o[0]:o[0] + v.shape[0], o[1]:o[1] + v.shape[1], o[2]:o[2] + v.shape[2]] = v
+        return out
+    r = torch.load(os.path.join(d, tag, "result.pt"), map_location=dev, weights_only=False)
+    return (r["out_vol"] if "out_vol" in r else r["x_t"]).float().to(dev)
 
 
 def body_mask(gt: torch.Tensor, meas: torch.Tensor) -> torch.Tensor:
@@ -62,9 +77,7 @@ def main():
         peak = float(gt[body].max())
         row = {"tag": tag, "body_voxels_M": float(body.sum()) / 1e6}
         for name, d in ARMS:
-            r = torch.load(os.path.join(d, tag, "result.pt"),
-                           map_location=dev, weights_only=False)
-            vol = (r["out_vol"] if "out_vol" in r else r["x_t"]).float().to(dev)
+            vol = load_arm(name, d, tag, dev)
             m, al = aligned_metrics(vol, gt, sp, mask=meas, iters=200, return_aligned=True)
             row[name] = {
                 "psnr_meas": m["psnr_aligned"], "ssim_meas": m["ssim_aligned"],
