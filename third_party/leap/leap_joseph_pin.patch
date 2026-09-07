@@ -1,0 +1,115 @@
+diff --git a/src/leapctype.py b/src/leapctype.py
+index b81da84..931d20b 100644
+--- a/src/leapctype.py
++++ b/src/leapctype.py
+@@ -5736,6 +5736,27 @@ class tomographicModels:
+         self.set_model()
+         return self.libprojectors.set_truncatedScan(aFlag)
+         
++    def set_forceJosephModular(self, aFlag):
++        """FM3D PATCH -- force the modular-beam FORWARD onto the Joseph ray-driven kernel.
++
++        Stock LEAP picks between its separable-footprint and Joseph modular projectors per
++        GEOMETRY SET (SF only while every rowVector stays within ~5.06 deg of the z axis, see
++        `parameters::set_sourcesAndModules`). Under per-view rigid motion that switch fires
++        silently and mid-optimization. Set True to disable it and always take Joseph, so one
++        operator serves every geometry. See refs/LEAP/FM3D_PATCH.md.
++        """
++        self.libprojectors.set_forceJosephModular.argtypes = [ctypes.c_bool]
++        self.libprojectors.set_forceJosephModular.restype = ctypes.c_bool
++        self.set_model()
++        return self.libprojectors.set_forceJosephModular(aFlag)
++
++    def get_forceJosephModular(self):
++        """FM3D PATCH -- is the modular forward pinned to the Joseph kernel?"""
++        self.libprojectors.get_forceJosephModular.argtypes = []
++        self.libprojectors.get_forceJosephModular.restype = ctypes.c_bool
++        self.set_model()
++        return self.libprojectors.get_forceJosephModular()
++
+     def set_offsetScan(self, aFlag):
+         """Set the offsetScan parameter
+         
+diff --git a/src/parameters.cpp b/src/parameters.cpp
+index aeaad95..5ffa163 100644
+--- a/src/parameters.cpp
++++ b/src/parameters.cpp
+@@ -54,6 +54,7 @@ void parameters::initialize()
+ 	whichProjector = SEPARABLE_FOOTPRINT;
+ 	doWeightedBackprojection = false;
+ 	doExtrapolation = false;
++	forceJosephModular = false;
+ 	volumeDimensionOrder = ZYX;
+ 	rampID = 2;
+ 	FBPlowpass = 1.0;
+@@ -158,6 +159,7 @@ void parameters::assign(const parameters& other)
+     this->whichProjector = other.whichProjector;
+ 	this->doWeightedBackprojection = other.doWeightedBackprojection;
+ 	this->doExtrapolation = other.doExtrapolation;
++	this->forceJosephModular = other.forceJosephModular;
+ 	this->rampID = other.rampID;
+ 	this->FBPlowpass = other.FBPlowpass;
+ 	this->chunkingMemorySizeThreshold = other.chunkingMemorySizeThreshold;
+diff --git a/src/parameters.h b/src/parameters.h
+index f60440c..15538ee 100644
+--- a/src/parameters.h
++++ b/src/parameters.h
+@@ -418,6 +418,10 @@ public:
+ 	int whichProjector;
+ 	bool doWeightedBackprojection;
+ 	bool doExtrapolation;
++	// FM3D PATCH: force the modular-beam FORWARD onto the Joseph ray-driven kernel even when
++	// the geometry is axially aligned, i.e. disable the silent SF<->Joseph switch. See
++	// refs/LEAP/FM3D_PATCH.md.
++	bool forceJosephModular;
+ 	float rFOVspecified;
+ 	int rampID;
+ 	float FBPlowpass;
+diff --git a/src/projectors_Joseph.cu b/src/projectors_Joseph.cu
+index 4a15628..50cb434 100644
+--- a/src/projectors_Joseph.cu
++++ b/src/projectors_Joseph.cu
+@@ -2251,6 +2251,8 @@ bool project_Joseph_modular(float*& g, float* f, parameters* params, bool data_o
+     // Call Kernel
+     dim3 dimBlock = setBlockSize(N_g);
+     dim3 dimGrid = setGridSize(N_g, dimBlock);
++    if (params->forceJosephModular == true)
++        useSF = false;   // FM3D PATCH: kill the silent SF<->Joseph switch
+     if (params->modularbeamIsAxiallyAligned() == true && useSF == true)
+     {
+         //printf("s = %f, %f, %f\n", params->sourcePositions[0], params->sourcePositions[1], params->sourcePositions[2]);
+diff --git a/src/tomographic_models_c_interface.cpp b/src/tomographic_models_c_interface.cpp
+index 446aa4b..e99c018 100644
+--- a/src/tomographic_models_c_interface.cpp
++++ b/src/tomographic_models_c_interface.cpp
+@@ -629,6 +629,17 @@ float get_rFOV_max()
+ 	return tomo()->params.rFOV_max();
+ }
+ 
++bool set_forceJosephModular(bool aFlag)
++{
++	tomo()->params.forceJosephModular = aFlag;
++	return true;
++}
++
++bool get_forceJosephModular()
++{
++	return tomo()->params.forceJosephModular;
++}
++
+ bool set_offsetScan(bool aFlag)
+ {
+ 	return tomo()->params.set_offsetScan(aFlag);
+diff --git a/src/tomographic_models_c_interface.h b/src/tomographic_models_c_interface.h
+index 96fa6a1..983b018 100644
+--- a/src/tomographic_models_c_interface.h
++++ b/src/tomographic_models_c_interface.h
+@@ -164,6 +164,8 @@ extern "C" PROJECTOR_API bool set_rFOV(float rFOV_in);
+ extern "C" PROJECTOR_API float get_rFOV();
+ extern "C" PROJECTOR_API float get_rFOV_min();
+ extern "C" PROJECTOR_API float get_rFOV_max();
++extern "C" PROJECTOR_API bool set_forceJosephModular(bool);
++extern "C" PROJECTOR_API bool get_forceJosephModular();
+ extern "C" PROJECTOR_API bool set_offsetScan(bool);
+ extern "C" PROJECTOR_API bool get_offsetScan();
+ extern "C" PROJECTOR_API bool set_truncatedScan(bool);

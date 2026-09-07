@@ -1,0 +1,17 @@
+# Tested versions (Python 3.11, CUDA 12.8). torch must match your CUDA toolkit.
+torch==2.8.0
+triton==3.4.0
+numpy>=2.0
+scipy>=1.14
+SimpleITK>=2.4
+matplotlib>=3.9
+tensorboard>=2.17
+
+# Not pip-installable from PyPI as used here -- see README "Setup":
+#   tiny-cuda-nn (hash-encoded motion estimator):
+#       pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
+#   LEAP (the projector), built from source with third_party/leap/leap_joseph_pin.patch applied.
+
+# Learned-autofocus baseline only (bench/thies): the authors' numba-cuda backprojector.
+# numba>=0.60
+# numba-cuda
