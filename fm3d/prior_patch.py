@@ -155,11 +155,19 @@ def predict_x1_patched(model, x_t: torch.Tensor, t: float, *, patch: int = 64,
                        stride: int | None = None, batch: int = 8,
                        context: str = "auto", n_offsets: int = 1,
                        blend: str = "hann", generator=None,
-                       amp: bool = False) -> torch.Tensor:
+                       amp: bool = False, net_out: str = "v") -> torch.Tensor:
     """Blended clean-endpoint prediction of the 3D-patch FM prior over a volume.
 
     model : UNet3D velocity net (NET space)   x_t : (1,1,D,H,W) NET
     t     : FM ODE time in [0,1)              ->    x1_hat (1,1,D,H,W) NET
+
+    net_out: WHAT THE NETWORK'S OUTPUT MEANS -- must match the checkpoint's training target
+        (ckpt args["target"], trainer --target). "v" (default) = the FM velocity; x1_hat is
+        recovered as x_t + (1-t)*v. "x1" = the net regresses the clean endpoint DIRECTLY
+        (the InDI / Cold-Diffusion restoration objective, arXiv:2303.11435 / 2208.09392 --
+        the parameterization ablation arm, 2026-08-11); the output IS x1_hat, no conversion.
+        Everything downstream (blending, prior_ode's recursion, the posterior loop's
+        divide-back-to-velocity) already works in x1 space, so this flag is the ONLY seam.
 
     TWO PATCH->VOLUME SCHEMES, both standard in the 3D-CT-diffusion literature (see the memory):
 
@@ -195,6 +203,8 @@ def predict_x1_patched(model, x_t: torch.Tensor, t: float, *, patch: int = 64,
         raise ValueError(f"context must be auto|global|none, got {context!r}")
     if blend not in ("hann", "uniform"):
         raise ValueError(f"blend must be hann|uniform, got {blend!r}")
+    if net_out not in ("v", "x1"):
+        raise ValueError(f"net_out must be v|x1, got {net_out!r}")
     device = x_t.device
     _, _, D, H, W = x_t.shape
     pd = min(patch, D)
@@ -222,9 +232,10 @@ def predict_x1_patched(model, x_t: torch.Tensor, t: float, *, patch: int = 64,
             tiles = make_tile_inputs(x_t, chunk, (pd, ph, pw), ctx)
             with torch.autocast(device_type=x_t.device.type, dtype=torch.float16,
                                 enabled=amp):
-                v = model(tiles, t_t.expand(tiles.shape[0]))
-            v = v.float()
-            x1 = tiles[:, :1] + (1.0 - float(t)) * v            # clean endpoint (ch 0)
+                out = model(tiles, t_t.expand(tiles.shape[0]))
+            out = out.float()
+            # clean endpoint (ch 0): recovered from v, or the net's own output (net_out="x1")
+            x1 = tiles[:, :1] + (1.0 - float(t)) * out if net_out == "v" else out
             for i, (z, y, x) in enumerate(chunk):
                 acc[:, :, z:z + pd, y:y + ph, x:x + pw] += x1[i:i + 1] * win
                 wacc[:, :, z:z + pd, y:y + ph, x:x + pw] += win
@@ -235,7 +246,7 @@ def predict_x1_patched(model, x_t: torch.Tensor, t: float, *, patch: int = 64,
 def prior_ode(model, x0: torch.Tensor, *, n_steps: int = 50, patch: int = 64,
               stride: int | None = None, batch: int = 8, context: str = "auto",
               n_offsets: int = 1, blend: str = "hann", generator=None,
-              amp: bool = True) -> torch.Tensor:
+              amp: bool = True, net_out: str = "v") -> torch.Tensor:
     """Prior-ONLY Euler integration of the FM ODE, t: 0 -> 1. No data consistency, no TV --
     "what does the prior ALONE make of the cold start". This is the validation metric, the same
     one the sibling 4DCT project renders every `val_every` steps.
@@ -262,7 +273,7 @@ def prior_ode(model, x0: torch.Tensor, *, n_steps: int = 50, patch: int = 64,
         t = k / n_steps
         x1 = predict_x1_patched(model, x, t, patch=patch, stride=stride, batch=batch,
                                 context=context, n_offsets=n_offsets, blend=blend,
-                                generator=generator, amp=amp)
+                                generator=generator, amp=amp, net_out=net_out)
         x = x + (dt / max(1.0 - t, 1e-3)) * (x1 - x)          # == x + dt * v
     return x
 

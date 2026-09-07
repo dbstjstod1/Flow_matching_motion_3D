@@ -7,6 +7,15 @@ produces. They differ in WHERE the motion is attenuated:
     data (DEFAULT since 2026-08-05)   x_t = FDK( A(x; P_nom @ T((1-t)*theta)), P_nom )
     geom (the original)               x_t = FDK( y, P_nom @ T(t*theta) ) + t*Delta
 
+Plus ONE DELIBERATE STRAW MAN (2026-08-11, the paper's bridge-shape ablation):
+
+    linear                            x_t = (1-t)*x_0 + t*x_1,  the pixel-space line
+
+whose interior images ARE that superposition no operator produces. Its endpoints are the data
+bridge's exactly (x_0 = the cold start FDK(y_theta, P_nom); x_1 = the memoized static FDK), so
+the arms differ ONLY in the path -- see `bridge_pair_linear` for why that isolates the
+physics-curved-vs-straight axis of the "is FM on a physics bridge necessary" ablation.
+
 The `geom` bridge holds the measurement fixed and improves the GEOMETRY, which is literally what
 the inference loop does as theta_hat converges -- that was the argument for it. Its cost is that
 FDK's analytic inverse assumes a CIRCULAR orbit and P(theta) is not one, so its bare endpoint is
@@ -159,6 +168,12 @@ def bridge_pair_data(gen, idx: int, t: torch.Tensor, theta, delta: float = 0.005
     """
     tv = float(t)
     s = 1.0 - tv
+    if mode == "value":
+        # x_t ONLY, no tangent pass -- the --target x1 arm regresses the endpoint, so the draw
+        # never needs dy/ds. Same value path as "analytic" (bit-identical x_t), ~1.5 s cheaper.
+        P_s, _ = bridge_P_and_dP(theta, gen.P_nom, s)
+        x_t = gen.to_net(gen.fdk(gen.simulate(idx, P_s[None]), gen.P_nom[None])[0])
+        return x_t, None
     if mode == "analytic":
         # bridge_P_and_dP gives P(s) and dP/ds in closed form; the value comes from `simulate`
         # (the vendored library) so the endpoints stay bit-exact, the derivative from the
@@ -180,6 +195,36 @@ def bridge_pair_data(gen, idx: int, t: torch.Tensor, theta, delta: float = 0.005
     return x_t, dx
 
 
+@torch.no_grad()
+def bridge_pair_linear(gen, idx: int, t: torch.Tensor, y):
+    """(x_t, dx_t) in NET space for THE LINEAR (pixel) BRIDGE -- `--bridge linear`, the
+    bridge-shape ABLATION arm (2026-08-11).
+
+        x_t = (1-t)*x_0 + t*x_1,   x_0 = FDK(y_theta, P_nom),   x_1 = the static FDK
+
+    The endpoints are the data bridge's exactly: x_0 is the same cold start (FDK of the
+    full-motion sinogram at nominal geometry) and x_1 is `static_anchor_net`, which IS the data
+    bridge's t=1 image by construction (same simulate + FDK, memoized). So the three arms start
+    and finish on the same images and differ ONLY in the path between them. Here that path is
+    the straight pixel-space line -- the rectified-flow / stochastic-interpolant linear coupling
+    (Liu et al. 2022 arXiv:2209.03003; Albergo & Vanden-Eijnden arXiv:2303.08797) -- whose
+    interior images are ghosted superpositions of two reconstructions, which no operator
+    produces. The velocity target is the constant
+
+        dx_t/dt = x_1 - x_0
+
+    exact by definition: no tangent kernel, no finite difference, nothing to gate. This arm
+    exists so the ablation can hold the FM machinery (UNet, t-sampling, patching, sampler, the
+    whole posterior loop) fixed and remove exactly one thing: the physics of the path. The
+    affine offset of `to_net` cancels in x_1 - x_0, so the tangent needs no `to_net_tangent`.
+    """
+    x0 = gen.to_net(gen.fdk(y, gen.P_nom[None])[0])
+    x1 = gen.static_anchor_net(idx)
+    dx = x1 - x0
+    return x0 + float(t) * dx, dx
+
+
+@torch.no_grad()
 def bridge_pair(gen, t: torch.Tensor, y, theta, dlt, delta: float = 0.02,
                 mode: str = "analytic", filtered=None):
     """(x_t, dx_t) in NET space, for one volume. t: scalar tensor. `--bridge geom`.
@@ -374,7 +419,7 @@ def main():
     ap.add_argument("--train_rot_deg", type=float, default=20.0,
                     help="max TRAINING rotation, peak-to-peak [deg]. motion_amp=thies only")
 
-    ap.add_argument("--bridge", default="data", choices=["data", "geom"],
+    ap.add_argument("--bridge", default="data", choices=["data", "geom", "linear"],
                     help="WHERE THE MOTION DECAYS. data (DEFAULT since 2026-08-05) = in the "
                          "MEASUREMENT: x_t = FDK(A(x; P((1-t)theta)), P_nom). The reconstruction "
                          "geometry is nominal for every t, so the endpoint IS the static FDK by "
@@ -386,7 +431,26 @@ def main():
                          "every t (scripts/diag_bridge_ab.py); see the module docstring for the "
                          "table and for what the switch costs (3 native sims per draw, not 1). "
                          "--anchor applies to `geom` only; under `data` it selects nothing but "
-                         "the VALIDATION reference, as it always did.")
+                         "the VALIDATION reference, as it always did. linear = the bridge-shape "
+                         "ABLATION arm (2026-08-11): the pixel-space line between the SAME two "
+                         "endpoints, x_t = (1-t)*FDK(y_theta, P_nom) + t*staticFDK, constant "
+                         "velocity target x_1 - x_0 (exact by definition). Holds every other "
+                         "knob fixed and removes only the physics of the path; --data_tangent/"
+                         "--tangent are inert under it, --anchor again only picks the val "
+                         "reference.")
+    ap.add_argument("--target", default="v", choices=["v", "x1"],
+                    help="WHAT THE NETWORK REGRESSES. v (DEFAULT, flow matching) = the bridge "
+                         "tangent dx_t/dt. x1 = the clean endpoint itself (the static FDK) -- "
+                         "the InDI / Cold-Diffusion restoration objective (arXiv:2303.11435 / "
+                         "2208.09392), the PARAMETERIZATION ablation arm (2026-08-11): same "
+                         "bridge, same UNet, same t-sampling, only the regression target (and "
+                         "hence what supervision the exact physics tangent provides) changes. "
+                         "On a LINEAR bridge the two are algebraically equivalent; on the curved "
+                         "data bridge they are not -- that non-equivalence is the point of the "
+                         "arm. Inference reads this from the ckpt (net_out in prior_patch); "
+                         "sampling is the same recursion either way (prior_ode's step IS InDI's). "
+                         "x1 draws skip the tangent kernel entirely (cheaper). --bridge geom is "
+                         "REFUSED under x1 (its endpoint needs the anchor detrend; not our arm).")
     ap.add_argument("--data_tangent", default="analytic", choices=["analytic", "fd"],
                     help="how the DATA bridge gets dy/ds. analytic (DEFAULT) = the exact "
                          "s-derivative of LEAP's pinned Joseph forward, one fused pass "
@@ -451,6 +515,9 @@ def main():
                          "plain-UNet3D compatible. --no-compile to disable.")
     ap.add_argument("--no-compile", dest="compile", action="store_false")
     args = ap.parse_args()
+    if args.target == "x1" and args.bridge == "geom":
+        ap.error("--target x1 needs an endpoint that is clean by construction; the geom "
+                 "bridge's is anchor-detrended. Use --bridge data or linear.")
 
     dev = "cuda"
     os.makedirs(args.out, exist_ok=True)
@@ -547,11 +614,12 @@ def main():
         # Checkpoints written before 2026-08-05 have no 'bridge' key and were ALL trained on the
         # geometry bridge. The loop below only compares keys the checkpoint HAS, so without this
         # a resume of an old run would silently adopt the new `data` default and continue the
-        # weights on a different manifold.
+        # weights on a different manifold. Same story for 'target' (pre-2026-08-11 = velocity).
         prev.setdefault("bridge", "geom")
+        prev.setdefault("target", "v")
 
-        for k in ("base", "patch", "context", "bridge", "anchor", "shape", "views", "dataset",
-                  "tangent", "data_tangent", "trans_mm", "rot_deg", "sim_grid",
+        for k in ("base", "patch", "context", "bridge", "target", "anchor", "shape", "views",
+                  "dataset", "tangent", "data_tangent", "trans_mm", "rot_deg", "sim_grid",
                   "motion_amp", "train_trans_mm", "train_rot_deg"):
             if k in prev and k in vars(args) and _cmp(prev[k]) != _cmp(vars(args)[k]):
                 raise SystemExit(f"--resume mismatch on '{k}': checkpoint has {prev[k]!r}, "
@@ -595,13 +663,21 @@ def main():
     print(f"motion (ALL PEAK-TO-PEAK): train={args.motion_amp} {_mx}{mot_trans:g} mm / "
           f"{mot_rot:g} deg  |  val=fixed {args.trans_mm:g} mm / {args.rot_deg:g} deg"
           f"   [Thies: train max 10/15, eval 5/5]")
-    print("bridge: " + (f"DATA  x_t = FDK(A(x; P((1-t)theta)), P_nom)  -- endpoint = static FDK "
-                        f"by construction, no anchor; tangent={args.data_tangent}"
-                        + (f" (delta {args.bridge_delta:g})" if args.data_tangent == "fd" else
-                           " (exact d/ds of LEAP's Joseph forward)")
-                        if args.bridge == "data" else
-                        f"GEOM  x_t = FDK(y, P(t*theta)) + t*Delta  -- anchor={args.anchor}, "
-                        f"tangent={args.tangent}"))
+    if args.target == "x1":
+        print("target: X1 (endpoint regression, InDI/Cold-Diffusion objective) -- the "
+              "parameterization ablation arm; no tangent pass in the draws")
+    if args.bridge == "data":
+        print("bridge: " + f"DATA  x_t = FDK(A(x; P((1-t)theta)), P_nom)  -- endpoint = static "
+                           f"FDK by construction, no anchor; tangent={args.data_tangent}"
+                           + (f" (delta {args.bridge_delta:g})" if args.data_tangent == "fd" else
+                              " (exact d/ds of LEAP's Joseph forward)"))
+    elif args.bridge == "linear":
+        print("bridge: LINEAR  x_t = (1-t)*FDK(y_theta, P_nom) + t*staticFDK  -- the "
+              "bridge-shape ABLATION arm; same endpoints as `data`, straight pixel path, "
+              "constant tangent x_1 - x_0 (exact by definition)")
+    else:
+        print(f"bridge: GEOM  x_t = FDK(y, P(t*theta)) + t*Delta  -- anchor={args.anchor}, "
+              f"tangent={args.tangent}")
 
     next_idx = [None]        # the NEXT cq500 patient, sampled one draw ahead so `prefetch_fine`
                              # can load its native-grid volume under the training steps
@@ -616,16 +692,22 @@ def main():
         from the evolving x_t, so train and infer see the same channel.
 
         Under `--bridge data` (the default) the draw does NOT simulate the full-motion y at all:
-        every sinogram it needs is a partially-moved one at s = 1-t, and it needs three of them
-        (the value plus a central difference) -- see `bridge_pair_data`. The anchor block below
-        is skipped entirely; the endpoint is clean by construction.
+        every sinogram it needs is a partially-moved one at s = 1-t. Deployed --data_tangent
+        analytic simulates ONE (the value; the tangent comes fused from `simulate_tangent`);
+        only the fd counterparty needs three (value plus a central difference) -- see
+        `bridge_pair_data`. The anchor block below is skipped entirely; the endpoint is clean
+        by construction.
 
         Under `--bridge geom` the ANCHOR (see `bridge_pair`) is a property of the draw. On cq500
         its motion-free static FDK is MEMOIZED per volume (`gen.static_anchor_net`), since it
         depends on neither the motion nor t -- that removes one forward projection (~0.9 s) and one
         FDK (~0.18 s) from every draw after a volume's first, and the cache refreshes a draw only
         every `--refresh` steps. To reach the memo we sample the volume INDEX ourselves here
-        (cq500's `volume(idx)` is a clean per-patient lookup)."""
+        (cq500's `volume(idx)` is a clean per-patient lookup).
+
+        Under `--bridge linear` (the ablation arm) the draw is the cheapest of the three: the
+        full-motion y, ONE FDK for the cold-start endpoint, and the same memoized static FDK as
+        its t=1 -- no tangent pass at all (the target is the constant x_1 - x_0)."""
         _tm: dict[str, float] = {}
         _tk = [time.time()]
 
@@ -670,8 +752,30 @@ def main():
             # is the static FDK by construction. No anchor, no Delta, no shared ramp pass (each
             # of the three sinograms is its own).
             t = sample_t(1, dev)[0]
-            x_t, dx = bridge_pair_data(gen, idx, t, th[0], delta=args.bridge_delta,
-                                       mode=args.data_tangent)
+            if args.target == "x1":
+                # ENDPOINT-REGRESSION ARM: the target slot holds x_1 (the static FDK memo, the
+                # bridge's own t=1 image), and the draw skips the tangent pass entirely.
+                x_t, _ = bridge_pair_data(gen, idx, t, th[0], mode="value")
+                dx = gen.static_anchor_net(idx)
+            else:
+                x_t, dx = bridge_pair_data(gen, idx, t, th[0], delta=args.bridge_delta,
+                                           mode=args.data_tangent)
+            _tick("bridge")
+            x_t = x_t[None, None]                                    # (1,1,D,H,W)
+            ctx = volume_context(x_t, (p, p, p)) if in_ch == 5 else None
+            _tick("ctx")
+            if prof_draw:
+                print("[draw]", " ".join(f"{k} {v:.3f}" for k, v in _tm.items()),
+                      f"| total {sum(_tm.values()):.3f}", flush=True)
+            return x_t, dx, t, ctx
+
+        if args.bridge == "linear":
+            # THE LINEAR BRIDGE (ablation arm): straight pixel line between the data bridge's
+            # own two endpoints. x_1 comes from the same memo the geom anchor uses.
+            t = sample_t(1, dev)[0]
+            x_t, dx = bridge_pair_linear(gen, idx, t, y)
+            if args.target == "x1":
+                dx = gen.static_anchor_net(idx)      # the target slot holds x_1, not x_1 - x_0
             _tick("bridge")
             x_t = x_t[None, None]                                    # (1,1,D,H,W)
             ctx = volume_context(x_t, (p, p, p)) if in_ch == 5 else None
@@ -833,7 +937,8 @@ def main():
             # what the posterior loop runs.
             run_validation(ema, val_gen, meas, val_dir, it=it, patients=args.val_patients,
                            patch=args.patch, ode_steps=args.val_ode_steps, anchor=args.anchor,
-                           trans_mm=args.trans_mm, rot_deg=args.rot_deg, writer=writer, dev=dev)
+                           trans_mm=args.trans_mm, rot_deg=args.rot_deg, writer=writer, dev=dev,
+                           net_out=args.target)
             ema.train()
 
         if it % args.save_every == 0 or it == args.iters:

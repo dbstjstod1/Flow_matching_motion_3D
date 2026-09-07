@@ -70,7 +70,7 @@ from fm3d.unet_3d import UNet3D
 
 @torch.no_grad()
 def fm_predict(model, gen, x_mu, t, dt, patch, context="auto", n_offsets=1, generator=None,
-               blend="uniform", batch=64, amp=False):
+               blend="uniform", batch=64, amp=False, net_out="v"):
     """One Euler step of the FM ODE. Takes and returns a MU-space volume.
 
     The prior is evaluated PATCH-WISE and blended (`predict_x1_patched`), never on the whole slab
@@ -99,11 +99,16 @@ def fm_predict(model, gen, x_mu, t, dt, patch, context="auto", n_offsets=1, gene
     It is nevertheless EXACT: v -> x1 is affine with a constant coefficient and the blend weights
     normalize to 1, so the (1-t) cancels and what is blended is v itself, to 6e-6 relative at the
     worst t. See fm3d/prior_patch.py. The one thing never to do is treat x1_hat as a clean image.
+
+    `net_out` (off the ckpt's training target, ca["target"]): "v" = everything above; "x1" =
+    the endpoint-regression arm (InDI, 2026-08-11) -- there x1_hat IS the net's clean-image
+    prediction, the caveat above does not apply, and the divide-back-to-velocity makes this
+    step exactly InDI's recursion.
     """
     x_net = gen.to_net(x_mu)[None, None]
     x1 = predict_x1_patched(model, x_net, t, patch=patch, stride=patch // 2,
                             context=context, n_offsets=n_offsets, generator=generator,
-                            blend=blend, batch=batch, amp=amp)
+                            blend=blend, batch=batch, amp=amp, net_out=net_out)
     v = (x1 - x_net) / max(1.0 - t, 1e-3)
     return gen.from_net(x_net + dt * v)[0, 0]
 
@@ -776,6 +781,25 @@ def main():
     ap.add_argument("--asd_red", type=float, default=0.95, help="TV step reduction factor")
     ap.add_argument("--asd_ng", type=int, default=0,
                     help="TV gradient-descent iterations per step; 0 = use --tv_iters")
+    ap.add_argument("--prior", default="fm", choices=["fm", "w3dm"],
+                    help="WHICH NET fills the prior step; everything else in the loop is "
+                         "byte-identical (the unified-loop benchmark arm, 2026-08-18). "
+                         "fm (DEFAULT) = the flow-matching velocity net from --ckpt, Euler "
+                         "step x + dt*v. w3dm = JRM-ADM's wavelet-domain x0-DDPM (retrained "
+                         "on OUR train split), consumed by its own parameterization's step "
+                         "rule: renoise to the matched DDPM level (ephemeral input adapter; "
+                         "the loop state, the estimator and the CG step stay noise-free), "
+                         "predict x0_hat, advance the SAME dt via the InDI-style fractional "
+                         "step (dt/(1-t))*(x0_hat - x). See fm3d/w3dm_prior.py. --ckpt is "
+                         "still required for geometry/dataset plumbing.")
+    ap.add_argument("--w3dm_weights",
+                    default="refs/jrm-adm/weights_retrain/model_state_dict.pth",
+                    help="W3DM state dict (--prior w3dm). Default = the prior retrained on "
+                         "our 150-patient train split (refs/jrm-adm/train_w3dm.py).")
+    ap.add_argument("--w3dm_tmax", type=int, default=500,
+                    help="renoise depth at the cold start: t_ddpm = (1-t)*tmax of the "
+                         "T=1000 linear-beta schedule (SDEdit's t0). THE knob of the w3dm "
+                         "arm -- swept on val patients, then frozen for the cohort.")
     ap.add_argument("--no_prior", action="store_true",
                     help="BASELINE: skip the FM prior step (x_prior = x), leaving estimator + "
                          "data step + TV = classical blind joint motion estimation with "
@@ -1104,6 +1128,15 @@ def main():
     gauge_th = None                                              # warm-start for the gauge fit
     xt_gauge = None                        # x_t carries its OWN gauge; fitted separately
     gtile = torch.Generator(device=dev).manual_seed(args.seed)   # reproducible tile jitter
+    w3dm = None
+    gnoise = None
+    if args.prior == "w3dm":
+        from fm3d.w3dm_prior import W3DMPrior
+        w3dm = W3DMPrior(args.w3dm_weights, device=dev)
+        # renoise stream, separate from gtile so the FM arm's tile jitter is untouched
+        gnoise = torch.Generator(device=dev).manual_seed(args.seed + 7777)
+        print(f"prior: W3DM (unified-loop arm) | weights {args.w3dm_weights} | "
+              f"tmax {args.w3dm_tmax}")
     dtvg = None                            # ASD-POCS TV step; set from dp on the first step
     # ADMM's split variable d and scaled dual u, SHARED ACROSS OUTER STEPS (the "variable
     # sharing" of DiffusionMBIR / DDS): one sweep per ODE step only makes sense if the dual
@@ -1147,10 +1180,16 @@ def main():
         # is handed a different image every step, and the Gauss-Seidel design ("fit the motion on
         # the improved image") is precisely what is being removed. Read the gap as
         # method-vs-baseline, not as an accounting of who moved x_t further.
-        x_prior = x if args.no_prior else fm_predict(
-            model, gen, x, t, dt, patch, context=args.context,
-            n_offsets=args.patch_offsets, generator=gtile, blend=args.blend,
-            batch=args.prior_batch, amp=args.prior_amp)
+        if args.no_prior:
+            x_prior = x
+        elif args.prior == "w3dm":
+            from fm3d.w3dm_prior import w3dm_predict
+            x_prior = w3dm_predict(w3dm, x, t, dt, tmax=args.w3dm_tmax, generator=gnoise)
+        else:
+            x_prior = fm_predict(
+                model, gen, x, t, dt, patch, context=args.context,
+                n_offsets=args.patch_offsets, generator=gtile, blend=args.blend,
+                batch=args.prior_batch, amp=args.prior_amp, net_out=ca.get("target", "v"))
 
         # 2. ESTIMATE on the improved image (Gauss-Seidel, not simultaneous)
         if args.theta_oracle:

@@ -72,7 +72,7 @@ _VAL_CACHE: dict[tuple, dict] = {}
 
 def run_validation(model, gen, meas, out_dir, *, it=0, patients=3, patch=64, ode_steps=50,
                    anchor="static", trans_mm=10.0, rot_deg=10.0, blend="uniform", n_offsets=2,
-                   tile_batch=64, writer=None, dev="cuda"):
+                   tile_batch=64, writer=None, dev="cuda", net_out="v"):
     """Prior-ONLY ODE from the cold start, on `patients` fixed val cases. Returns the per-patient
     metrics AND the montage paths, and (if given) logs scalars + images to a tensorboard writer.
 
@@ -139,10 +139,13 @@ def run_validation(model, gen, meas, out_dir, *, it=0, patients=3, patch=64, ode
             # nothing ships. The val curve therefore shifts slightly at that date -- by well
             # under the 0.07 dB the blend A/B already treats as noise, but it is a shift, so
             # pass amp=False to reproduce a pre-2026-08-04 val number exactly.
+            # net_out comes from the ckpt's training target ("v" = velocity, "x1" = endpoint
+            # regression, the InDI arm) -- the recursion is the same either way, only the
+            # interpretation of the net's output changes (prior_patch.predict_x1_patched).
             x1_mu = gen.from_net(prior_ode(model, gen.to_net(x0_mu)[None, None], n_steps=ode_steps,
                                            patch=patch, stride=patch // 2, batch=tile_batch,
                                            context="auto", blend=blend, n_offsets=n_offsets,
-                                           generator=gtor, amp=True)[0, 0])
+                                           generator=gtor, amp=True, net_out=net_out)[0, 0])
         # GAUGE-AWARE: rigidly align to the target before scoring. Raw PSNR penalises the
         # unobservable global pose the prior is free to shift; the aligned number is the honest
         # one (see fm3d/reg_metric.py, and the SE(3) gauge in memory).
@@ -195,7 +198,8 @@ def evaluate(ckpt, gen, meas, args, dev):
     return run_validation(model, gen, meas, args.out, it=it, patients=args.patients,
                           patch=ca["patch"], ode_steps=args.ode_steps, anchor=args.anchor,
                           trans_mm=args.trans_mm, rot_deg=args.rot_deg,
-                          blend=args.blend, n_offsets=args.n_offsets, dev=dev)[:2]
+                          blend=args.blend, n_offsets=args.n_offsets, dev=dev,
+                          net_out=ca.get("target", "v"))[:2]
 
 
 def main():

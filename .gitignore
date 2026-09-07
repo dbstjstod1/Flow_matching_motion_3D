@@ -8,3 +8,8 @@ logs/
 # apply" in its own footer. Read it from docs/ locally; refs/ carries the text extraction we
 # actually cite line numbers against.
 docs/*.pdf
+
+# local-only: upstream clones/weights (39 GB), docx build intermediates, soffice proof renders
+refs/jrm-adm/
+docs/arxiv/_docx.tex
+docs/arxiv/proof/
