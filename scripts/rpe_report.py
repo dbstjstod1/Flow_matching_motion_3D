@@ -60,7 +60,7 @@ def main():
         _row("MEAN", {k: avg(k) for k in rows[0][1]},
              {k: sum(m[k] for _, _, m in rows) / n for k in rows[0][2]})
     print("\nThe paper reports `RPE zc` (mean pose offset removed, no ground truth needed). "
-          "Thies et al. report the raw RPE at half this amplitude: 0.61 mm, uncorrected ~3 mm.")
+          "Distances are in detector-plane millimeters.")
 
 
 if __name__ == "__main__":

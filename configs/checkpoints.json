@@ -1,0 +1,12 @@
+{
+  "data": {
+    "filename": "logs/fm3d_databridge/ckpt_iter500000.pth",
+    "sha256": "1d6f4632a4ddf66469e0e36d19a1ae3ae908382b0fe4383ab3fc5ec8e982f1a3",
+    "iteration": 500000
+  },
+  "linear": {
+    "filename": "logs/fm3d_linbridge/ckpt_iter500000.pth",
+    "sha256": "28ecde662580ff335cf455b4a7b24a5d6983a1637575a2f44552ed7249c4a5b1",
+    "iteration": 500000
+  }
+}

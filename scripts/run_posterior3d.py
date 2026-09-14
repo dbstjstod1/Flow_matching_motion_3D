@@ -1,11 +1,11 @@
-"""Blind rigid-motion correction: the predictor-corrector loop along the geometry bridge
+"""Blind rigid-motion correction: the predictor-corrector loop with a geometry-bridge prior
 (Algorithm 1 of the paper).
 
 Per Euler step k of N (t = k/N), starting cold from x = FDK(y, P_nom) and theta_hat = 0:
 
     1. PREDICT   x_pred = x + dt * v_phi(x, t)              frozen flow-matching prior, patch-blended
-    2. ESTIMATE  theta_hat = argmin ||A_theta x_pred - y||    hash-encoded MLP over the view index,
-                                                              warm-started Adam, --per iterations
+    2. ESTIMATE  theta_hat = argmin ||A_theta x_pred - y||    Akima spline coefficients,
+                                                              warm-started GD, --per iterations
     3. CORRECT   z = CG(theta_hat, y; warm start x_pred)      --cg_iters conjugate-gradient iterations
                  z = z + kappa * (D_TV(z) - z)                relaxed TV update
     4. x = z
@@ -16,7 +16,7 @@ than a gradient step because the payoff of a better theta_hat lies in streaks an
 single adjoint step barely reaches.
 
 Two volumes are saved in result.pt: the final iterate x_t (the primary output) and FDK(theta_hat)
-(a learning-free witness of the recovered geometry). Every score is computed after rigid alignment
+(an analytic readout of the prior-assisted pose estimates). Every score is computed after rigid alignment
 to the ground truth, because blind motion correction has an exact SE(3) gauge (fm3d/reg_metric.py).
 
     python scripts/run_posterior3d.py --ckpt logs/fm3d_databridge/ckpt_iter500000.pth \
@@ -204,8 +204,8 @@ def build_world(*, ckpt, dev="cuda", root=None, split="val",
     meas = measured_region_mask(gen.shape, spacing, cfg, device=dev)
 
     gt = gen.volume(run)                                             # (1,1,D,H,W) mu
-    # Amplitudes are PEAK-TO-PEAK (fm3d/rigid_motion). 10 mm / 10 deg is 2x the evaluation
-    # amplitude of Thies et al. and equals that of JRM-ADM.
+    # Amplitudes are full control-point sampling widths before zero-centering:
+    # 10 means nodes in [-5, 5]; realized trajectory ranges can differ.
     amp = {}
     if trans_mm is not None:
         amp["trans_mm"] = trans_mm
@@ -234,21 +234,23 @@ def main():
                     help="akima (the field standard, 10 zero-centred nodes per DoF) | mixed | "
                          "sinusoid | linear | jerk | step")
     ap.add_argument("--trans_mm", type=float, default=10.0,
-                    help="peak-to-peak translation amplitude [mm], all three DoFs")
+                    help="full translation-node sampling width [mm], before zero-centering")
     ap.add_argument("--rot_deg", type=float, default=10.0,
-                    help="peak-to-peak rotation amplitude [deg], all three DoFs")
+                    help="full rotation-node sampling width [deg], before zero-centering")
     ap.add_argument("--seed", type=int, default=3,
                     help="seeds the motion draw, the tile jitter and the estimator (the cohort "
                          "convention is seed = 1000 + run)")
     # ---- the loop ---------------------------------------------------------------------------
-    ap.add_argument("--n_steps", type=int, default=50, help="Euler steps along the bridge (N)")
+    ap.add_argument("--n_steps", type=int, default=50, help="learned Euler updates (N)")
     ap.add_argument("--per", type=int, default=200,
-                    help="estimator Adam iterations per flow step (PER). 200 is the knee of the "
-                         "cost/accuracy curve; 100 does not converge")
+                    help="pose-fitting iterations per outer step")
     ap.add_argument("--loss", default="l2",
                     help="projection-domain data term of the estimator: l2 | l2si | lncc | ncc")
+    ap.add_argument("--estimator", default="akima_gd",
+                    choices=["akima_gd", "bspline_rmsprop", "net"],
+                    help="paper: akima_gd; pose ablation: bspline_rmsprop; legacy: net")
     ap.add_argument("--lr", type=float, default=None,
-                    help="estimator lr; default 3e-3, matched to the full-bandwidth hash encoder")
+                    help="pose step size; defaults: Akima 1000, B-spline .001, legacy net .003")
     ap.add_argument("--views_per_iter", type=int, default=24,
                     help="random views per estimator iteration (stochastic view subsampling)")
     ap.add_argument("--est_coarse", type=int, default=2,
@@ -326,15 +328,13 @@ def main():
     gt3, theta_true = world["gt3"], world["theta_true"]
     y, static_fdk = world["y"], world["static_fdk"]
 
-    # ---- the motion estimator: hash-encoded MLP over the normalized view index ---------------
-    # Bandwidth and lr travel together: the full-bandwidth encoder (stock NGP 16 levels) at
-    # lr 3e-3 represents the trajectory without spending capacity on view-to-view jitter.
+    # Spline coefficients persist across outer updates and the grid transition.
+    default_lr = {"akima_gd": 1000.0, "bspline_rmsprop": 0.001, "net": 0.003}
     est_kw = dict(dx=gen.dx, dy=gen.dy, dz=gen.dz, loss=args.loss,
-                  views_per_iter=args.views_per_iter, lr=3e-3)
-    if args.lr is not None:
-        est_kw["lr"] = args.lr
-    print(f"estimator: hash-encoded MLP, lr={est_kw['lr']} views/iter={args.views_per_iter} "
-          f"loss={args.loss}")
+                  views_per_iter=args.views_per_iter,
+                  lr=default_lr[args.estimator] if args.lr is None else args.lr)
+    print(f"estimator: {args.estimator}, lr={est_kw['lr']} "
+          f"views/iter={args.views_per_iter} loss={args.loss}")
 
     def build_grid(n):
         """Everything the estimator needs to work on a 1/n grid (volume pooled n, panel binned n)."""
@@ -354,12 +354,10 @@ def main():
                  if args.est_coarse_until < 1.0 else ""))
     g0 = grids[ec]
     est_kw.update(dx=g0["vox"], dy=g0["vox"], dz=g0["vox"])
-    est = make_estimator("net", g0["cfg"], gen.P_nom, g0["u"], g0["v"], dev, **est_kw)
+    est = make_estimator(args.estimator, g0["cfg"], gen.P_nom, g0["u"], g0["v"], dev, **est_kw)
 
     def use_grid(t):
-        """Re-point the estimator at the grid for flow time t. The estimator is a coordinate net
-        over the VIEW INDEX and never sees the volume grid, so its weights and Adam moments carry
-        across the switch intact; only the images and rays it is scored against change."""
+        """Switch the fitting grid while retaining the fitted motion parameters."""
         gg = grids[ec] if (ec > 1 and t < args.est_coarse_until) else grids[1]
         est.cfg, est.u, est.v = gg["cfg"], gg["u"], gg["v"]
         est.dx = est.dy = est.dz = gg["vox"]

@@ -8,7 +8,7 @@ matplotlib>=3.9
 tensorboard>=2.17
 
 # Not pip-installable from PyPI as used here -- see README "Setup":
-#   tiny-cuda-nn (hash-encoded motion estimator):
+#   tiny-cuda-nn (OPTIONAL, legacy --estimator net only; not needed by the paper):
 #       pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
 #   LEAP (the projector), built from source with third_party/leap/leap_joseph_pin.patch applied.
 

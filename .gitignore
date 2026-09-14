@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 *.pth
 *.pt
+
+# External baseline clone and generated artifacts
+refs/jrm-adm/
+.pytest_cache/

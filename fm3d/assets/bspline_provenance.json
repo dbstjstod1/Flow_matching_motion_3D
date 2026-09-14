@@ -1,0 +1,9 @@
+{
+  "package": "torch-cubic-spline-grids",
+  "version": "0.5.2",
+  "views": 360,
+  "control_points": 20,
+  "source": "JRM-ADM published III-A count; released interpolation package",
+  "max_forward_error": 1.1920928955078125e-07,
+  "max_gradient_error": 4.76837158203125e-07
+}

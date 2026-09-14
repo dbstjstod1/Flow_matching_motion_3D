@@ -283,7 +283,7 @@ def main():
     mot_trans = args.train_trans_mm if args.motion_amp == "thies" else args.trans_mm
     mot_rot = args.train_rot_deg if args.motion_amp == "thies" else args.rot_deg
     _mx = "max " if args.motion_amp == "thies" else ""
-    print(f"motion (peak-to-peak): train={args.motion_amp} {_mx}{mot_trans:g} mm / "
+    print(f"motion (nominal sampling width): train={args.motion_amp} {_mx}{mot_trans:g} mm / "
           f"{mot_rot:g} deg  |  val=fixed {args.trans_mm:g} mm / {args.rot_deg:g} deg")
     if args.bridge == "data":
         print(f"bridge: geometry  x_t = FDK(A(x; P((1-t)theta)), P_nom)  tangent={args.data_tangent}")

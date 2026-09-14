@@ -37,7 +37,8 @@ from fm3d.rigid_motion import params_to_Pmot, reprojection_error, zero_centre_ga
 from jrm_theta_convert import jrm_thetas_to_ours                       # noqa: E402
 
 JRM = "refs/jrm-adm/data/recon_ours_v2"
-OURS = "data/fm3d_test30_databridge"
+OURS = "data/test30"
+DATA_ROOT = None
 CKPT = "logs/fm3d_databridge/ckpt_iter500000.pth"
 MU_RATIO = 0.02 / 0.0193
 
@@ -58,7 +59,7 @@ def score_one(i: int, dev: str) -> dict:
     devi = float((jrm["theta_true"].double() - tt).abs().max())
     assert devi < 1e-5, f"{tag}: JRM and ours saw different motion (|dtheta| {devi:.2e})"
 
-    w = build_world(ckpt=CKPT, dev=dev, split="test", run=i, seed=1000 + i,
+    w = build_world(ckpt=CKPT, root=DATA_ROOT, dev=dev, split="test", run=i, seed=1000 + i,
                     motion_kind="akima", trans_mm=10.0, rot_deg=10.0)
     gen, gt3, meas, spacing = w["gen"], w["gt3"], w["meas"], w["spacing"]
     assert (w["theta_true"].double().cpu() - tt).abs().max() < 1e-5, f"{tag}: world pairing"
@@ -113,11 +114,17 @@ def summary(rows: list[dict]):
 
 
 def main():
+    global JRM, OURS, CKPT, DATA_ROOT
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="data/jrm_native_test30/scores.json")
     ap.add_argument("--only", type=int, nargs="*", default=None)
+    ap.add_argument("--jrm", default=JRM)
+    ap.add_argument("--ours", default=OURS)
+    ap.add_argument("--ckpt", default=CKPT)
+    ap.add_argument("--root", default=None)
     a = ap.parse_args()
-    os.makedirs(os.path.dirname(a.out), exist_ok=True)
+    JRM, OURS, CKPT, DATA_ROOT = a.jrm, a.ours, a.ckpt, a.root
+    os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     rows = json.load(open(a.out)) if os.path.exists(a.out) else []
     have = {r["tag"] for r in rows}
     done = sorted(int(re.search(r"p(\d+)_result", p).group(1))

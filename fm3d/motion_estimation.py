@@ -6,7 +6,8 @@
 `y` is the measured cone-beam data, and the gradient flows analytically through the projector's
 recovery of the rays from P. See `rigid_motion.py` for how theta enters P.
 
-Three estimators, ONE CONTRACT, so the posterior loop can swap them by name:
+The paper uses Akima + GD, with B-spline + RMSprop as an ablation (spline_motion.py).
+Legacy estimators remain available. All share the following contract:
 
     est.refine_global(image, y_meas, iters, prox_anchor=None, prox_lam=0.0) -> float   # last loss
     est.current_params() -> (V, 6)
@@ -41,7 +42,6 @@ import torch
 import torch.nn.functional as F
 
 from .filters import DEFAULT_RAMP_WINDOW, ramp_filter
-from .motion_net import MotionNet6DoF
 from .projector_3d import forward_project_3d_batched
 from .rigid_motion import params_to_Pmot
 
@@ -301,6 +301,7 @@ class NetMotionEstimator(_BaseEstimator):
     def __init__(self, *a, lr=3e-3, enc="hash", n_levels=16, base_resolution=16,
                  per_level_scale=1.5, fourier_m=8, trans_max_mm=15.0, rot_max_deg=8.0, **kw):
         super().__init__(*a, **kw)
+        from .motion_net import MotionNet6DoF
         self.net = MotionNet6DoF(
             self.V, enc=enc, n_levels=n_levels, base_resolution=base_resolution,
             per_level_scale=per_level_scale, fourier_m=fourier_m,
@@ -315,10 +316,13 @@ class NetMotionEstimator(_BaseEstimator):
 
 def make_estimator(name: str, cfg, P_nom, u, v, device, **kw) -> _BaseEstimator:
     n = name.lower()
+    if n in ("akima_gd", "bspline_rmsprop"):
+        from .spline_motion import SplineSchemeEstimator
+        return SplineSchemeEstimator(cfg, P_nom, u, v, device, scheme=n, **kw)
     if n == "direct":
         return DirectMotionEstimator(cfg, P_nom, u, v, device, **kw)
     if n == "basis":
         return BasisMotionEstimator(cfg, P_nom, u, v, device, **kw)
     if n in ("net", "mlp"):
         return NetMotionEstimator(cfg, P_nom, u, v, device, **kw)
-    raise ValueError(f"unknown estimator '{name}' (direct|basis|net)")
+    raise ValueError(f"unknown estimator '{name}' (akima_gd|bspline_rmsprop|direct|basis|net)")

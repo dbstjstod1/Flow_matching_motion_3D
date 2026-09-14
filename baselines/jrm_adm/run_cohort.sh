@@ -1,25 +1,22 @@
-#!/bin/bash
-# Sequential test30 cohort driver for the JRM-ADM port (A2d, 2026-08-18). OURS, not upstream.
-# One patient at a time (each run holds ~26 GB on the 224^3 grid), ~4.6 h/patient measured on
-# p00 -> ~5.6 days for the remaining 29. Skips patients whose result already exists, so a
-# restart after any death resumes where it stopped. Launch:
-#   cd refs/jrm-adm && setsid nohup ./run_cohort.sh </dev/null > ../../logs/jrm_cohort.log 2>&1 &
-set -u
-PY=/home/mirlab/anaconda3/envs/jrm_adm/bin/python
+#!/usr/bin/env bash
+# Run inside the upstream JRM-ADM clone after copying this adapter there.
+# MODEL_PATH selects OUR retrained prior explicitly; no fallback to released weights.
+set -euo pipefail
+PY_EXEC="${PYTHON:-python}"
+: "${MODEL_PATH:?Set MODEL_PATH to the retrained EMA model weights}"
 cd "$(dirname "$0")"
+CASE_DIR="${CASE_DIR:-data/ours_cohort}"
+RESULT_DIR="${RESULT_DIR:-data/recon_ours_v2}"
+mkdir -p "$RESULT_DIR"
 for i in $(seq 0 29); do
-    tag=$(printf "p%02d" "$i")
-    out="data/recon_ours_v2/${tag}_result.pt"
-    if [ -f "$out" ]; then
-        echo "== $tag: exists, skip"
-        continue
+    tag=$(printf 'p%02d' "$i")
+    if [ -e "$RESULT_DIR/${tag}_result.pt" ]; then
+        echo "Existing result: $RESULT_DIR/${tag}_result.pt; choose a fresh RESULT_DIR." >&2
+        exit 1
     fi
-    echo "== $tag: start $(date '+%F %T')"
-    CUDA_VISIBLE_DEVICES=0 $PY -u run_on_ours.py --case "data/ours_cohort/${tag}.pt" \
-        --out data/recon_ours_v2 --vol 224 224 224 --gamma 3.3e4 --prior_zflip \
-        > "/tmp/jrm_cohort_${tag}.log" 2>&1
-    rc=$?
-    echo "== $tag: rc=$rc $(date '+%F %T')"
-    [ $rc -ne 0 ] && tail -3 "/tmp/jrm_cohort_${tag}.log"
+    "$PY_EXEC" -u run_on_ours.py --case "$CASE_DIR/$tag.pt" \
+        --out "$RESULT_DIR" --vol 224 224 224 --angle_batch 36 \
+        --gamma 33000 --prior_zflip --model_path "$MODEL_PATH" \
+        > "$RESULT_DIR/$tag.log" 2>&1
+    echo "Completed $tag"
 done
-echo "COHORT DONE $(date '+%F %T')"

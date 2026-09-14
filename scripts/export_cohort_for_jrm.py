@@ -39,6 +39,7 @@ from run_posterior3d import build_world
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="logs/fm3d_databridge/ckpt_iter500000.pth")
+    ap.add_argument("--root", default=None, help="CQ500 directory; overrides checkpoint root")
     ap.add_argument("--out", default="refs/jrm-adm/data/ours_cohort")
     ap.add_argument("--n", type=int, default=30)
     ap.add_argument("--start", type=int, default=0)
@@ -46,7 +47,7 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     for i in range(args.start, args.n):
-        world = build_world(ckpt=args.ckpt, dev="cuda", split="test", run=i,
+        world = build_world(ckpt=args.ckpt, root=args.root, dev="cuda", split="test", run=i,
                             motion_kind="akima", seed=1000 + i,
                             trans_mm=10.0, rot_deg=10.0)
         gen = world["gen"]

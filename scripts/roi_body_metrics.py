@@ -62,7 +62,13 @@ def main():
     ap.add_argument("--tags", default=None, help="comma list; default p00..p29")
     ap.add_argument("--n", type=int, default=30)
     ap.add_argument("--out", default="data/roi_body_metrics.json")
+    ap.add_argument("--root", default=None)
+    ap.add_argument("--ckpt", default=CKPT)
+    ap.add_argument("--arm", action="append", help="NAME=DIRECTORY; repeat to select output cohorts")
     a = ap.parse_args()
+    arms = [tuple(item.split("=", 1)) for item in a.arm] if a.arm else ARMS
+    if any(len(item) != 2 for item in arms):
+        ap.error("--arm requires NAME=DIRECTORY")
     tags = a.tags.split(",") if a.tags else [f"p{i:02d}" for i in range(a.n)]
     dev = "cuda"
     from run_posterior3d import build_world
@@ -70,13 +76,13 @@ def main():
     rows = []
     for tag in tags:
         i = int(tag[1:])
-        w = build_world(ckpt=CKPT, dev=dev, split="test", run=i, seed=1000 + i,
+        w = build_world(ckpt=a.ckpt, root=a.root, dev=dev, split="test", run=i, seed=1000 + i,
                         motion_kind="akima", trans_mm=10.0, rot_deg=10.0)
         gt, sp, meas = w["gt3"], w["spacing"], w["meas"]
         body = body_mask(gt, meas)
         peak = float(gt[body].max())
         row = {"tag": tag, "body_voxels_M": float(body.sum()) / 1e6}
-        for name, d in ARMS:
+        for name, d in arms:
             vol = load_arm(name, d, tag, dev)
             m, al = aligned_metrics(vol, gt, sp, mask=meas, iters=200, return_aligned=True)
             row[name] = {
@@ -86,23 +92,23 @@ def main():
             }
         rows.append(row)
         print(f"{tag}  body {row['body_voxels_M']:.1f}M | " + " | ".join(
-            f"{n} {row[n]['psnr_body']:.2f}/{row[n]['ssim_body']:.4f}" for n, _ in ARMS),
+            f"{n} {row[n]['psnr_body']:.2f}/{row[n]['ssim_body']:.4f}" for n, _ in arms),
             flush=True)
 
-    os.makedirs(os.path.dirname(a.out), exist_ok=True)
+    os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     json.dump(rows, open(a.out, "w"), indent=1)
     print("wrote", a.out)
 
     if len(rows) > 1:
         print("\n== cohort summary (body ROI, aligned) ==")
-        for name, _ in ARMS:
+        for name, _ in arms:
             p = np.array([r[name]["psnr_body"] for r in rows])
             s = np.array([r[name]["ssim_body"] for r in rows])
             print(f"  {name:7s} PSNR {p.mean():6.2f} +- {p.std(ddof=1):.2f}   "
                   f"SSIM {s.mean():.4f} +- {s.std(ddof=1):.4f}")
         try:
             from scipy.stats import wilcoxon
-            for name, _ in ARMS[1:]:
+            for name, _ in arms[1:]:
                 dp = np.array([r["fm"]["psnr_body"] - r[name]["psnr_body"] for r in rows])
                 ds = np.array([r["fm"]["ssim_body"] - r[name]["ssim_body"] for r in rows])
                 print(f"  fm vs {name:7s} dPSNR {dp.mean():+.2f} (win {(dp > 0).sum()}/"
