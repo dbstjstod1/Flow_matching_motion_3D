@@ -16,7 +16,7 @@ for i in $(seq 0 29); do
     fi
     "$PY_EXEC" -u run_on_ours.py --case "$CASE_DIR/$tag.pt" \
         --out "$RESULT_DIR" --vol 224 224 224 --angle_batch 36 \
-        --gamma 33000 --prior_zflip --model_path "$MODEL_PATH" \
+        --gamma 33000 --prior_zflip --model_path "$MODEL_PATH" --seed "$((1000+i))" \
         > "$RESULT_DIR/$tag.log" 2>&1
     echo "Completed $tag"
 done

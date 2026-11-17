@@ -7,4 +7,6 @@ __pycache__/
 
 # External baseline clone and generated artifacts
 refs/jrm-adm/
+refs/LEAP/
 .pytest_cache/
+.venv/

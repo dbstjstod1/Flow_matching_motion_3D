@@ -1,66 +1,12 @@
-"""Per-view rigid (6-DoF) patient motion, composed into the projection matrices.
+"""Rigid motion composed into the acquisition geometry: P_moved = P_nom @ T(theta).
 
-THE PARAMETERIZATION
---------------------
-    theta: (V, 6) = [tx, ty, tz | wx, wy, wz]
-        translation  [mm]        (world axes: x, y in the orbit plane; z = SI = rotation axis)
-        rotation     [rad]       ROTATION VECTOR (axis-angle), i.e. an element of so(3)
+theta has shape (V, 6): translations in mm, followed by axis-angle rotation
+vectors in radians. The pivot is the centered volume origin. Training scales
+theta by (1-t), giving linear translations and geodesic SO(3) rotations.
 
-AMPLITUDES ARE PEAK-TO-PEAK, EVERYWHERE IN THIS REPO
-----------------------------------------------------
-Every `trans_mm` / `rot_deg` argument, CLI flag and stored run-arg is the **full swing** of the
-motion parameter, not a +- bound. `akima_motion` therefore draws its spline nodes from
-`uniform(-amp/2, +amp/2)`. This is Thies' convention, established from their released sampler
-(`refs/thies_moco_diff_likelihood/motion_compensation_data_loader.py`), which draws
-`(rand(n) - 0.5) * amplitude` -- so their paper's "5 mm / 5 deg" evaluation is nodes in +-2.5.
-It is cross-checked against a figure the paper states independently: at that setting the
-UNCOMPENSATED median RPE is "around 3 mm" (TMI L568), and this code reproduces 3.05 mm.
-
-**Converted on 2026-07-28** (before that, the same arguments meant the +- node bound, i.e. HALF
-the number they mean now). Anything reading amplitudes back out of a stored run predates the
-switch unless its args carry `amp_units="p2p"` -- use `amp_from_run_args` to read them, which
-doubles the legacy values. `scripts/gate_motion_amp.py` check 9 asserts that `p2p = 2A` is
-bit-identical to the pre-switch `+-A`, i.e. that this was a RELABELLING and no physical motion
-changed.
-
-Rotation is an axis-angle vector, NOT Euler angles. That is not a style choice, it is what
-makes the geometry bridge legal. The bridge trains on partially-corrected geometries
-
-    x_t = FDK(y, P_nom @ T(t * theta)),   t in [0, 1]
-
-and for `t * theta` to trace the SHORTEST PATH from "no correction" to "full correction",
-the map theta -> T(theta) must be a geodesic in the motion group. exp(t*skew(w)) is exactly
-the SO(3) geodesic; scaling Euler angles is not (AI_Geocal uses Rz@Ry@Rx in degrees, which is
-fine there because it never interpolates). Getting this wrong does not crash -- it silently
-curves the bridge, so the finite-difference velocity target no longer points where the
-inference ODE travels.
-
-We interpolate on SO(3) x R^3 (rotation geodesic, translation straight line) rather than on
-SE(3) (the screw-motion exp, which couples them). Both are geodesics; the decoupled one keeps
-`tx,ty,tz` literally "millimetres of translation" at every t, which is what the motion
-estimator's bounds, smoothness penalty and reported RMSE all assume.
-
-HOW MOTION ENTERS THE FORWARD MODEL
------------------------------------
-The volume is never warped. The per-view rigid transform is right-multiplied into the nominal
-projection matrix, exactly as in the 2D code (`P_nominal @ T_obj`) and in AI_Geocal
-(`E = E0 @ T_obj`; `P = K @ E`):
-
-    P_moved[v] = P_nom[v] @ T(theta[v])          (V,3,4) @ (V,4,4) -> (V,3,4)
-
-Because T right-multiplies, it acts in OBJECT space: `P T x` projects the point x after the
-object has been moved by T. So theta is patient motion (equivalently, inverse gantry motion),
-and the pivot is wherever the world origin is.
-
-    PIVOT. The projector puts the world origin at the VOLUME CENTRE (`X0 = -0.5*W*dx`, and
-    likewise y, z -- see projector_3d.forward_project_3d_batched). So rotation is about the
-    volume centre for free, and AI_Geocal's explicit pivot correction `t_eff = tp + c - R c`
-    reduces to `t_eff = tp` here (c = 0). If you ever move the world box off-centre, this file
-    is where that assumption breaks.
-
-Keeping the motion in the geometry (rather than warping the volume) is what makes the whole
-project cheap: a motion update is a (V,4,4) matmul, not V volume resamplings, and
-d(sinogram)/d(theta) flows analytically through the projector's ray recovery from P.
+trans_mm and rot_deg denote full control-point sampling widths: Akima nodes
+are drawn within +/- amplitude/2 before trajectory zero-centering. These are
+not bounds on the realized peak-to-peak trajectory after interpolation.
 """
 
 from __future__ import annotations

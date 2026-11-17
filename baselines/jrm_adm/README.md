@@ -1,18 +1,12 @@
-# JRM-ADM baseline adapter
+# JRM-ADM on the shared CQ500 cohort
 
-Use [the authors' JRM-ADM repository](https://github.com/antoinedepaepe/jrm-adm) at commit
-`4552c7123aaa38848d75071eb0e0028b0206e052` and its separate environment/dependencies.
-This directory contains our dataset/training adapters, not vendored upstream solver code.
+Use [JRM-ADM](https://github.com/antoinedepaepe/jrm-adm) commit
+`4552c7123aaa38848d75071eb0e0028b0206e052` in its own environment, following the
+upstream instructions for `carterbox-torch-radon` and Python dependencies.
+This directory supplies our CQ500 export/training/solver adapters; the upstream
+sampler, optimizers and network are obtained from that pinned checkout.
 
-The current manuscript's archived baseline is the retrained **300,000-iteration** prior
-(AdamW, batch 1, learning rate 10⁻⁴, EMA 0.999, seed 0, fp32, no augmentation),
-224³ reconstruction, 360 views, angle batch 36, gamma **33000**, with a z-flip around prior
-calls. This identifies the evaluated baseline; it does not claim to reproduce every training
-choice of the original JRM-ADM paper. Later fine-tuning and released-weight diagnostics are
-separate experiments.
-
-From this repository root, clone upstream, install its dependencies in a separate environment,
-and copy our adapters:
+From this repository root:
 
 ```bash
 git clone https://github.com/antoinedepaepe/jrm-adm refs/jrm-adm
@@ -20,7 +14,7 @@ git -C refs/jrm-adm checkout 4552c7123aaa38848d75071eb0e0028b0206e052
 cp baselines/jrm_adm/{run_on_ours.py,run_cohort.sh,train_w3dm.py} refs/jrm-adm/
 ```
 
-Export training volumes and the shared test measurements using the **flow-matching environment**:
+Export with the **flow-matching environment**:
 
 ```bash
 python scripts/export_w3dm_train.py --root data/CQ500 --split train \
@@ -30,11 +24,12 @@ python scripts/export_cohort_for_jrm.py --root data/CQ500 \
     --out refs/jrm-adm/data/ours_cohort
 ```
 
-The training exporter preserves our original vertex-anchored 160×192×192 crop and superior-first
-orientation in raw HU. The measurement exporter carries the paired ground-truth poses for
-verification; the solvers do not receive them as estimates.
+Training exports are the original vertex-anchored 160×192×192 crops in raw HU,
+with superior-first orientation. Test exports preserve the shared measurements and
+motion trajectories; ground-truth poses are carried for scoring and are not passed
+to the motion optimizer as estimates.
 
-In the **JRM environment**, from `refs/jrm-adm`:
+In the **JRM environment**, run from `refs/jrm-adm`:
 
 ```bash
 python train_w3dm.py --data data/train_volumes --out weights_retrain \
@@ -42,12 +37,17 @@ python train_w3dm.py --data data/train_volumes --out weights_retrain \
 MODEL_PATH=weights_retrain/model_state_dict.pth CUDA_VISIBLE_DEVICES=0 bash run_cohort.sh
 ```
 
-`MODEL_PATH` is required, so the run cannot silently fall back to the authors' released prior.
-`PYTHON`, `CASE_DIR` and `RESULT_DIR` can override the interpreter and directories. Existing
-case results are preserved; choose a fresh `RESULT_DIR` for another configuration.
+These commands train in fp32 without augmentation and run the 100-step sampler on
+224³ volumes, with angle batches of 36, gamma 33000 and a z-flip around prior calls.
+`MODEL_PATH` explicitly selects the retrained EMA weights. `PYTHON`, `CASE_DIR` and
+`RESULT_DIR` override the interpreter or directories. The driver stops if a result
+already exists; use a fresh `RESULT_DIR` for another run.
 
-Back in this repository root and the **flow-matching environment**, score with the shared
-operator/metric convention:
+New runs record an inference seed of `1000+i` per case. The archived comparison did
+not record its random image-initialization seed; matching the protocol does not
+promise bitwise reproduction of those archived volumes.
+
+Back at this repository root, in the **flow-matching environment**:
 
 ```bash
 python scripts/score_jrm_native.py --root data/CQ500 \
@@ -55,8 +55,7 @@ python scripts/score_jrm_native.py --root data/CQ500 \
     --jrm refs/jrm-adm/data/recon_ours_v2 --out data/jrm_scores.json
 ```
 
-This reports both the native refined output and FDK at the recovered poses. It converts the
-baseline's attenuation scale and affine-motion convention, checks paired trajectories, and
-scores with the same measured-FOV mask. Use a fresh scores filename for a different experiment.
-[PROVENANCE.md](PROVENANCE.md) preserves earlier adaptation notes; this guide specifies the
-current manuscript cohort.
+Set `--ours` to your proposed-method cohort directory. The scorer checks paired
+trajectories, converts the attenuation scale and affine-motion convention, and
+reports the native output and FDK at the recovered poses under the common
+measured-FOV metric. [PROVENANCE.md](PROVENANCE.md) lists the adaptation details.

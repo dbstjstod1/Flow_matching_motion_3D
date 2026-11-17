@@ -1,4 +1,4 @@
-"""Body-ROI PSNR/SSIM over the test30 cohort (user request, 2026-08-21).
+"""Common measured-FOV and supplementary body-ROI scores for CQ500 outputs.
 
     python scripts/roi_body_metrics.py [--tags p16,p14] [--n 30] [--out data/roi_body_metrics.json]
 
@@ -10,7 +10,8 @@ intersected with the measured region.
 
 The ALIGNMENT is unchanged (mask=measured region, iters=200 -- the loop's own convention), so
 this changes only WHERE the score is read, not the gauge fit. Volumes scored: the four
-x_t-class deliverables (ours / linear bridge / W3DM loop / Thies output / native JRM-ADM).
+x_t-class deliverables (geometry / image-linear / autofocus / JRM-ADM).
+The manuscript uses psnr_meas and ssim_meas, not the supplementary body scores.
 """
 from __future__ import annotations
 
@@ -28,9 +29,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fm3d.reg_metric import aligned_metrics, psnr, ssim   # noqa: E402
 
 CKPT = "logs/fm3d_databridge/ckpt_iter500000.pth"
-ARMS = [("fm", "data/fm3d_test30_databridge"), ("linear", "data/linbridge_test30"),
-        ("w3dm", "data/w3dm_test30"), ("thies", "data/bench_thies_test30"),
-        ("jrm", "refs/jrm-adm/data/recon_ours_v2")]      # native JRM-ADM (added 2026-09-07)
 JRM_MU_RATIO = 0.02 / 0.0193          # their mu_water -> ours, as in score_jrm_native.py
 
 
@@ -64,9 +62,10 @@ def main():
     ap.add_argument("--out", default="data/roi_body_metrics.json")
     ap.add_argument("--root", default=None)
     ap.add_argument("--ckpt", default=CKPT)
-    ap.add_argument("--arm", action="append", help="NAME=DIRECTORY; repeat to select output cohorts")
+    ap.add_argument("--arm", action="append", required=True,
+                    help="NAME=DIRECTORY; repeat to select output cohorts")
     a = ap.parse_args()
-    arms = [tuple(item.split("=", 1)) for item in a.arm] if a.arm else ARMS
+    arms = [tuple(item.split("=", 1)) for item in a.arm]
     if any(len(item) != 2 for item in arms):
         ap.error("--arm requires NAME=DIRECTORY")
     tags = a.tags.split(",") if a.tags else [f"p{i:02d}" for i in range(a.n)]
@@ -100,22 +99,12 @@ def main():
     print("wrote", a.out)
 
     if len(rows) > 1:
-        print("\n== cohort summary (body ROI, aligned) ==")
+        print("\n== paper cohort summary (measured FOV, aligned; population SD) ==")
         for name, _ in arms:
-            p = np.array([r[name]["psnr_body"] for r in rows])
-            s = np.array([r[name]["ssim_body"] for r in rows])
-            print(f"  {name:7s} PSNR {p.mean():6.2f} +- {p.std(ddof=1):.2f}   "
-                  f"SSIM {s.mean():.4f} +- {s.std(ddof=1):.4f}")
-        try:
-            from scipy.stats import wilcoxon
-            for name, _ in arms[1:]:
-                dp = np.array([r["fm"]["psnr_body"] - r[name]["psnr_body"] for r in rows])
-                ds = np.array([r["fm"]["ssim_body"] - r[name]["ssim_body"] for r in rows])
-                print(f"  fm vs {name:7s} dPSNR {dp.mean():+.2f} (win {(dp > 0).sum()}/"
-                      f"{len(dp)}, p={wilcoxon(dp)[1]:.2g})   dSSIM {ds.mean():+.4f} "
-                      f"(win {(ds > 0).sum()}/{len(ds)}, p={wilcoxon(ds)[1]:.2g})")
-        except Exception:
-            pass
+            p = np.array([r[name]["psnr_meas"] for r in rows])
+            s = np.array([r[name]["ssim_meas"] for r in rows])
+            print(f"  {name:7s} PSNR {p.mean():6.2f} +- {p.std(ddof=0):.2f}   "
+                  f"SSIM {s.mean():.4f} +- {s.std(ddof=0):.4f}")
 
 
 if __name__ == "__main__":

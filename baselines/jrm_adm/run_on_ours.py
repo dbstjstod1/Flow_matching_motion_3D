@@ -1,22 +1,12 @@
-"""Run the JRM-ADM solver on OUR cohort measurements (A2c stage 2, 2026-08-17). OURS, not
-upstream -- a re-plumbed run_jrm_adm.py that swaps their simulated demo data for the exchange
-files scripts/export_cohort_for_jrm.py writes, keeping their SOLVER STACK byte-identical
-(sampler, optimizers, motion model, wavelet prior; the hardcoded lr/gamma schedule included).
+"""Run the released JRM-ADM solver on exported, paired CQ500 measurements.
 
-Protocol deltas vs their paper, all stated:
-  * measurements = OUR full-view protocol (360 views, 500x700 @ 0.64 mm detector, noiseless,
-    Akima 10/10 p2p motion, test30 cohort) -- the whole point of the port;
-  * angles come from the exchange file (= our betas + 90 deg, the measured operator bridge);
-  * the prior = weights_retrain/model_state_dict.pth, retrained on OUR train split (config
-    model_path, switched 2026-08-17);
-  * recon grid stays THEIR 160x192x192 @ 1 mm (the retrained prior's native grid); our head
-    fits the 192 mm in-plane FOV per the export-crop measurements;
-  * angle_batch_size scales the WLS chunking to 360 views (20 -> 36 divides 360).
+Copy this adapter into the pinned upstream checkout and use run_cohort.sh for the
+paper configuration: 224-cubed reconstruction, angle batches of 36, gamma 33000,
+retrained prior and prior z-flip. The upstream sampler and optimizers are unchanged.
+Ground-truth poses travel through the result only for pairing and evaluation.
 
-result.pt per patient: x_est (attenuation, their grid/frame), thetas_est, theta_true (copied
-through for the cmp pairing assertion), runtime.
-
-    cd refs/jrm-adm && python run_on_ours.py --case data/ours_cohort/p00.pt --out data/recon_ours
+New runs record an explicit random initialization seed. The archived comparison
+did not record this seed; this adapter does not promise bitwise archived results.
 """
 import argparse
 import os
@@ -61,8 +51,13 @@ def main():
                          "anatomy without touching the data term.")
     ap.add_argument("--model_path", default=None,
                     help="override config model_path (control runs with their RELEASED weights)")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="seed for model/initial-image RNG; cohort driver uses 1000 + case index")
     args = ap.parse_args()
 
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     cfg = load_yaml("config/adm_jrm.yaml")
     device = torch.device(cfg["common"]["device"])
     run_cfg, dcfg = cfg["adm_jrm"], cfg["diffusion"]
@@ -143,7 +138,8 @@ def main():
                 "model_path": run_cfg["model_path"], "case": args.case,
                 "port_args": {"vol": vol_size, "gamma": gamma,
                               "prior_zflip": bool(args.prior_zflip),
-                              "angle_batch": args.angle_batch}}, out_p)
+                              "angle_batch": args.angle_batch,
+                              "seed": args.seed}}, out_p)
     print(f"{tag}: done in {dt / 60:.1f} min -> {out_p}")
 
 

@@ -4,8 +4,8 @@
 Per Euler step k of N (t = k/N), starting cold from x = FDK(y, P_nom) and theta_hat = 0:
 
     1. PREDICT   x_pred = x + dt * v_phi(x, t)              frozen flow-matching prior, patch-blended
-    2. ESTIMATE  theta_hat = argmin ||A_theta x_pred - y||    Akima spline coefficients,
-                                                              warm-started GD, --per iterations
+    2. ESTIMATE  theta_hat = argmin ||A_theta x_pred - y||    16-level Hash-INR,
+                                                              persistent Adam, --per iterations
     3. CORRECT   z = CG(theta_hat, y; warm start x_pred)      --cg_iters conjugate-gradient iterations
                  z = z + kappa * (D_TV(z) - z)                relaxed TV update
     4. x = z
@@ -244,13 +244,12 @@ def main():
     ap.add_argument("--n_steps", type=int, default=50, help="learned Euler updates (N)")
     ap.add_argument("--per", type=int, default=200,
                     help="pose-fitting iterations per outer step")
-    ap.add_argument("--loss", default="l2",
-                    help="projection-domain data term of the estimator: l2 | l2si | lncc | ncc")
-    ap.add_argument("--estimator", default="akima_gd",
-                    choices=["akima_gd", "bspline_rmsprop", "net"],
-                    help="paper: akima_gd; pose ablation: bspline_rmsprop; legacy: net")
+    ap.add_argument("--loss", default="l2", choices=["l2"],
+                    help="mean squared projection residual (paper objective)")
+    ap.add_argument("--estimator", default="net", choices=["net"],
+                    help="16-level Hash-INR with a 4 x 64 ReLU MLP")
     ap.add_argument("--lr", type=float, default=None,
-                    help="pose step size; defaults: Akima 1000, B-spline .001, legacy net .003")
+                    help="Adam learning rate for the scan-specific pose network (default: .003)")
     ap.add_argument("--views_per_iter", type=int, default=24,
                     help="random views per estimator iteration (stochastic view subsampling)")
     ap.add_argument("--est_coarse", type=int, default=2,
@@ -291,6 +290,10 @@ def main():
         raise SystemExit("--blend uniform needs --patch_offsets >= 2 (a single non-overlapping "
                          "pass leaves tile seams)")
 
+    from fm3d.motion_net import HAVE_TCNN
+    if not HAVE_TCNN:
+        raise SystemExit("The paper protocol requires tiny-cuda-nn. Install its PyTorch "
+                         "bindings as described in README.md before inference.")
     dev = "cuda"
     os.makedirs(args.out, exist_ok=True)
     # The estimator draws its network init and its per-iteration view subset from the global
@@ -328,11 +331,10 @@ def main():
     gt3, theta_true = world["gt3"], world["theta_true"]
     y, static_fdk = world["y"], world["static_fdk"]
 
-    # Spline coefficients persist across outer updates and the grid transition.
-    default_lr = {"akima_gd": 1000.0, "bspline_rmsprop": 0.001, "net": 0.003}
+    # Network weights and Adam moments persist across outer updates and grid changes.
     est_kw = dict(dx=gen.dx, dy=gen.dy, dz=gen.dz, loss=args.loss,
                   views_per_iter=args.views_per_iter,
-                  lr=default_lr[args.estimator] if args.lr is None else args.lr)
+                  lr=0.003 if args.lr is None else args.lr)
     print(f"estimator: {args.estimator}, lr={est_kw['lr']} "
           f"views/iter={args.views_per_iter} loss={args.loss}")
 

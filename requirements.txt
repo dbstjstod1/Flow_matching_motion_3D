@@ -1,17 +1,17 @@
-# Tested versions (Python 3.11, CUDA 12.8). torch must match your CUDA toolkit.
+# Inspected environment: Python 3.11, PyTorch CUDA 12.8.
+# Install the CUDA-enabled PyTorch wheel before this file (see README).
 torch==2.8.0
 triton==3.4.0
-numpy>=2.0
-scipy>=1.14
-SimpleITK>=2.4
-matplotlib>=3.9
-tensorboard>=2.17
+numpy==2.4.4
+scipy==1.17.1
+SimpleITK==2.5.5
+matplotlib==3.11.0
+tensorboard==2.20.0
 
-# Not pip-installable from PyPI as used here -- see README "Setup":
-#   tiny-cuda-nn (OPTIONAL, legacy --estimator net only; not needed by the paper):
-#       pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
-#   LEAP (the projector), built from source with third_party/leap/leap_joseph_pin.patch applied.
-
-# Learned-autofocus baseline only (bench/thies): the authors' numba-cuda backprojector.
-# numba>=0.60
-# numba-cuda
+# Required separately for the paper's Hash-INR backend:
+# python -m pip install --no-build-isolation \
+#   'git+https://github.com/NVlabs/tiny-cuda-nn.git@v2.0#subdirectory=bindings/torch'
+# The pure-PyTorch fallback is for development, not the reported Hash-INR results.
+# LEAP requires a source build; see third_party/leap/FM3D_PATCH.md.
+# Autofocus additionally needs numba-cuda; JRM-ADM uses a separate environment.
+# See docs/baselines.md for those optional comparison methods.

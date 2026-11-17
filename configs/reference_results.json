@@ -1,46 +1,408 @@
 {
-  "psnr": {
-    "mean": 37.12106107076009,
-    "sd": 1.6485327301513544
+  "protocol": "cq500-hash-inr-20261117",
+  "n": 30,
+  "sd_ddof": 0,
+  "source_audit_sha256": "a7a53f2f81380ce5654dbd1fd4a1bc28a71936247facc21073e1d3e1cec92ab3",
+  "metric_convention": "Rigidly aligned final-iterate and estimated-pose FDK PSNR/SSIM against CT in the measured FOV, in attenuation units. RPE is detector millimeters after a ground-truth-independent zero-mean pose transform. Component MAE uses millimeters and degrees.",
+  "test_cases": [
+    {
+      "index": 0,
+      "cq500_patient_id": 283,
+      "seed": 1000
+    },
+    {
+      "index": 1,
+      "cq500_patient_id": 284,
+      "seed": 1001
+    },
+    {
+      "index": 2,
+      "cq500_patient_id": 285,
+      "seed": 1002
+    },
+    {
+      "index": 3,
+      "cq500_patient_id": 286,
+      "seed": 1003
+    },
+    {
+      "index": 4,
+      "cq500_patient_id": 287,
+      "seed": 1004
+    },
+    {
+      "index": 5,
+      "cq500_patient_id": 289,
+      "seed": 1005
+    },
+    {
+      "index": 6,
+      "cq500_patient_id": 290,
+      "seed": 1006
+    },
+    {
+      "index": 7,
+      "cq500_patient_id": 291,
+      "seed": 1007
+    },
+    {
+      "index": 8,
+      "cq500_patient_id": 292,
+      "seed": 1008
+    },
+    {
+      "index": 9,
+      "cq500_patient_id": 293,
+      "seed": 1009
+    },
+    {
+      "index": 10,
+      "cq500_patient_id": 294,
+      "seed": 1010
+    },
+    {
+      "index": 11,
+      "cq500_patient_id": 299,
+      "seed": 1011
+    },
+    {
+      "index": 12,
+      "cq500_patient_id": 300,
+      "seed": 1012
+    },
+    {
+      "index": 13,
+      "cq500_patient_id": 301,
+      "seed": 1013
+    },
+    {
+      "index": 14,
+      "cq500_patient_id": 302,
+      "seed": 1014
+    },
+    {
+      "index": 15,
+      "cq500_patient_id": 303,
+      "seed": 1015
+    },
+    {
+      "index": 16,
+      "cq500_patient_id": 305,
+      "seed": 1016
+    },
+    {
+      "index": 17,
+      "cq500_patient_id": 308,
+      "seed": 1017
+    },
+    {
+      "index": 18,
+      "cq500_patient_id": 309,
+      "seed": 1018
+    },
+    {
+      "index": 19,
+      "cq500_patient_id": 310,
+      "seed": 1019
+    },
+    {
+      "index": 20,
+      "cq500_patient_id": 311,
+      "seed": 1020
+    },
+    {
+      "index": 21,
+      "cq500_patient_id": 312,
+      "seed": 1021
+    },
+    {
+      "index": 22,
+      "cq500_patient_id": 314,
+      "seed": 1022
+    },
+    {
+      "index": 23,
+      "cq500_patient_id": 316,
+      "seed": 1023
+    },
+    {
+      "index": 24,
+      "cq500_patient_id": 318,
+      "seed": 1024
+    },
+    {
+      "index": 25,
+      "cq500_patient_id": 319,
+      "seed": 1025
+    },
+    {
+      "index": 26,
+      "cq500_patient_id": 320,
+      "seed": 1026
+    },
+    {
+      "index": 27,
+      "cq500_patient_id": 321,
+      "seed": 1027
+    },
+    {
+      "index": 28,
+      "cq500_patient_id": 323,
+      "seed": 1028
+    },
+    {
+      "index": 29,
+      "cq500_patient_id": 324,
+      "seed": 1029
+    }
+  ],
+  "arms": {
+    "geometry": {
+      "summary": {
+        "psnr": {
+          "mean": 36.6629275004069,
+          "sd": 1.584226968965229
+        },
+        "ssim": {
+          "mean": 0.9783794482549032,
+          "sd": 0.008344590487937766
+        },
+        "fdk_psnr": {
+          "mean": 31.799941889444987,
+          "sd": 0.7621196621531855
+        },
+        "fdk_ssim": {
+          "mean": 0.7532357255617778,
+          "sd": 0.0315873914299852
+        },
+        "rpe_mm": {
+          "mean": 0.27591568042964015,
+          "sd": 0.08579878636053587
+        },
+        "tx_mae_mm": {
+          "mean": 0.787492711168845,
+          "sd": 0.6601080354979614
+        },
+        "ty_mae_mm": {
+          "mean": 0.7754307741694646,
+          "sd": 0.636404776470291
+        },
+        "tz_mae_mm": {
+          "mean": 0.029246099826470216,
+          "sd": 0.011516031880722127
+        },
+        "rx_mae_deg": {
+          "mean": 0.03698362920640799,
+          "sd": 0.013691430782795078
+        },
+        "ry_mae_deg": {
+          "mean": 0.040283877255068386,
+          "sd": 0.011211642738499315
+        },
+        "rz_mae_deg": {
+          "mean": 0.22891685426588143,
+          "sd": 0.091116878668949
+        }
+      },
+      "first_update_mean_rpe_at_most_0_5_mm": 30
+    },
+    "linear": {
+      "summary": {
+        "psnr": {
+          "mean": 35.28725293477376,
+          "sd": 2.2778483281432234
+        },
+        "ssim": {
+          "mean": 0.9664722164471944,
+          "sd": 0.014569788474751589
+        },
+        "fdk_psnr": {
+          "mean": 31.33665548960368,
+          "sd": 1.0066503603182797
+        },
+        "fdk_ssim": {
+          "mean": 0.7475487450758617,
+          "sd": 0.032446079213839345
+        },
+        "rpe_mm": {
+          "mean": 0.41450201374681783,
+          "sd": 0.16697219432361526
+        },
+        "tx_mae_mm": {
+          "mean": 0.7121107056298055,
+          "sd": 0.7014477700294782
+        },
+        "ty_mae_mm": {
+          "mean": 0.6906728954482,
+          "sd": 0.6893051147970926
+        },
+        "tz_mae_mm": {
+          "mean": 0.03564913087538899,
+          "sd": 0.01916144419553995
+        },
+        "rx_mae_deg": {
+          "mean": 0.044210782122094824,
+          "sd": 0.0205411306326637
+        },
+        "ry_mae_deg": {
+          "mean": 0.051209171690151746,
+          "sd": 0.02094500160168399
+        },
+        "rz_mae_deg": {
+          "mean": 0.39607515559875434,
+          "sd": 0.1869335936013722
+        }
+      },
+      "first_update_mean_rpe_at_most_0_5_mm": 39
+    }
   },
-  "ssim": {
-    "mean": 0.9795855422814687,
-    "sd": 0.009641625235719074
+  "comparators": {
+    "autofocus": {
+      "psnr": {
+        "mean": 29.217752520243327,
+        "sd": 1.0891215538531132
+      },
+      "ssim": {
+        "mean": 0.7268952151139577,
+        "sd": 0.03150000803733981
+      },
+      "rpe_mm": {
+        "mean": 2.2593245388113496,
+        "sd": 0.5147043679231867
+      },
+      "tx_mae_mm": {
+        "mean": 1.2989716667427367,
+        "sd": 0.31877632673897327
+      },
+      "ty_mae_mm": {
+        "mean": 1.3348966868297638,
+        "sd": 0.29627345910292574
+      },
+      "tz_mae_mm": {
+        "mean": 0.35603255323017435,
+        "sd": 0.21078447560359798
+      },
+      "rx_mae_deg": {
+        "mean": 0.9471136331415263,
+        "sd": 0.2886787850735199
+      },
+      "ry_mae_deg": {
+        "mean": 0.982180468841866,
+        "sd": 0.3222991620735475
+      },
+      "rz_mae_deg": {
+        "mean": 1.0901346394961335,
+        "sd": 0.41435342353932797
+      }
+    },
+    "jrm": {
+      "psnr": {
+        "mean": 29.642180760701496,
+        "sd": 2.636798148634638
+      },
+      "ssim": {
+        "mean": 0.9119573771953583,
+        "sd": 0.03845567208845661
+      },
+      "fdk_psnr": {
+        "mean": 29.451966985066733,
+        "sd": 1.6171840006462517
+      },
+      "fdk_ssim": {
+        "mean": 0.7149573544661204,
+        "sd": 0.04444021873930504
+      },
+      "rpe_mm": {
+        "mean": 0.8400201368246619,
+        "sd": 0.552658832499295
+      },
+      "tx_mae_mm": {
+        "mean": 2.1739576064405894,
+        "sd": 0.9701873124229954
+      },
+      "ty_mae_mm": {
+        "mean": 1.9694325599956832,
+        "sd": 1.0746178143383054
+      },
+      "tz_mae_mm": {
+        "mean": 0.05574640977340635,
+        "sd": 0.03835718036687225
+      },
+      "rx_mae_deg": {
+        "mean": 0.08849749672646644,
+        "sd": 0.07648815712816341
+      },
+      "ry_mae_deg": {
+        "mean": 0.07103187287558256,
+        "sd": 0.06869235971981812
+      },
+      "rz_mae_deg": {
+        "mean": 0.6818854346261478,
+        "sd": 0.6668003973031639
+      }
+    },
+    "uncorrected": {
+      "psnr": {
+        "mean": 23.288402366638184,
+        "sd": 0.9177937182330261
+      },
+      "ssim": {
+        "mean": 0.5458193997542063,
+        "sd": 0.034880069504570656
+      },
+      "rpe_mm": {
+        "mean": 6.122402528990338,
+        "sd": 0.6435194790027032
+      },
+      "tx_mae_mm": {
+        "mean": 1.9319119481690896,
+        "sd": 0.43691852198642284
+      },
+      "ty_mae_mm": {
+        "mean": 2.0781173833432187,
+        "sd": 0.42077748244942775
+      },
+      "tz_mae_mm": {
+        "mean": 1.945745905609244,
+        "sd": 0.3985388343802051
+      },
+      "rx_mae_deg": {
+        "mean": 2.0116991615745543,
+        "sd": 0.3357972848398655
+      },
+      "ry_mae_deg": {
+        "mean": 1.9001845169040774,
+        "sd": 0.4016259667563853
+      },
+      "rz_mae_deg": {
+        "mean": 2.165081755824284,
+        "sd": 0.41330397719255146
+      }
+    }
   },
-  "fdk_psnr": {
-    "mean": 31.933850479125976,
-    "sd": 0.8894850296652625
+  "bridge_comparison": {
+    "psnr": {
+      "geometry_minus_linear": 1.375674565633138,
+      "sd_difference": 1.6951717090970753,
+      "geometry_wins": 23,
+      "ties": 0
+    },
+    "ssim": {
+      "geometry_minus_linear": 0.011907231807708741,
+      "sd_difference": 0.010858934128415654,
+      "geometry_wins": 27,
+      "ties": 0
+    },
+    "rpe": {
+      "geometry_minus_linear": -0.13858633331717776,
+      "sd_difference": 0.13607005615069812,
+      "geometry_wins": 25,
+      "ties": 0
+    },
+    "rpe_reduction_percent": 33.434417378205474
   },
-  "fdk_ssim": {
-    "mean": 0.7531132956345876,
-    "sd": 0.03246514194107485
-  },
-  "rpe_mm": {
-    "mean": 0.2679147911672178,
-    "sd": 0.0895136236309252
-  },
-  "tx_mae_mm": {
-    "mean": 0.6238219871854102,
-    "sd": 0.45274913386937354
-  },
-  "ty_mae_mm": {
-    "mean": 0.613912776887695,
-    "sd": 0.43708988016395267
-  },
-  "tz_mae_mm": {
-    "mean": 0.020279123425225472,
-    "sd": 0.007006027921888128
-  },
-  "rx_mae_deg": {
-    "mean": 0.0257737419363682,
-    "sd": 0.008132149880037597
-  },
-  "ry_mae_deg": {
-    "mean": 0.028711402922087893,
-    "sd": 0.008493873527045333
-  },
-  "rz_mae_deg": {
-    "mean": 0.25573334193974395,
-    "sd": 0.12458878753116039
+  "runtime": {
+    "geometry_mean_minutes": 9.04388888888889,
+    "scope": "Historical total per-patient process time including initialization, reconstruction, evaluation and output on RTX A6000. GPU exclusivity was not recorded."
   }
 }

@@ -1,21 +1,10 @@
-"""Coordinate networks over the view index: v -> theta(v) in R^6.
+"""Hash-encoded view coordinates mapped to per-view 6-DoF rigid motion.
 
-Ported from the 2D project's `MotionNetHash3DoF`, which was itself a port of AI_Geocal's
-`MotionNetHash_9DoF`. The only structural change is the head width (3 -> 6) and the bounds.
-
-WHY A NETWORK AT ALL, AND WHY A BAND-LIMITED ONE. Free per-view parameters have V*6 degrees of
-freedom against V projections, so nothing but a prior stops the fit from putting a different
-rigid pose on every view and explaining the data with jitter. AI_Geocal's answer is exactly this
-net: the hash grid + MLP is a low-capacity continuous function of the normalized view coordinate,
-so smoothness is structural rather than a penalty term (it carries no explicit smoothness loss).
-
-DEFAULTS ARE THE DEPLOYED FULLBAND ONES (stock Instant-NGP 16/16/1.5, as in AI_Geocal), paired
-with lr 3e-3 downstream. The 2D project's band-limited preset ("hashbl", 4/2/2.0 -- a 16-cell
-finest grid) was this file's default until 2026-08-07, when the preset and its `--est_band`
-switch were REMOVED (user's call): the 3D oracle sweep showed bandwidth x lr is ONE knob and
-fullband @ small lr beats hashbl @ its own lr 5x (rot 0.035 vs 0.173 deg at equal cost), and it
-transferred in-loop. The knobs stay exposed so any band limit can be re-tuned when the real
-scan's view count and motion bandwidth are known; git history has the preset.
+The paper uses 16 levels, base resolution 16, scale 1.5, two features per level,
+a 2^15-entry cap, and a 4x64 ReLU MLP. A zero-initialized output head and tanh
+bounds give zero starting motion and limits of 15 mm / 8 degrees per component.
+The evaluated implementation uses tiny-cuda-nn; the PyTorch fallback is for
+development and is not numerically equivalent to that implementation.
 """
 
 from __future__ import annotations

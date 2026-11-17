@@ -1,39 +1,11 @@
-"""6-DoF rigid motion estimation by differentiating the cone-beam forward model.
+"""Scan-specific Hash-INR fitting for the CQ500 reconstruction loop.
 
-    theta_hat = argmin_theta  L( A(x; P_nom @ T(theta)),  y_measured )
+The 16-level hash grid and 4 x 64 ReLU MLP predict one bounded 6-DoF pose
+per view. Adam weights and moments persist across image updates and the
+coarse-to-fine grid transition. The paper objective is the unnormalized mean
+squared projection residual, with no explicit trajectory penalty.
 
-`x` is the current image estimate (which, inside the posterior loop, is itself still improving),
-`y` is the measured cone-beam data, and the gradient flows analytically through the projector's
-recovery of the rays from P. See `rigid_motion.py` for how theta enters P.
-
-The paper uses Akima + GD, with B-spline + RMSprop as an ablation (spline_motion.py).
-Legacy estimators remain available. All share the following contract:
-
-    est.refine_global(image, y_meas, iters, prox_anchor=None, prox_lam=0.0) -> float   # last loss
-    est.current_params() -> (V, 6)
-    est.render_sinogram(image) -> (V, nv, nu)
-
-They differ only in how theta is parameterized, i.e. in what stops the fit from putting an
-independent rigid pose on every view:
-
-    direct   raw (V,6), Adam. No structure at all -- the baseline, and the thing the other two
-             have to beat. Its parameters and Adam moments PERSIST across calls, which is what
-             gives warm-start continuity down the posterior loop's ODE.
-    basis    theta = B @ c with B a cubic B-spline basis over the view axis. Band limit is
-             explicit (n_ctrl control points) and the waveform is not assumed -- unlike a Fourier
-             basis, which on a sinusoidal simulation is handed the answer and scores beautifully
-             for the wrong reason.
-    net      MotionNet6DoF, the AI_Geocal architecture, at the deployed FULLBAND settings
-             (stock NGP 16/16/1.5, lr 3e-3; the 2D-era band-limited "hashbl" preset was removed
-             2026-08-07 -- bandwidth and lr are ONE knob, see motion_net.py).
-
-NOTE ON THE PROJECTOR. Motion estimation needs d(loss)/dP. The forward is LEAP's modular-beam
-projector, PINNED to its Joseph kernel (`leap_projector._model` -> `set_forceJosephModular`;
-no backend switch and no kernel switch), and the geometry gradient is the EXACT gradient of it
-(`triton_leap_grad.leap_grad_P`). Because Joseph is bilinear in continuous coordinates the
-exact gradient is also the loss TREND -- the pin removed the SF lattice ripple that used to
-force a surrogate. Gated by `scripts/gate_leap_projector.py` (FD of the LEAP loss itself) and
-`gate_geometry` G4a.
+The projector differentiates P_nom @ T(theta); images are not warped.
 """
 
 from __future__ import annotations
@@ -118,39 +90,6 @@ def sinogram_data_loss(pred: torch.Tensor, y: torch.Tensor, kind: str = "l2si", 
         return (pred - y).abs().mean()
     raise ValueError(f"unknown sinogram loss '{kind}'")
 
-
-def bspline_basis(V: int, n_ctrl: int, device, degree: int = 3) -> torch.Tensor:
-    """(V, n_ctrl) uniform cubic B-spline design matrix over the view axis.
-
-    theta = B @ c limits the trajectory's bandwidth to n_ctrl without assuming its SHAPE -- the
-    guardrail against the Fourier basis, which reconstructs a sinusoidal simulation perfectly
-    because the simulation is a sinusoid, and would not survive a cough.
-    """
-    s = torch.linspace(0, 1, V, device=device)
-    t = torch.linspace(0, 1, n_ctrl - degree + 1, device=device)
-    dt = t[1] - t[0]
-    knots = torch.cat([t[:1] - dt * torch.arange(degree, 0, -1, device=device), t,
-                       t[-1:] + dt * torch.arange(1, degree + 1, device=device)])
-
-    def basis(i, k, x):
-        if k == 0:
-            return ((x >= knots[i]) & (x < knots[i + 1])).float()
-        a = torch.zeros_like(x)
-        if knots[i + k] > knots[i]:
-            a = (x - knots[i]) / (knots[i + k] - knots[i]) * basis(i, k - 1, x)
-        b = torch.zeros_like(x)
-        if knots[i + k + 1] > knots[i + 1]:
-            b = (knots[i + k + 1] - x) / (knots[i + k + 1] - knots[i + 1]) * basis(i + 1, k - 1, x)
-        return a + b
-
-    B = torch.stack([basis(i, degree, s) for i in range(n_ctrl)], dim=-1)
-    B[-1] = B[-2]                                    # close the right end (x == 1 falls outside)
-    return B / B.sum(-1, keepdim=True).clamp_min(1e-8)
-
-
-# ======================================================================================
-# estimators
-# ======================================================================================
 
 class _BaseEstimator:
     def __init__(self, cfg, P_nom, u_coords, v_coords, device, *, dx=1.0, dy=1.0, dz=1.0,
@@ -267,36 +206,8 @@ class _BaseEstimator:
         return self._project(image, self._theta())
 
 
-class DirectMotionEstimator(_BaseEstimator):
-    """Free per-view (V,6). No structure; the baseline the others must beat."""
-
-    def __init__(self, *a, lr=0.3, **kw):
-        super().__init__(*a, **kw)
-        self.params = torch.zeros(self.V, 6, device=self.device, requires_grad=True)
-        self.lr0 = lr
-        self._optim = self._make_opt([self.params], lr)
-
-    def _theta(self):
-        return self.params
-
-
-class BasisMotionEstimator(_BaseEstimator):
-    """theta = B @ c, cubic B-spline over the view axis. Explicit band limit, no assumed shape."""
-
-    def __init__(self, *a, n_ctrl=20, lr=0.3, **kw):
-        super().__init__(*a, **kw)
-        self.B = bspline_basis(self.V, n_ctrl, self.device)          # (V, n_ctrl)
-        self.c = torch.zeros(n_ctrl, 6, device=self.device, requires_grad=True)
-        self.lr0 = lr
-        self._optim = self._make_opt([self.c], lr)
-        self.smooth_w = 0.0            # the basis IS the smoothness prior; do not charge twice
-
-    def _theta(self):
-        return self.B @ self.c
-
-
 class NetMotionEstimator(_BaseEstimator):
-    """MotionNet6DoF (AI_Geocal's architecture, band-limited settings). Deployed default in 2D."""
+    """The paper's 16-level Hash-INR and persistent Adam optimizer."""
 
     def __init__(self, *a, lr=3e-3, enc="hash", n_levels=16, base_resolution=16,
                  per_level_scale=1.5, fourier_m=8, trans_max_mm=15.0, rot_max_deg=8.0, **kw):
@@ -314,15 +225,7 @@ class NetMotionEstimator(_BaseEstimator):
         return self.net.all_params(device=self.device)
 
 
-def make_estimator(name: str, cfg, P_nom, u, v, device, **kw) -> _BaseEstimator:
-    n = name.lower()
-    if n in ("akima_gd", "bspline_rmsprop"):
-        from .spline_motion import SplineSchemeEstimator
-        return SplineSchemeEstimator(cfg, P_nom, u, v, device, scheme=n, **kw)
-    if n == "direct":
-        return DirectMotionEstimator(cfg, P_nom, u, v, device, **kw)
-    if n == "basis":
-        return BasisMotionEstimator(cfg, P_nom, u, v, device, **kw)
-    if n in ("net", "mlp"):
-        return NetMotionEstimator(cfg, P_nom, u, v, device, **kw)
-    raise ValueError(f"unknown estimator '{name}' (akima_gd|bspline_rmsprop|direct|basis|net)")
+def make_estimator(name: str, cfg, P_nom, u, v, device, **kw) -> NetMotionEstimator:
+    if name.lower() != "net":
+        raise ValueError(f"unknown estimator {name!r}; the CQ500 paper uses 'net'")
+    return NetMotionEstimator(cfg, P_nom, u, v, device, **kw)

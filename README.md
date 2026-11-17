@@ -1,184 +1,135 @@
 # Geometry-Bridge Flow Matching for Blind Rigid-Motion Correction in Head Cone-Beam CT
 
-Implementation of the manuscript by Sungho Yun and Seungryong Cho (KAIST).
-The current paper configuration uses **Akima splines + gradient descent** for pose fitting,
-with a frozen 3D flow-matching image prior, CG data consistency and relaxed TV updates.
-The earlier hash-MLP estimator remains available as `--estimator net` for legacy experiments.
-
-The geometry bridge learns image changes caused by progressively reducing simulated acquisition
-motion while keeping the source anatomy fixed. Training uses
-`x_t = FDK(A_{(1-t)theta}(x), P_nom)` and analytic forward-projector geometry derivatives
-as velocity targets. During inference, the measured projections stay fixed:
+CQ500 reproduction code for the manuscript by Sungho Yun and Seungryong Cho (KAIST),
+aligned with the **17 November 2026 manuscript**. This release contains the CQ500
+simulation study: a geometry-bridge image prior, **16-level Hash-INR pose estimation**,
+the image-linear training ablation, and the learned-autofocus / JRM-ADM comparisons.
+Acquired clinical CBCT code, data and manuscript editing files are excluded.
 
 ```text
-x = FDK(y, nominal poses); theta = 0
+CQ500 CT → simulated moving projections → uncorrected FDK
 repeat 50 times:
-    x_pred = x + dt * v_phi(x, t)
-    theta  = fit poses to y using x_pred       # 200 Akima + GD steps
-    z      = CG(A_theta, y, start=x_pred)      # 5 iterations, all 360 views
-    x      = z + 0.3 * (TV_denoise(z) - z)
-return x, theta, FDK(y, theta)
+    predict image velocity with the frozen flow-matching prior
+    fit rigid poses with Hash-INR + Adam (200 steps, 24 sampled views)
+    refine the volume with CG (5 iterations) and relaxed TV
+return refined volume, poses, and FDK at the estimated poses
 ```
 
-## Setup
+## Install and prepare CQ500
 
-Tested environment: Linux, Python 3.11, PyTorch 2.8 / CUDA 12.8, Triton 3.4,
-RTX A6000 (48 GB). One GPU runs training or inference.
+Tested with Linux, Python 3.11, PyTorch 2.8 / CUDA 12.8, Triton 3.4 and an
+RTX A6000 (48 GB). Training and reconstruction require an NVIDIA GPU.
 
 ```bash
 pip install -r requirements.txt
+pip install --no-build-isolation \
+    'git+https://github.com/NVlabs/tiny-cuda-nn.git@v2.0#subdirectory=bindings/torch'
 ```
 
-Build [LEAP](https://github.com/LLNL/LEAP) at commit `0c8846f` with the provided Joseph-kernel
-patch; follow [third_party/leap/FM3D_PATCH.md](third_party/leap/FM3D_PATCH.md).
-An unpatched projector is rejected. **tiny-cuda-nn is not required** for the paper's Akima or
-B-spline estimators; it is optional for the legacy hash-MLP.
+Build the pinned, patched **LEAP** projector using
+[the build instructions](third_party/leap/FM3D_PATCH.md). The reported Hash-INR
+uses tiny-cuda-nn; the development fallback does not reproduce its numerical behavior.
 
-Obtain and unpack [CQ500](http://headctstudy.qure.ai/dataset) under `data/CQ500`, then run:
+Unpack [CQ500](http://headctstudy.qure.ai/dataset) under `data/CQ500`, then index it:
 
 ```bash
 python scripts/prep_cq500.py --root data/CQ500
 ```
 
-The paper uses 150 training patients, 50 validation patients and the **first 30** patients of
-the remaining test split after series selection. The new launcher checks the public CQ500 IDs
-and series sizes against [configs/cq500_split.json](configs/cq500_split.json), so an incomplete
-dataset cannot silently shift the evaluated patients. The manifest contains no images or DICOM
-paths. Datasets, checkpoints and generated results are not stored in Git.
+The launcher verifies the public patient IDs and series sizes against
+[the split manifest](configs/cq500_split.json): **150 training, 50 validation, and
+the first 30 held-out patients**. Each test patient uses seed `1000 + patient_index`.
+All methods share the same patient, motion and projection data.
 
-## Reproduce the proposed method
+## Train and reconstruct
 
-All paper settings are explicit in [configs/paper.json](configs/paper.json). Run commands from
-the repository root. Set `CUDA_VISIBLE_DEVICES` to select a GPU. Add `--dry-run` to any launcher
-command to inspect the complete underlying command without loading data or CUDA.
-
-Train the geometry-bridge prior:
+Run from the repository root. [configs/paper.json](configs/paper.json) contains the
+fixed settings. Add `--dry-run` to inspect a command without loading data or CUDA.
+Select a GPU with `CUDA_VISIBLE_DEVICES`.
 
 ```bash
+# Train the geometry-bridge prior (500,000 iterations).
 CUDA_VISIBLE_DEVICES=0 python scripts/reproduce.py train \
     --root data/CQ500 --out logs/fm3d_databridge
-```
 
-Training uses 500,000 iterations, 32³ patches, batch 64, AdamW, cosine learning rate
-10⁻⁴ → 10⁻⁶ and EMA 0.999. Use `ckpt_iter500000.pth` for paper evaluation.
-[configs/checkpoints.json](configs/checkpoints.json) records the hashes of the evaluated
-checkpoints; pretrained weights are not bundled. Training is the provided route to obtain a prior.
-
-Reconstruct one test patient, or the complete paired cohort:
-
-```bash
+# Reconstruct one test patient.
 CUDA_VISIBLE_DEVICES=0 python scripts/reproduce.py infer \
     --root data/CQ500 --ckpt logs/fm3d_databridge/ckpt_iter500000.pth \
-    --patient 0 --out data/test30/p00
+    --patient 0 --out data/test_case/p00
 
+# Reconstruct and summarize the full 30-patient cohort.
 CUDA_VISIBLE_DEVICES=0 python scripts/reproduce.py cohort \
     --root data/CQ500 --ckpt logs/fm3d_databridge/ckpt_iter500000.pth \
     --out data/test30
-
 python scripts/summarize_cohort.py data/test30
 ```
 
-The cohort fixes `(split=test, run=i, seed=1000+i)` for `i=0..29`. Each case records its command,
-source hashes, checkpoint hash and completion status in `launch.json`; progress is in `run.log`.
-A repeated cohort command skips only successful cases with the same launch manifest.
-Incomplete or incompatible outputs are preserved and require a fresh output directory.
-Training checkpoints can be resumed through `scripts/train_fm3d.py --resume` with the same
-training settings; the cohort launcher does not resume a partly reconstructed volume.
+Training uses 32³ patches, global context, batch 64, AdamW, learning rate
+10⁻⁴ → 10⁻⁶, and EMA 0.999. The geometry bridge is selected by `--bridge data`:
+`x_t = FDK(A_{(1-t)theta}(CT), P_nominal)`, with analytic velocity targets.
+Pose fitting uses a 16-level hash encoding, a 4×64 ReLU MLP, Adam at 0.003,
+tanh bounds of ±15 mm / ±8°, and the mean squared projection residual.
 
-The paper reports about **9.1 minutes per patient** on an RTX A6000. Runtime covers the complete
-process; GPU load, compilation and software versions affect it. CUDA atomic reductions can also
-cause small numerical variation even with fixed seeds.
+Checkpoints and patient images are not bundled. Train the priors with the commands
+above; [checkpoint hashes](configs/checkpoints.json) identify the archived weights
+used for the reported results. New training runs can vary numerically across hardware
+and software versions. Each inference case saves `launch.json`, `run.log` and
+`result.pt`; the launcher reuses only completed cases with an identical launch record.
+An interrupted or changed run requires a fresh output directory.
 
-### Outputs and evaluation
+## Image-linear ablation and comparisons
 
-`result.pt` contains:
-
-| Key | Meaning |
-|---|---|
-| `x_t` | Final refined volume (primary output; saved as fp16) |
-| `x_final` | FDK at the estimated poses (saved as fp16) |
-| `theta`, `theta_true` | `(360, 6)` poses: translations in mm, axis–angle rotation vectors in radians |
-| `final_xt`, `final` | Stored full-precision image scores for the final iterate and estimated-pose FDK |
-| `theta_hist` | Pose estimates after each outer update |
-
-Both image outputs are scored against ground-truth CT after rigid alignment, within the measured
-field of view. Metrics use attenuation values, not the display HU window: GT maximum attenuation
-in the mask sets the PSNR peak and SSIM range, with a uniform 7×7×7 SSIM window.
-RPE is measured in detector-plane mm after ground-truth-independent mean-pose removal.
-Estimated-pose FDK applies no learned image update, but its poses were recovered with the prior's aid.
-The motion-free training FDK endpoint and true-pose FDK of the corrupted scan are distinct references.
-
-Motion amplitudes of 10 mm / 10° are **full control-point sampling widths**: nodes are drawn in
-±5 mm / ±5° before zero-centering. They do not guarantee a realized peak-to-peak trajectory range.
-
-Archived 30-patient reference results (mean ± population SD):
-
-| Output | PSNR (dB) | SSIM | RPE (mm) |
-|---|---:|---:|---:|
-| Proposed, final iterate | 37.12 ± 1.65 | 0.980 ± 0.010 | 0.268 ± 0.090 |
-| Proposed, estimated-pose FDK | 31.93 ± 0.89 | 0.753 ± 0.032 | 0.268 ± 0.090 |
-
-These are the manuscript's archived results, not a new training run performed for this release.
-Full-precision reference summaries are in [configs/reference_results.json](configs/reference_results.json).
-
-## Ablations
-
-**Training bridge:** train an image-linear prior with the same endpoints, architecture and budget,
-then use the same inference loop:
+Change only the prior's training bridge; retain the same reconstruction settings:
 
 ```bash
-python scripts/reproduce.py train --bridge linear --root data/CQ500 --out logs/fm3d_linbridge
-python scripts/reproduce.py cohort --bridge linear --root data/CQ500 \
-    --ckpt logs/fm3d_linbridge/ckpt_iter500000.pth --out data/linear_test30
+python scripts/reproduce.py train --bridge linear \
+    --root data/CQ500 --out logs/fm3d_linbridge
+python scripts/reproduce.py cohort --bridge linear \
+    --root data/CQ500 --ckpt logs/fm3d_linbridge/ckpt_iter500000.pth \
+    --out data/linear_test30
 python scripts/summarize_cohort.py data/linear_test30
 ```
 
-**Pose-fitting scheme:** retain the geometry-bridge prior and replace 30-node Akima + GD
-(initial step 1000, decay 0.97 within each fit) with 20-control-point cubic B-splines + RMSprop
-(step 0.001). The spline basis used in the experiment is bundled with its provenance.
+[Comparison instructions](docs/baselines.md) cover learned autofocus and JRM-ADM,
+including training, the common test inputs and evaluation.
 
-```bash
-python scripts/reproduce.py cohort --estimator bspline_rmsprop --root data/CQ500 \
-    --ckpt logs/fm3d_databridge/ckpt_iter500000.pth --out data/bspline_test30
-python scripts/summarize_cohort.py data/bspline_test30
-```
+## Evaluation
 
-Step sizes were selected by minimum mean zero-centered RPE on validation indices 0, 1, 2
-(seeds 2000, 2001, 2002), before test evaluation. For a validation sweep or a modified protocol,
-use `scripts/run_posterior3d.py` directly with explicit `--split val --run ... --seed ... --lr ...`.
-Its default estimator is also Akima + GD.
+`result.pt` stores the refined volume (`x_t`), estimated-pose FDK (`x_final`),
+estimated and true trajectories (`theta`, `theta_true`), and their image scores
+(`final_xt`, `final`). Poses use mm and axis-angle radians. Image scores use
+ground-truth CT after rigid alignment, inside the measured field of view, in
+attenuation units without display-window clipping. RPE is in detector mm after
+ground-truth-independent mean-pose removal. Report the stored image scores:
+saved volumes are fp16, while the scores were evaluated before that conversion.
 
-## Comparison methods
+Archived results on 30 patients (mean ± population SD):
 
-- **Learned autofocus:** `scripts/bench_thies_train_qm.py` and `scripts/bench_thies_estimate.py`.
-  Use `scripts/bench_thies_original.py` with `FM3D_THIES_VENDOR_BP=1` for the original released
-  CUDA kernels used in the manuscript's runtime comparison. See
-  [docs/baselines.md](docs/baselines.md) for commands and metric scope.
-- **JRM-ADM:** the authors' sampler and optimizer stack, with our retrained prior and the common
-  360-view scans. Export/retraining/running/scoring instructions are in
-  [baselines/jrm_adm/README.md](baselines/jrm_adm/README.md).
+| Training bridge / output | PSNR (dB) | SSIM | RPE (mm) |
+|---|---:|---:|---:|
+| Geometry / refined volume | 36.66 ± 1.58 | 0.978 ± 0.008 | 0.276 ± 0.086 |
+| Geometry / estimated-pose FDK | 31.80 ± 0.76 | 0.753 ± 0.032 | 0.276 ± 0.086 |
+| Image-linear / refined volume | 35.29 ± 2.28 | 0.966 ± 0.015 | 0.415 ± 0.167 |
 
-## Code map and checks
+[Reference results](configs/reference_results.json) retain full precision. The original
+geometry cohort averaged about **9.0 minutes per patient**; GPU isolation was not recorded.
+Test motion widths of 10 mm / 10° mean control points sampled in ±5 mm / ±5°
+before zero-centering, rather than realized trajectory extrema.
 
-| Path | Role |
-|---|---|
-| `fm3d/spline_motion.py` | Paper's Akima + GD and B-spline + RMSprop estimators |
-| `fm3d/rigid_motion.py`, `geometry_3d.py` | Motion simulation, acquisition geometry and pose evaluation |
-| `fm3d/leap_projector.py`, `triton_leap_grad.py` | Patched LEAP operator and analytic geometry derivatives |
-| `fm3d/unet_3d.py`, `prior_patch.py` | Velocity network, global context and patch aggregation |
-| `scripts/train_fm3d.py` | Geometry/image-linear bridge training |
-| `scripts/run_posterior3d.py` | Joint reconstruction loop and final image scoring |
-| `scripts/reproduce.py`, `summarize_cohort.py` | Fixed paper protocol, cohort launching and reporting |
+## Checks and code
 
 ```bash
 CUDA_VISIBLE_DEVICES='' python -m unittest discover -s tests -v
-CUDA_VISIBLE_DEVICES='' python scripts/gate_motion_schemes.py
 CUDA_VISIBLE_DEVICES='' python scripts/gate_context_unet.py
 CUDA_VISIBLE_DEVICES='' python scripts/gate_rpe.py
 ```
 
-Operator checks requiring CUDA and patched LEAP: `scripts/gate_geometry.py` and
-`scripts/gate_leap_forward_tangent.py`.
-Checks requiring CQ500: `scripts/gate_bridge_data.py` and `scripts/gate_bridge_linear.py`.
-Third-party code keeps its original licenses and provenance notices. The study uses simulated
-projections from clinical CT volumes; acquired-CBCT validation is outside this release.
+CUDA / patched-LEAP checks: `scripts/gate_geometry.py` and
+`scripts/gate_leap_forward_tangent.py`. With CQ500 installed, also run
+`scripts/gate_bridge_data.py` and `scripts/gate_bridge_linear.py`.
+[Validation scope](docs/release_validation.md) records what was checked for this release.
+
+`fm3d/` contains geometry, motion fitting, projectors, the image network and metrics;
+`scripts/` contains preparation, training, reconstruction and evaluation;
+`configs/` fixes the paper protocol; `bench/` and `baselines/` contain the comparison
+adapters. Third-party source retains its license and provenance notices.

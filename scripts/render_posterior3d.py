@@ -1,32 +1,13 @@
-"""Deferred metric/montage renderer for run_posterior3d's --metric_mode defer.
+"""Render deferred CQ500 reconstruction snapshots and per-step image metrics.
 
-WHY THIS EXISTS (user, 2026-07-25). The per-step metric block -- FDK(theta) + four 150-iter
-gauge fits + the montage PNG -- is ~17 s of GPU work per hit that the POSTERIOR LOOP never
-consumes: it is pure readout for the by-eye judgement. In defer mode the loop drops a snapshot
-(theta + fp16 x_t, ~0.2 s) and keeps going at pure-inference speed; this script turns the
-snapshots into exactly the metrics and montages the inline mode would have produced.
+Rebuilds the scan from snaps/meta.pt using the same code, data and checkpoint.
+Image alignment requires CUDA for practical runtimes. The main result's stored
+final image scores remain the source for cohort evaluation.
 
-WHERE TO RUN IT. rigid_align at 256^3 is a GPU optimization (150 Adam iterations of
-grid_sample), so:
-  * concurrently with the run, on the OTHER GPU:   CUDA_VISIBLE_DEVICES=1 ... --watch
-  * after the run, on the same GPU:                 ... (no --watch)
-  * --device cpu works but is a last resort: one gauge fit is minutes on CPU, not seconds.
+    python scripts/render_posterior3d.py --out data/test30/p00
 
-The world (gt, y, static FDK) is REBUILT deterministically from the run's (ckpt, run, seed) via
-run_posterior3d.build_world -- nothing heavy is shipped through the snapshot dir (the sinogram
-alone would be ~480 MB). Deterministic because the volume is a file read, make_motion is
-seeded, and the Triton forward has no atomics. The renderer must run the same code version as
-the loop -- the standing assumption for every script in this repo.
-
-Gauge fits are warm-start-chained across steps in step order, exactly as inline mode chained
-them, so the fits are equally cheap and the trajectories comparable.
-
-When the run's result.pt exists by the time rendering finishes, the metric rows are MERGED into
-its hist (matched by step), so the cmp_* scripts see the same result.pt schema inline mode
-writes. A render_hist.json is written either way.
-
-    python scripts/render_posterior3d.py --out data/runs/legacy_mixed3mm/estimator/night_A_v1            # after the run
-    CUDA_VISIBLE_DEVICES=1 python scripts/render_posterior3d.py --out data/runs/legacy_mixed3mm/estimator/night_A_v1 --watch
+Use --watch on another GPU to render while inference is running. This updates
+result.pt history and writes render_hist.json plus montage images.
 """
 
 from __future__ import annotations

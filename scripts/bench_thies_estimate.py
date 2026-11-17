@@ -221,7 +221,7 @@ def main(argv=None):
     # ---- 6. metrics ---------------------------------------------------------------------------
     # RPE in fp64: at the paper's 0.61 mm on a 0.64 mm pixel, the raw RPE is a difference of two
     # nearly-equal projected point sets and fp32 cancellation is a percent-level effect on the
-    # very digit being compared (same reasoning as cmp_thies_vs_ours, which computes OUR side in
+    # very digit being compared (same convention as the cohort summarizer, which computes poses in
     # fp64 -- the two sides of the paired table must not differ in precision).
     sp = (a.out_voxel_mm,) * 3
     res = {"args": vars(a), "est_seconds": est_sec, "history": hist}

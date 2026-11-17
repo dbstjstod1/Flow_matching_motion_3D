@@ -1,7 +1,9 @@
-"""Summarize final-iterate, estimated-pose FDK and motion metrics on CPU.
+"""Summarize a 30-patient CQ500 Hash-INR cohort on CPU.
 
 Image scores use the stored full-precision evaluation, not the fp16 display volumes.
 RPE and component MAE use the ground-truth-independent zero-mean pose frame.
+Both geometry-bridge and image-linear runs use the same evaluation protocol.
+Archived expectations for both arms are in configs/reference_results.json.
 """
 import argparse
 import json
@@ -14,6 +16,14 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fm3d.geometry_3d import ConeBeam3DConfig, build_conebeam_orbit
 from fm3d.rigid_motion import reprojection_error, zero_centre_gauge
+
+
+PAPER_SETTINGS = dict(
+    estimator="net", n_steps=50, per=200, loss="l2", views_per_iter=24,
+    est_coarse=2, est_coarse_until=0.5, cg_iters=5, kappa=0.3, tv_iters=5,
+    tv_step=0.015, blend="uniform", patch_offsets=2, context="global",
+    trans_mm=10.0, rot_deg=10.0, motion_kind="akima",
+)
 
 
 def score(path):
@@ -55,10 +65,15 @@ def main():
         meta = torch.load(case / "snaps/meta.pt", map_location="cpu", weights_only=False)["args"]
         if (meta["split"], meta["run"], meta["seed"]) != ("test", i, 1000 + i):
             raise ValueError(f"Wrong patient/seed pairing: {case}")
+        mismatches = {key: (meta.get(key), expected) for key, expected in PAPER_SETTINGS.items()
+                      if meta.get(key) != expected}
+        if mismatches or meta.get("lr") not in (None, 0.003):
+            raise ValueError(f"Not the paper Hash-INR protocol: {case}: {mismatches}, lr={meta.get('lr')}")
         settings = {key: meta.get(key) for key in
                     ("estimator", "lr", "ckpt", "n_steps", "per", "loss", "views_per_iter",
                      "est_coarse", "est_coarse_until", "cg_iters", "kappa", "tv_iters",
-                     "tv_step", "blend", "patch_offsets", "trans_mm", "rot_deg")}
+                     "tv_step", "blend", "patch_offsets", "context", "trans_mm", "rot_deg")}
+        settings["lr"] = 0.003
         if common_settings is None:
             common_settings = settings
         elif settings != common_settings:

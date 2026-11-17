@@ -1,27 +1,9 @@
-"""3D cone-beam geometry built on the projection-matrix formulation (prompt 6).
+"""Cone-beam projection geometry for CQ500 motion simulation.
 
-This is the full-3D version of `geometry_2d.py` (which was written as the 2D
-reduction of this very pipeline). World points are (x, y, z), the detector is a
-2D flat panel, and a projection matrix is 3x4 mapping a homogeneous world point
-[x, y, z, 1]^T to a homogeneous detector coordinate [u*w, v*w, w]^T.
-
-Geometry convention (documented once, used by projector/FDK/warp/estimator)
----------------------------------------------------------------------------
-* World frame: isocenter at the origin. The source orbits in the x-y (axial)
-  plane; **z is the rotation axis = SI (superior-inferior) direction**. This is
-  the whole point of the 3D redesign: breathing motion is SI-dominant and z is
-  now an explicit in-volume axis (never through-plane).
-* Volume tensor layout: (B, 1, D, H, W) with W<->x, H<->y, D<->z. Voxel centers
-  at x = (ix-(W-1)/2)*dx, y = (iy-(H-1)/2)*dy, z = (iz-(D-1)/2)*dz  [mm]
-  (same centered pixel-center convention as the 2D pipeline).
-* Detector: flat panel, u = lateral (in the orbit plane, nu columns), v = axial
-  (parallel to +z, nv rows), both physical mm, centered (principal point 0).
-* Intrinsic K = [[SDD, 0, u0], [0, SDD, v0], [0, 0, 1]] so the matrix output is
-  the physical detector position in mm. Extrinsic rows are the camera axes
-  [e_u; e_v; e_depth] with e_depth pointing source->isocenter, e_u the in-plane
-  lateral axis (same -90deg rotation as the 2D `build_fanbeam_orbit`), e_v=+z.
-* Per-view breathing motion NEVER enters P (Option-A invariant): the operator
-  is always A(Warp(x, phi(., tau_v)); P_nom).
+World coordinates and detector coordinates are in mm. The source orbits the
+x-y plane; z is the rotation axis. Volumes use (B, 1, D, H, W) with W=x, H=y,
+D=z. A 3x4 matrix maps homogeneous world coordinates to detector coordinates.
+Rigid motion enters through P_moved = P_nominal @ T_object.
 """
 
 from __future__ import annotations
@@ -34,223 +16,49 @@ import torch
 
 @dataclass
 class ConeBeam3DConfig:
-    """Circular cone-beam scan geometry (all distances in mm).
+    """Circular cone-beam geometry; the paper explicitly uses ``thies()``.
 
-    Defaults model a **Varian OBI kV cone-beam** acquisition (2x2-binned panel):
-    SOD=1000, SDD=1500 (magnification M=1.5), 1024x768 detector at 0.388mm pitch,
-    660 views over 360 deg (a FASTER-than-stock OBI gantry; the stock protocol is ~900).
-    Derived numbers for these defaults:
-
-        transaxial FOV diameter = 2 * SOD * sin(atan(nu*du/2 / SDD)) = 262.6 mm
-        axial coverage at iso   = nv*dv / M                          = 198.7 mm
-        detector pitch at iso   = du / M                             = 0.259 mm
-
-    So a DIR-Lab thorax (248 mm in-plane) fits transaxially, but its 235 mm of z
-    does NOT fit the 198.7 mm axial coverage -- that truncation is PHYSICAL (it is
-    why OBI needs multiple couch positions), so callers must crop z to the cone.
-
-    `det_bin` sub-samples the panel (nu,nv //= det_bin; du,dv *= det_bin). This is
-    NOT a shortcut when det_bin=2: the detector pitch at the isocenter (0.517 mm)
-    still meets Nyquist for a 0.97 mm voxel (needs <= 0.485 mm), while det_bin=1 is
-    4x oversampled relative to the reconstruction grid and only costs compute.
-
-    `det_offset_u_mm` shifts the panel laterally = the HALF-FAN / displaced-detector body
-    protocol that EVERY clinical linac CBCT uses for a thorax or pelvis, because no full-fan
-    FOV (26-27.7 cm on any vendor) contains one. Each view then images a bit more than half the
-    object and the opposite view supplies the rest. Supported here; the centrally overlapping
-    rays are de-duplicated by the **Wang weight** (Wang, Med Phys 29(7):1634, 2002) in
-    `projector_3d.fdk_conebeam_3d_batched`. It requires a FULL 360 deg orbit: on a short scan
-    you would also need Parker weighting (Parker, Med Phys 9(2):254, 1982), which is NOT
-    implemented -- `build_conebeam_orbit` raises for that combination.
-
-    Use `ConeBeam3DConfig.halcyon()` for the half-fan preset. See its docstring for why a
-    Halcyon-class panel is the only clinical geometry that contains a whole DIR-Lab thorax.
-
-    CAUTION, `axial_coverage_mm()` is the ON-AXIS value. The region measured in EVERY view is
-    not a cylinder but a BARREL that narrows with radius: a voxel at radius r comes within
-    (SOD - r) of the source at some view, where its magnification is largest, so
-
-        |z| <= half_v * (SOD - r) / SDD          (`measured_region_mask`)
-
-    On the OBI defaults that is 99.3 mm on the axis but only 86.3 mm at the FOV edge. This is
-    why vendors quote a smaller axial FOV (OBI: ~16 cm) than nv*dv/M would suggest.
+    Detector offsets and binning are expressed in physical mm. The evaluation
+    mask is the region measured in every view, which narrows with radial distance.
     """
 
     # distances
     SOD: float = 1000.0         # source-to-isocenter (axis) [mm]
     SDD: float = 1500.0         # source-to-detector [mm]   (M = SDD/SOD = 1.5)
 
-    # detector (native Varian OBI, 2x2 binned)
+    # Generic detector defaults; thies() supplies the CQ500 protocol.
     det_nu: int = 1024          # columns (lateral, in the orbit plane)
     det_nv: int = 768           # rows (axial, parallel to +z = SI)
     det_pixel_mm: float = 0.388  # 2x2-binned pitch (native 0.194)
     det_offset_u_mm: float = 0.0  # lateral panel offset (half-fan); FDK supports it via the
                                   # Wang weight + symmetric enlargement (360 deg orbits only --
                                   # see class docstring and projector_3d.wang_weight)
-    det_offset_v_mm: float = 0.0  # AXIAL panel offset. Small but real: SPARE-MC ships
-                                  # ProjectionOffsetY = -2 mm ("calibration for simulation"),
-                                  # and ignoring it shifts the whole measured barrel by
-                                  # 2*SOD/SDD = 1.33 mm at the isocentre -- more than a voxel on
-                                  # their 1 mm grid, i.e. a systematic z registration error
-                                  # between our reconstruction and their ground truth.
+    det_offset_v_mm: float = 0.0  # axial panel offset [mm]
     det_bin: int = 1            # extra binning applied on top (see class docstring)
 
     # acquisition
     n_views: int = 660         # faster CBCT system than the stock ~900-view OBI protocol
-    scan_duration_sec: float = 60.0   # gantry rotation time. THIS, with the patient's
-                                      # respiratory rate, sets how many BREATHS the scan
-                                      # contains -- see `pca_motion.n_cycles_from`. It is
-                                      # unrelated to n_phases (=10, the motion model's
-                                      # within-cycle resolution) and to n_views.
+    scan_duration_sec: float = 60.0
     angular_range_deg: float = 360.0
     angle_start: float = 0.0    # first view angle [rad]
     clockwise: bool = False
 
     # ---- presets ------------------------------------------------------------------
-    @classmethod
-    def halcyon(cls, det_bin: int = 2, n_views: int = 660,
-                scan_duration_sec: float = 60.0) -> "ConeBeam3DConfig":
-        """Varian Halcyon / Ethos kV-CBCT: the ONLY shipping clinical geometry whose single
-        circular orbit contains a whole DIR-Lab thorax.
 
-            SAD 1000, SDD 1540 (M=1.54) | 43x43 cm a-Si panel, 1280^2 @ 0.336 mm
-            lateral offset 175 mm (half-fan) | 360 deg
-
-        Derived: FOV diameter **491.2 mm**, axial coverage **279.3 mm** on-axis, cone half-angle
-        **8.0 deg**. Compare the two DIR-Lab cases we have: case1 needs 335.2 x 235.0 mm, case2
-        needs 418.4 x 280.0 mm. Both fit. Varian OBI (FOV 262.6, axial 198.7 -- and only ~16 cm
-        of usable axial FOV in practice) fits neither, which is why OBI thorax protocols are
-        half-fan and why long anatomy needs a couch-shift double orbit.
-
-        8.0 deg is not an aggressive cone angle: it IS Halcyon's, and it sits beside Elekta XVI
-        (7.6 deg) and HyperSight (7.0 deg). FDK's error grows only linearly with distance from
-        the mid-plane (Wang & Lin); the regime where it visibly breaks (Defrise disks) is ~30 deg.
-
-        `det_bin=2` -> 640^2 @ 0.672 mm -> detector pitch at iso **0.436 mm**, still inside the
-        0.485 mm Nyquist limit of a 0.97 mm voxel, and only 0.52x the rays of the OBI default.
-
-        DELIBERATE DEVIATION: Halcyon rotates at 4 RPM (~15 s). We keep `scan_duration_sec=60`
-        and `n_views=660`, i.e. Halcyon's GEOMETRY with a SLOW gantry. Respiratory-correlated
-        CBCT needs a slow rotation to sample the breathing cycle (Sonke et al. 2005 use ~4 min);
-        `scan_duration_sec` is what turns a respiratory RATE into n_cycles (~15 breaths here).
-        """
-        return cls(SOD=1000.0, SDD=1540.0, det_nu=1280, det_nv=1280, det_pixel_mm=0.336,
-                   det_offset_u_mm=175.0, det_bin=det_bin, n_views=n_views,
-                   scan_duration_sec=scan_duration_sec, angular_range_deg=360.0)
-
-    @classmethod
-    def spare_mc(cls, det_bin: int = 1, n_views: int = 680,
-                 scan_duration_sec: float = 60.0) -> "ConeBeam3DConfig":
-        """The SPARE Monte-Carlo geometry -- **the only real inference target this project has**
-        (SPARE is the sole public thoracic 4D-CBCT dataset with raw projections).
-
-            SAD 1000, SDD 1500 (M=1.5) | 512x384 @ 0.776 mm | offset_u +148 (half-fan),
-            offset_v -2 | 680 views / 360 deg
-
-        Every number is from the dataset's own `README_DataInfo.txt` AND cross-checked against
-        the `<Matrix>` entries in its `Geometry.xml` (solving `P [S;1] = 0` for the source puts
-        it at +anterior at gantry 0, rotating toward the patient's LEFT -- which is what fixes
-        `angle_start` and `clockwise` below). Derived: FOV diameter **462.2 mm**, axial coverage
-        **198.7 mm** on-axis, cone half-angle 5.7 deg.
-
-        NOTE THE AXIAL SHORTFALL. SPARE asks for a 220 mm (SI) reconstruction but the on-axis
-        axial coverage is 198.7 mm, and the BARREL narrows with radius on top of that. The ends
-        of the requested box are therefore NOT measured -- physical, not a bug (their own
-        instructions warn that some scans do not even fill the panel vertically). Keep
-        `measured_region_mask` in every metric and in FM patch sampling.
-
-        ANGLE CONVENTION. IEC 0 deg = source anterior = our +y; our beta=0 puts the source at
-        +x; and their gantry angle increases toward the patient's left, which is CLOCKWISE in
-        our right-handed (L, A, I) frame. Hence `angle_start = -90 deg` with `clockwise=True`,
-        which yields beta = 90 deg - gantry. Getting this backwards MIRRORS the reconstruction
-        instead of failing loudly -- `scripts/smoke_spare.py` gates it against the reference FDK
-        that ships with every scan. Prefer `spare.config_from_scan()`, which reads the scan's own
-        Geometry.xml; this preset is the same numbers for when the archive is not mounted.
-
-        NOTE `det_offset_u_mm = -148`, where SPARE's own files say +148: our detector u axis runs
-        OPPOSITE to RTK's, so the panel's lateral displacement changes sign with it, and the
-        loaded projections must be flipped in u to match (`spare.read_projections(flip_u=True)`).
-        The two changes are one change. `det_offset_v_mm = -2` keeps its sign -- the v axes DO
-        agree.
-        """
-        return cls(SOD=1000.0, SDD=1500.0, det_nu=512, det_nv=384, det_pixel_mm=0.776,
-                   det_offset_u_mm=-148.0, det_offset_v_mm=-2.0, det_bin=det_bin,
-                   n_views=n_views, scan_duration_sec=scan_duration_sec,
-                   angular_range_deg=360.0, angle_start=-1.5707963267948966, clockwise=True)
 
     @classmethod
     def thies(cls, det_pixel_mm: float = 0.64, n_views: int = 360,
               det_bin: int = 1) -> "ConeBeam3DConfig":
-        """**The head-motion-compensation literature's de-facto standard simulation geometry.**
+        """CQ500 protocol: SOD 785 mm, SDD 1200 mm, 700x500 panel at 0.64 mm.
 
-            SID 785 (source-to-ISOCENTRE = our SOD), SDD 1200 (M = 1.529)
-            500 x 700 panel @ 0.64 mm | 360 views over a full 2*pi
-
-        Shared by Thies et al. (TMI 2025, arXiv:2401.09283; arXiv:2405.19079; MICCAI 2024) and by
-        JRM-ADM (arXiv:2504.14033), all of which forward-project CQ500 head CT volumes through it.
-        Matching it is what makes our numbers comparable to theirs. JRM-ADM differs on two knobs
-        (0.5 mm pitch, 120 views) -- hence the arguments; see `ConeBeam3DConfig.jrm_adm()`.
-
-        Derived (gated in `scripts/gate_cq500.py`):
-            FOV diameter    288.4 mm       axial coverage  209.3 mm on-axis
-            iso pitch       0.419 mm       cone half-angle 7.6 deg
-
-        **"500 x 700" does not say which axis is which, and the papers never do.** It MUST be
-        nu (lateral) = 700: that is the 288 mm FOV above, and a head fits. The other assignment
-        gives a 207 mm FOV, which truncates a head at every view. Derived, not quoted -- gated.
-
-        "SID" is source-to-ISOCENTRE here (Thies' text says so explicitly). Elsewhere in the
-        literature SID often means source-to-IMAGE, i.e. the detector -- reading it that way would
-        silently shrink the geometry by 415 mm.
-
-        Note the axial shortfall: a 256 mm (256^3 @ 1 mm) reconstruction box, which is what Thies
-        evaluates on, is TALLER than the 209 mm the panel sees on-axis (and the measured region is
-        a barrel that narrows further with radius). The ends of the box are not measured. This is
-        physical -- keep `measured_region_mask` in every metric and in FM patch sampling.
+        The full circular scan has 360 views. The measured axial coverage is
+        shorter than the 256 mm reconstruction box; use measured_region_mask
+        for image evaluation. ``det_bin`` is used by the coarse pose fit.
         """
         return cls(SOD=785.0, SDD=1200.0, det_nu=700, det_nv=500, det_pixel_mm=det_pixel_mm,
                    det_bin=det_bin, n_views=n_views, angular_range_deg=360.0)
 
-    @classmethod
-    def jrm_adm(cls, n_views: int = 120, det_bin: int = 1) -> "ConeBeam3DConfig":
-        """JRM-ADM's variant of the standard geometry: same SID/SDD/panel, 0.5 mm pitch, and only
-        120 full-scan views (they then SUBSAMPLE to 20/40/60 for the sparse-view experiments).
-        Derived: FOV 225.9 mm, axial coverage 163.5 mm -- both notably tighter than Thies', and
-        225.9 mm is only just wider than a head."""
-        return cls.thies(det_pixel_mm=0.5, n_views=n_views, det_bin=det_bin)
 
-    @classmethod
-    def preset(cls, name: str, *, det_bin: int | None = None, n_views: int | None = None,
-               scan_duration_sec: float = 60.0) -> "ConeBeam3DConfig":
-        """`"thies"` (**the CQ500 head-motion standard**), `"jrm_adm"` (its sparse-view variant),
-        `"halcyon"` (half-fan, contains a whole DIR-Lab thorax), `"obi"` (full-fan Varian OBI,
-        which contains neither case and therefore truncates), or `"spare_mc"` (the 4DCT inference
-        target). One switch for every script.
-
-        `n_views=None` (and `det_bin=None`) means "the preset's own default": thies 360,
-        jrm_adm 120, spare_mc 680, halcyon/obi 660. An explicit value is ALWAYS honoured --
-        this used to use 660 as a "not passed" sentinel, so `preset("thies", n_views=660)`
-        silently returned 360 views; it no longer does."""
-        if name in ("thies", "cq500"):
-            return cls.thies(det_bin=1 if det_bin is None else det_bin,
-                             n_views=360 if n_views is None else n_views)
-        if name == "jrm_adm":
-            return cls.jrm_adm(det_bin=1 if det_bin is None else det_bin,
-                               n_views=120 if n_views is None else n_views)
-        if name == "halcyon":
-            return cls.halcyon(det_bin=2 if det_bin is None else det_bin,
-                               n_views=660 if n_views is None else n_views,
-                               scan_duration_sec=scan_duration_sec)
-        if name == "obi":
-            return cls(det_bin=1 if det_bin is None else det_bin,
-                       n_views=660 if n_views is None else n_views,
-                       scan_duration_sec=scan_duration_sec)
-        if name == "spare_mc":
-            return cls.spare_mc(det_bin=1 if det_bin is None else det_bin,
-                                n_views=680 if n_views is None else n_views,
-                                scan_duration_sec=scan_duration_sec)
-        raise ValueError(f"unknown geometry preset {name!r} "
-                         f"(thies|jrm_adm|halcyon|obi|spare_mc)")
 
     # ---- derived (kept as properties so the old .nu/.du/.angle_span call sites work)
     @property

@@ -1,34 +1,37 @@
-# Paper-code update: verification scope
+# CQ500 release validation — 17 November 2026
 
-The September 2026 update replaces the default hash-MLP pose fit with the paper's
-30-node Akima + GD scheme and includes the 20-control-point B-spline + RMSprop ablation.
-The public reconstruction loop retains the paper's CG-only, one-TV-update path; local
-exploratory solvers and unpublished diagnostic runs are not needed to execute it.
+The public protocol follows the current manuscript's 16-level Hash-INR experiment.
+Clinical data/adaptation, superseded pose-estimator ablations, duplicate launchers
+and unrelated scanner presets are excluded. Existing research data and manuscript
+files were not modified.
 
-Checks completed for this update:
+Verified for this release:
 
-- Akima values and gradients match the released Thies interpolation, including all-zero
-  initialization. Both spline schemes pass unit conversion, update continuity, deterministic
-  sampled-view optimization and step-schedule checks.
-- Launcher tests parse all 30 case commands, both training-bridge configurations, the pose
-  ablation and the default inference configuration. Completed runs are reused only with an
-  identical launch identity; incompatible and nonempty output directories are preserved.
-- CPU checks pass for RPE units/gauge behavior and global-context patch aggregation.
-- Both archived 500k-iteration checkpoints pass the shape/architecture/bridge checks.
-  The CQ500 selection matches the 150/50/30-case manifest.
-- The new CPU cohort summarizer reads the archived 30 proposed reconstructions and reproduces
-  mean PSNR 37.12106107076009 dB, SSIM 0.9795855422814687 and RPE
-  0.2679147911672178 mm, including the estimated-pose FDK and component MAE statistics.
-- The autofocus wrapper selects the authors' released backprojector, verified by class and
-  source hash without running reconstruction.
-- Python compilation, shell syntax and Git whitespace checks pass.
+- Eight CPU tests cover all 30 paired launch commands, both training bridges,
+  checkpoint bridge/iteration checks, output preservation, zero pose initialization
+  and persistent Adam state.
+- The released Hash-INR and original research implementation produce identical
+  parameters after synthetic CPU optimization with the same initial seed and views.
+- Every inference config field matches the archived metadata for all 60 cases
+  (geometry and image-linear), with implicit `lr=None` resolved to Adam 0.003.
+- Both original 500k prior checkpoints pass architecture/bridge/iteration checks;
+  the complete dataset's selected 150/50/30 public IDs match the split manifest.
+- Independent CPU aggregation of all 60 archived results matches all eleven metric
+  means and population standard deviations in `configs/reference_results.json`
+  (maximum absolute difference 1.11e-16).
+- Global-context/patch aggregation and RPE geometry/gauge checks pass.
+- The supplied LEAP patch matches the six locally patched source files.
+- Python compilation, shell syntax, local documentation links and Git whitespace
+  checks pass. Removed modules have no remaining Python import dependencies.
 
-This update did not retrain a prior or repeat the complete GPU reconstruction cohort.
-Both local GPUs were occupied by existing experiments. The full geometry/operator gates
-require CUDA and patched LEAP; they are listed separately from CPU checks in the README.
-Fixed seeds do not guarantee bitwise equality for CUDA atomic reductions or across software
-versions. The reference results in `configs/reference_results.json` remain archived outcomes.
+No new prior training, full reconstruction cohort, or CUDA operator gate was run
+for this cleanup: CUDA was unavailable in the execution environment. Archived
+results are reference outcomes, not results of a new end-to-end run. Checkpoints
+and CQ500 images are not bundled; training instructions provide the route to new
+weights. CUDA reductions and software versions can cause numerical variation.
 
-Patient images, model weights, local experiment queues and manuscript editing artifacts are
-not included. The small B-spline array is interpolation geometry, with a recorded source
-package/version and checksum in `fm3d/assets/`.
+The original JRM inference initialization seed was not recorded. The adapter now
+records an explicit seed for future runs; this does not establish bitwise equality
+with its archived volumes. The installed tiny-cuda-nn package reports version 2.0,
+but its original source commit was not recorded; the installation command pins the
+upstream v2.0 tag. Original proposed-method timing did not record GPU exclusivity.

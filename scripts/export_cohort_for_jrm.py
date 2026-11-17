@@ -1,7 +1,7 @@
 """Export our test30 cohort measurements for the JRM-ADM solver (A2c stage 1, 2026-08-17).
 
 One case per (split=test, run=i, seed=1000+i), THE cohort triple every benchmark here uses
-(chain_databridge_eval, cmp_thies_vs_ours) -- y/theta come from `run_posterior3d.build_world`,
+-- y/theta come from `run_posterior3d.build_world`,
 so JRM-ADM sees byte-identical measurements to every other arm, and `theta_true` rides along
 for the pairing assertion the cmp scripts enforce.
 

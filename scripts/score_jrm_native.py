@@ -6,7 +6,7 @@ Per patient (skipped if already in the json):
     256^3 at the centre (exactly what fig_jrm_cmp.py does); scored against the GT volume with
     `aligned_metrics(mask=meas, iters=200)` = the loop's own stored-metric convention;
   * theta: their (V,3,4) affines -> our (V,6) via jrm_theta_convert (gated), then the SAME
-    fp64 RPE as cmp_thies_vs_ours (zero-centred gauge) and the per-DoF MAE of
+    fp64 RPE (zero-centred gauge) and the per-DoF MAE of
     fig_motion_arxiv.py (zero-mean gauge, translations mm / rotations deg);
   * FDK(theta_hat_JRM) with OUR vanilla operator, scored the same way (the FDK-class witness);
   * runtime from result.pt.

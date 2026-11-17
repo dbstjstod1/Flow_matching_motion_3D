@@ -45,22 +45,22 @@ def commands(args, config):
                         root=str(args.root), out=str(args.out))
         return [(args.out, [sys.executable, "-u", str(ROOT / "scripts/train_fm3d.py"),
                             *flags(settings)])]
-    settings = dict(config["inference"], estimator=args.estimator,
-                    lr=config["validation"]["selected_lr"][args.estimator])
+    settings = dict(config["inference"])
     patients = config["cohort"]["patients"] if args.mode == "cohort" else [args.patient]
     jobs = []
     for patient in patients:
         out = args.out / f"p{patient:02d}" if args.mode == "cohort" else args.out
         case = dict(settings, ckpt=str(args.ckpt), root=str(args.root),
-                    split="test", run=patient, seed=1000 + patient, out=str(out))
+                    split=config["cohort"]["split"], run=patient,
+                    seed=config["cohort"]["seed_offset"] + patient, out=str(out))
         jobs.append((out, [sys.executable, "-u", str(ROOT / "scripts/run_posterior3d.py"),
                            *flags(case)]))
     return jobs
 
 
 def source_hashes():
-    files = [CONFIG, *sorted((ROOT / "fm3d").glob("*.py")),
-             *sorted((ROOT / "fm3d/assets").glob("*")),
+    files = [*sorted((ROOT / "configs").glob("*.json")),
+             *sorted((ROOT / "fm3d").glob("*.py")),
              *sorted((ROOT / "bench").rglob("*.py")),
              *sorted((ROOT / "scripts").glob("*.py"))]
     return {str(p.relative_to(ROOT)): digest(p) for p in files if p.is_file()}
@@ -100,7 +100,6 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--ckpt", type=Path)
     parser.add_argument("--bridge", choices=["data", "linear"], default="data")
-    parser.add_argument("--estimator", choices=["akima_gd", "bspline_rmsprop"], default="akima_gd")
     parser.add_argument("--patient", type=int, choices=range(30), default=0)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
