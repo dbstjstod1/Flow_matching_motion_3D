@@ -8,10 +8,7 @@ SimpleITK==2.5.5
 matplotlib==3.11.0
 tensorboard==2.20.0
 
-# Required separately for the paper's Hash-INR backend:
-# python -m pip install --no-build-isolation \
-#   'git+https://github.com/NVlabs/tiny-cuda-nn.git@v2.0#subdirectory=bindings/torch'
-# The pure-PyTorch fallback is for development, not the reported Hash-INR results.
+# The spline estimators use PyTorch and the bundled interpolation basis.
 # LEAP requires a source build; see third_party/leap/FM3D_PATCH.md.
 # Autofocus additionally needs numba-cuda; JRM-ADM uses a separate environment.
 # See docs/baselines.md for those optional comparison methods.

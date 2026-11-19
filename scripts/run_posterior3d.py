@@ -4,8 +4,8 @@
 Per Euler step k of N (t = k/N), starting cold from x = FDK(y, P_nom) and theta_hat = 0:
 
     1. PREDICT   x_pred = x + dt * v_phi(x, t)              frozen flow-matching prior, patch-blended
-    2. ESTIMATE  theta_hat = argmin ||A_theta x_pred - y||    16-level Hash-INR,
-                                                              persistent Adam, --per iterations
+    2. ESTIMATE  theta_hat = argmin ||A_theta x_pred - y||    spline coefficients,
+                                                              warm-started fitting, --per iterations
     3. CORRECT   z = CG(theta_hat, y; warm start x_pred)      --cg_iters conjugate-gradient iterations
                  z = z + kappa * (D_TV(z) - z)                relaxed TV update
     4. x = z
@@ -246,10 +246,11 @@ def main():
                     help="pose-fitting iterations per outer step")
     ap.add_argument("--loss", default="l2", choices=["l2"],
                     help="mean squared projection residual (paper objective)")
-    ap.add_argument("--estimator", default="net", choices=["net"],
-                    help="16-level Hash-INR with a 4 x 64 ReLU MLP")
+    ap.add_argument("--estimator", default="akima_gd",
+                    choices=["akima_gd", "bspline_rmsprop"],
+                    help="paper main: Akima+GD; ablation: 20-control-point B-spline+RMSprop")
     ap.add_argument("--lr", type=float, default=None,
-                    help="Adam learning rate for the scan-specific pose network (default: .003)")
+                    help="initial pose step size (Akima: 1000; B-spline: .001)")
     ap.add_argument("--views_per_iter", type=int, default=24,
                     help="random views per estimator iteration (stochastic view subsampling)")
     ap.add_argument("--est_coarse", type=int, default=2,
@@ -286,19 +287,16 @@ def main():
                          "later with scripts/render_posterior3d.py; inline = score and draw "
                          "the montage inside the loop (~17 s per hit)")
     args = ap.parse_args()
+    if args.lr is None:
+        args.lr = {"akima_gd": 1000.0, "bspline_rmsprop": 0.001}[args.estimator]
     if args.blend == "uniform" and args.patch_offsets < 2:
         raise SystemExit("--blend uniform needs --patch_offsets >= 2 (a single non-overlapping "
                          "pass leaves tile seams)")
 
-    from fm3d.motion_net import HAVE_TCNN
-    if not HAVE_TCNN:
-        raise SystemExit("The paper protocol requires tiny-cuda-nn. Install its PyTorch "
-                         "bindings as described in README.md before inference.")
     dev = "cuda"
     os.makedirs(args.out, exist_ok=True)
-    # The estimator draws its network init and its per-iteration view subset from the global
-    # RNG, so the global seed is what makes two runs of one command follow the same trajectory
-    # (up to atomics in the kernels).
+    # Seed the image-prior setup and global operations. Synthetic motion and tile offsets
+    # use this case seed; pose view subsampling has its own fixed seed of zero.
     torch.manual_seed(args.seed)
 
     world = build_world(ckpt=args.ckpt, dev=dev, root=args.root, split=args.split,
@@ -331,10 +329,10 @@ def main():
     gt3, theta_true = world["gt3"], world["theta_true"]
     y, static_fdk = world["y"], world["static_fdk"]
 
-    # Network weights and Adam moments persist across outer updates and grid changes.
+    # Spline coefficients persist across outer updates and grid changes.
     est_kw = dict(dx=gen.dx, dy=gen.dy, dz=gen.dz, loss=args.loss,
                   views_per_iter=args.views_per_iter,
-                  lr=0.003 if args.lr is None else args.lr)
+                  lr=args.lr)
     print(f"estimator: {args.estimator}, lr={est_kw['lr']} "
           f"views/iter={args.views_per_iter} loss={args.loss}")
 
@@ -394,7 +392,9 @@ def main():
     if args.metric_mode == "defer":
         snap_dir = os.path.join(args.out, "snaps")
         os.makedirs(snap_dir, exist_ok=True)
-        torch.save({"args": {**vars(args), "amp_units": AMP_UNITS}},
+        torch.save({"args": {**vars(args), "amp_units": AMP_UNITS},
+                    "prior": {"bridge": ca["bridge"], "checkpoint": args.ckpt,
+                              "iteration": ck["iter"]}},
                    os.path.join(snap_dir, "meta.pt"))
         print(f"metric_mode=defer: snapshots -> {snap_dir}/  "
               f"(render: python scripts/render_posterior3d.py --out {args.out} [--watch])")

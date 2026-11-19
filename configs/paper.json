@@ -1,5 +1,5 @@
 {
-  "protocol": "cq500-hash-inr-tmi-20261117",
+  "protocol": "cq500-spline-arxiv-2611.23788v1",
   "training": {
     "dataset": "cq500",
     "split": "train",
@@ -43,8 +43,8 @@
     "n_steps": 50,
     "per": 200,
     "loss": "l2",
-    "estimator": "net",
-    "lr": 0.003,
+    "estimator": "akima_gd",
+    "lr": 1000.0,
     "views_per_iter": 24,
     "est_coarse": 2,
     "est_coarse_until": 0.5,
@@ -105,20 +105,28 @@
     "pnp_iterations": 1,
     "pose_readout": "last step; no temporal averaging",
     "view_sampling_seed": 0,
-    "encoder": "tiny-cuda-nn HashGrid",
-    "hash_levels": 16,
-    "hash_features_per_level": 2,
-    "hash_log2_size": 15,
-    "hash_base_resolution": 16,
-    "hash_per_level_scale": 1.5,
-    "mlp_hidden_layers": 4,
-    "mlp_width": 64,
-    "activation": "ReLU",
-    "translation_bound_mm": 15.0,
-    "rotation_vector_bound_deg": 8.0,
-    "optimizer": "Adam",
-    "persistent_optimizer_state": true,
+    "akima_nodes": 30,
+    "akima_decay": 0.97,
+    "akima_decay_reset": "each outer step",
+    "bspline_controls": 20,
+    "bspline_rmsprop_reset": "each outer step",
+    "spline_coefficient_units": "mm/degrees; output rotations are axis-angle radians",
+    "spline_coefficients_persist": true,
+    "spline_coefficients_bounded": false,
     "pose_penalty": 0.0,
     "loss_normalization": false
+  },
+  "validation": {
+    "patients": [
+      0,
+      1,
+      2
+    ],
+    "seed_offset": 2000,
+    "criterion": "minimum mean zero-centered RPE; smaller learning rate breaks ties",
+    "selected_lr": {
+      "akima_gd": 1000.0,
+      "bspline_rmsprop": 0.001
+    }
   }
 }

@@ -1,64 +1,78 @@
 # Reproducibility notes
 
-This document describes the configuration, reference results, and recorded
-validation for the code in this repository.
-
-## Implementation and reference results
-
-The reconstruction scripts use a 16-level Hash-INR pose estimator with Adam.
-The [linked paper](https://arxiv.org/abs/2611.23788) uses spline-based pose fitting
-for its main results and motion-estimator ablation. Those spline estimators are
-not included in the current reconstruction scripts.
-
-[Reference results](../configs/reference_results.json) record the existing
-30-patient geometry-bridge and image-linear Hash-INR runs. They describe this
-configuration, rather than the paper's spline-based results.
+This release follows the CQ500 experiments in
+[arXiv:2611.23788v1](https://arxiv.org/abs/2611.23788v1), submitted 18 November 2026.
+The main method uses 30-node Akima interpolation with gradient descent. The
+motion-estimator ablation uses 20 cubic B-spline controls with RMSprop; the
+image-linear ablation retains Akima and changes only the prior's training bridge.
 
 ## Data and checkpoints
 
-Download CQ500 separately and use the preparation instructions in the
-[README](../README.md#prepare-the-data). The selected patient IDs and series sizes
-are listed in the [split manifest](../configs/cq500_split.json).
+Download CQ500 separately and follow the
+[preparation instructions](../README.md#prepare-the-data). The selected patient
+IDs and series sizes are in the [split manifest](../configs/cq500_split.json):
+150 training, 50 validation, and 30 test patients. Test patient `i` uses seed
+`1000+i`, with the same simulated Akima motion across all three experiment arms.
 
 Pretrained checkpoints are not distributed with the repository. The
-[checkpoint manifest](../configs/checkpoints.json) contains hashes for the weights
-used in the reference runs; it is not a download manifest. The README provides
-commands for training new geometry-bridge and image-linear priors.
+[checkpoint manifest](../configs/checkpoints.json) identifies the original weights
+by hash; it is not a download manifest. The README provides commands to train
+geometry-bridge and image-linear priors for 500,000 iterations. The original
+training configurations differ only in the bridge and output directory.
+
+## Reference results
+
+[Reference results](../configs/reference_results.json) come from all 30 saved
+results for each of geometry/Akima, image-linear/Akima, and geometry/B-spline.
+The incomplete 22-case B-spline progress summary is not used. There is no
+image-linear/B-spline reference cohort.
+
+The file retains full-precision means and population standard deviations
+(`ddof=0`). Rounded paper entries can differ in their final digit or SD convention.
+Image metrics use the stored scores evaluated before volume conversion to fp16;
+RPE is recomputed from the saved trajectories with the paper's zero-centered
+pose convention. Each cohort must have a consistent estimator and prior bridge.
 
 ## Recorded validation
 
-The validation record includes:
+The release was checked against the original experiment outputs and implementations:
 
-- Eight CPU tests covering all 30 paired launch commands, both training bridges,
-  checkpoint bridge/iteration checks, output preservation, zero pose initialization,
-  and persistent Adam state.
-- Matching parameters between the released Hash-INR implementation and the
-  reference research implementation after synthetic CPU optimization with the
-  same initial seed and sampled views.
-- Agreement between every inference configuration field and the archived
-  metadata for all 60 cases, with implicit `lr=None` resolved to Adam 0.003.
-- Architecture, bridge, and iteration checks for both original 500k prior
-  checkpoints; agreement between the selected 150/50/30 patient IDs and the
-  split manifest.
-- Independent CPU aggregation of all 60 archived results, matching all eleven
-  metric means and population standard deviations in the reference-results
-  file (maximum absolute difference 1.11e-16).
-- Global-context/patch aggregation and RPE geometry/gauge checks.
-- Agreement between the supplied LEAP patch and the six locally patched source files.
-- Python compilation, shell syntax, local documentation links, Git whitespace
-  checks, and Python import consistency.
+- Eleven CPU tests for both estimators, deterministic paired launch commands, both
+  training bridges, checkpoint compatibility, and preservation of existing outputs.
+- Akima interpolation values and gradients, including zero initialization,
+  against the released learned-autofocus interpolation code; spline units,
+  optimizer resets, coefficient continuity, and deterministic view sampling.
+- The packaged 360-by-20 cubic B-spline basis and its SHA256 checksum. Its
+  [provenance](../fm3d/assets/bspline_provenance.json) records forward and gradient
+  agreement with `torch-cubic-spline-grids==0.5.2`. That package is not needed at runtime.
+- Independent CPU aggregation of all 90 archived results. All three arms use
+  identical ground-truth motion for every paired patient.
+- Architecture, bridge, iteration, and SHA256 checks for both original 500k
+  checkpoints, plus agreement of the selected patients with the split manifest.
+- Global-context patch aggregation, RPE geometry/gauge checks, Python compilation,
+  shell syntax, documentation links, and source import checks.
 
-These checks did not include a new prior-training run, full reconstruction cohort,
-or CUDA operator checks. The reference metrics come from the existing experiment
-outputs. CUDA reductions, hardware, and software versions can affect new runs.
+These checks did not include new prior training, a new reconstruction cohort, or
+CUDA operator execution. The reported metrics come from the retained experiment
+outputs. New training and inference can vary with hardware and software versions.
+Run the CUDA/LEAP and data-dependent gates listed in the README in the target environment.
 
 ## Execution details
 
+- **Pose fitting:** Akima starts each fit at learning rate 1000 with 0.97 decay;
+  B-spline uses RMSprop at 0.001 (alpha 0.99, epsilon 1e-8, no momentum, uncentered).
+  Both retain coefficients across all 50 outer updates and the coarse-to-fine
+  transition. RMSprop moments reset each outer update. No tanh bounds or pose
+  regularization are applied. Simulation motion and estimated motion are separate.
 - **JRM-ADM initialization:** The original inference initialization seed was not
-  recorded. The adapter records an explicit seed for new runs, but this does not
-  establish bitwise equality with the reference volumes.
-- **tiny-cuda-nn:** The original installed package reported version 2.0; its source
-  commit was not recorded. The installation command pins the upstream v2.0 tag.
-- **Timing:** The original geometry-bridge cohort averaged about 9.0 minutes per
-  patient. Exclusive use of the GPU was not recorded, so compare runtimes with the
-  hardware and concurrent GPU workload documented.
+  recorded. The adapter records a seed for new runs; this does not establish
+  bitwise equality with the reference volumes.
+- **Timing:** The paper reports about 9.1 minutes per geometry/Akima case on an
+  RTX A6000: 548.565 seconds averaged over 29 isolated process records, excluding
+  the contended patient 24 timing (all 30 remain in the accuracy results).
+  The 1.9-minute autofocus comparison uses the accelerated backprojector, not
+  original-kernel diagnostic timing. These times include setup, scoring, and
+  output. Document hardware and concurrent GPU workload when comparing runtimes.
+- **Version history:** The later Hash-INR implementation remains available at
+  commit `465bf2f996ff2fa1555a24de4ef4904001d1d289`. The current commands and
+  reference results use the submitted spline protocol.

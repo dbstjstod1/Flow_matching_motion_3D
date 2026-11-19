@@ -1,9 +1,9 @@
-"""Scan-specific Hash-INR fitting for the CQ500 reconstruction loop.
+"""Common projection-residual fitting for the paper's two spline estimators.
 
-The 16-level hash grid and 4 x 64 ReLU MLP predict one bounded 6-DoF pose
-per view. Adam weights and moments persist across image updates and the
-coarse-to-fine grid transition. The paper objective is the unnormalized mean
-squared projection residual, with no explicit trajectory penalty.
+Akima + gradient descent is the main estimator; cubic B-splines + RMSprop
+provide the motion-estimator ablation. Both retain spline coefficients across
+image updates and the coarse-to-fine grid transition. The objective is ordinary
+projection MSE, with no explicit pose penalty or initial-loss normalization.
 
 The projector differentiates P_nom @ T(theta); images are not warped.
 """
@@ -141,9 +141,7 @@ class _BaseEstimator:
         raise NotImplementedError
 
     def _opt(self) -> torch.optim.Optimizer:
-        """The optimizer PERSISTS across refine_global calls, and that is deliberate: down the
-        posterior loop's ODE each call warm-starts from the last one's theta AND its Adam moments,
-        so the trajectory is continuous instead of being re-fitted from scratch 30 times."""
+        """Return this fit's optimizer; spline subclasses control moment/schedule resets."""
         return self._optim
 
     # -- shared ------------------------------------------------------------------------
@@ -156,8 +154,7 @@ class _BaseEstimator:
             dx=self.dx, dy=self.dy, dz=self.dz)[0]
 
     def _smooth(self, theta):
-        """2nd-difference penalty on the trajectory. Zero for `basis`/`net`, whose smoothness is
-        structural -- but harmless there, and it keeps one code path."""
+        """Optional second-difference term; disabled by both published spline schemes."""
         if self.smooth_w <= 0:
             return theta.new_zeros(())
         d2 = theta[2:] - 2 * theta[1:-1] + theta[:-2]
@@ -206,26 +203,10 @@ class _BaseEstimator:
         return self._project(image, self._theta())
 
 
-class NetMotionEstimator(_BaseEstimator):
-    """The paper's 16-level Hash-INR and persistent Adam optimizer."""
-
-    def __init__(self, *a, lr=3e-3, enc="hash", n_levels=16, base_resolution=16,
-                 per_level_scale=1.5, fourier_m=8, trans_max_mm=15.0, rot_max_deg=8.0, **kw):
-        super().__init__(*a, **kw)
-        from .motion_net import MotionNet6DoF
-        self.net = MotionNet6DoF(
-            self.V, enc=enc, n_levels=n_levels, base_resolution=base_resolution,
-            per_level_scale=per_level_scale, fourier_m=fourier_m,
-            trans_max_mm=trans_max_mm, rot_max_deg=rot_max_deg).to(self.device)
-        self.lr0 = lr
-        self._optim = self._make_opt(self.net.parameters(), lr)
-        self.smooth_w = 0.0            # bandwidth is structural; see motion_net.py
-
-    def _theta(self):
-        return self.net.all_params(device=self.device)
-
-
-def make_estimator(name: str, cfg, P_nom, u, v, device, **kw) -> NetMotionEstimator:
-    if name.lower() != "net":
-        raise ValueError(f"unknown estimator {name!r}; the CQ500 paper uses 'net'")
-    return NetMotionEstimator(cfg, P_nom, u, v, device, **kw)
+def make_estimator(name: str, cfg, P_nom, u, v, device, **kw):
+    from .spline_motion import SplineSchemeEstimator
+    if name not in ("akima_gd", "bspline_rmsprop"):
+        raise ValueError(f"unknown estimator {name!r}; choose akima_gd or bspline_rmsprop")
+    kw.setdefault("lr", {"akima_gd": 1000.0, "bspline_rmsprop": 0.001}[name])
+    kw.setdefault("loss", "l2")
+    return SplineSchemeEstimator(cfg, P_nom, u, v, device, scheme=name, **kw)

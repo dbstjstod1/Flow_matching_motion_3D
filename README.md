@@ -3,11 +3,13 @@
 **Sungho Yun and Seungryong Cho**  
 Korea Advanced Institute of Science and Technology (KAIST)
 
-**[Paper](https://arxiv.org/abs/2611.23788)** · [Installation](#installation) · [Training and reconstruction](#training-and-reconstruction) · [Evaluation](#evaluation) · [Citation](#citation)
+**[Paper (arXiv v1)](https://arxiv.org/abs/2611.23788v1)** · [Installation](#installation) · [Training and reconstruction](#training-and-reconstruction) · [Evaluation](#evaluation) · [Citation](#citation)
 
 This is the authors' code repository for the paper linked above. It provides the
 3D geometry-bridge flow-matching prior and a CQ500 experiment workflow for training,
-motion correction, and evaluation.
+motion correction, and evaluation. This release follows arXiv v1: **Akima + GD**
+for the main method and image-linear ablation, and **cubic B-spline + RMSprop**
+for the motion-estimator ablation. It contains the public CQ500 experiments only.
 
 The method learns how a reconstructed volume changes as acquisition motion is
 reduced. During reconstruction, learned image updates alternate with motion
@@ -30,13 +32,12 @@ git clone https://github.com/dbstjstod1/Flow_matching_motion_3D.git
 cd Flow_matching_motion_3D
 
 pip install -r requirements.txt
-pip install --no-build-isolation \
-    'git+https://github.com/NVlabs/tiny-cuda-nn.git@v2.0#subdirectory=bindings/torch'
 ```
 
 Build the pinned, patched **LEAP** projector using
-[the build instructions](third_party/leap/FM3D_PATCH.md). The Hash-INR
-pose estimator requires tiny-cuda-nn. The pure-PyTorch fallback is intended for development.
+[the build instructions](third_party/leap/FM3D_PATCH.md). Both pose estimators run
+in PyTorch; the B-spline interpolation basis is included with
+[its provenance](fm3d/assets/README.md).
 
 ## Prepare the data
 
@@ -53,14 +54,9 @@ All methods share the same patient, motion and projection data.
 
 ## Training and reconstruction
 
-**Implementation scope:** The commands below run the Hash-INR pose-fitting
-variant. The spline pose estimators used for the paper's main results and
-motion-estimator ablation are not currently included. The reference results below
-correspond to the available Hash-INR configuration.
-
 Run from the repository root. [configs/paper.json](configs/paper.json) contains the
 fixed settings. Add `--dry-run` to inspect a command without loading data or CUDA.
-Select a GPU with `CUDA_VISIBLE_DEVICES`.
+Select a GPU with `CUDA_VISIBLE_DEVICES`. The default estimator is `akima_gd`.
 
 ```bash
 # Train the geometry-bridge prior (500,000 iterations).
@@ -82,10 +78,11 @@ python scripts/summarize_cohort.py data/test30
 Training uses 32³ patches, global context, batch 64, AdamW, learning rate
 10⁻⁴ → 10⁻⁶, and EMA 0.999. The geometry bridge is selected by `--bridge data`:
 `x_t = FDK(A_{(1-t)theta}(CT), P_nominal)`, with analytic velocity targets.
-Pose fitting uses a 16-level hash encoding, a 4×64 ReLU MLP, Adam at 0.003,
-tanh bounds of ±15 mm / ±8°, and the mean squared projection residual.
+Pose fitting uses 30 Akima nodes and gradient descent at an initial learning rate
+of 1000, decayed by 0.97 within each fit, on the mean squared projection residual.
 Each of the 50 reconstruction updates includes 200 pose-fitting steps
-(24 sampled views per step), 5 CG iterations, and relaxed TV.
+(24 sampled views per step), 5 CG iterations, and relaxed TV. Spline coefficients
+persist across updates; the learning-rate schedule restarts each update.
 
 Pretrained checkpoints are not distributed with this repository. Train the priors
 using the commands above; [checkpoint hashes](configs/checkpoints.json) identify
@@ -95,7 +92,7 @@ numerically across hardware and software versions.
 Each inference case saves `launch.json`, `run.log` and `result.pt`; the launcher reuses only completed cases with an identical launch record.
 An interrupted or changed run requires a fresh output directory.
 
-## Image-linear ablation and comparisons
+## Ablations and comparisons
 
 Change only the prior's training bridge; retain the same reconstruction settings:
 
@@ -107,6 +104,21 @@ python scripts/reproduce.py cohort --bridge linear \
     --out data/linear_test30
 python scripts/summarize_cohort.py data/linear_test30
 ```
+
+For the motion-estimator ablation, use the same geometry-bridge prior with
+20 cubic B-spline controls and RMSprop at 0.001:
+
+```bash
+python scripts/reproduce.py cohort --estimator bspline_rmsprop \
+    --root data/CQ500 --ckpt logs/fm3d_databridge/ckpt_iter500000.pth \
+    --out data/bspline_test30
+python scripts/summarize_cohort.py data/bspline_test30
+```
+
+RMSprop uses alpha 0.99, epsilon 1e-8, no momentum, and no centering. Its moments
+reset at each reconstruction update while the fitted coefficients persist.
+Both estimators use unbounded coefficients in mm/degrees and return rotations in
+axis-angle radians. The simulated ground-truth motion remains Akima for all arms.
 
 [Comparison instructions](docs/baselines.md) cover learned autofocus and JRM-ADM,
 including training, the common test inputs and evaluation.
@@ -121,16 +133,16 @@ attenuation units without display-window clipping. RPE is in detector mm after
 ground-truth-independent mean-pose removal. Report the stored image scores:
 saved volumes are fp16, while the scores were evaluated before that conversion.
 
-Reference results for the Hash-INR configuration on 30 patients (mean ± population SD):
+Reference results on the same 30 patients (refined volume, mean ± population SD):
 
-| Training bridge / output | PSNR (dB) | SSIM | RPE (mm) |
+| Training bridge / pose estimator | PSNR (dB) | SSIM | RPE (mm) |
 |---|---:|---:|---:|
-| Geometry / refined volume | 36.66 ± 1.58 | 0.978 ± 0.008 | 0.276 ± 0.086 |
-| Geometry / estimated-pose FDK | 31.80 ± 0.76 | 0.753 ± 0.032 | 0.276 ± 0.086 |
-| Image-linear / refined volume | 35.29 ± 2.28 | 0.966 ± 0.015 | 0.415 ± 0.167 |
+| Geometry / Akima + GD (main) | 37.12 ± 1.65 | 0.980 ± 0.010 | 0.268 ± 0.090 |
+| Image-linear / Akima + GD | 35.53 ± 2.24 | 0.968 ± 0.016 | 0.402 ± 0.178 |
+| Geometry / B-spline + RMSprop | 36.93 ± 1.55 | 0.978 ± 0.009 | 0.270 ± 0.079 |
 
 [Reference results](configs/reference_results.json) retain full precision. The original
-geometry cohort averaged about **9.0 minutes per patient**. Timing conditions and
+geometry/Akima cohort is reported at about **9.1 minutes per patient**. Timing conditions and
 validation details are documented in the [reproducibility notes](docs/release_validation.md).
 Test motion widths of 10 mm / 10° mean control points sampled in ±5 mm / ±5°
 before zero-centering, rather than realized trajectory extrema.
@@ -139,6 +151,7 @@ before zero-centering, rather than realized trajectory extrema.
 
 ```bash
 CUDA_VISIBLE_DEVICES='' python -m unittest discover -s tests -v
+CUDA_VISIBLE_DEVICES='' python scripts/gate_motion_schemes.py
 CUDA_VISIBLE_DEVICES='' python scripts/gate_context_unet.py
 CUDA_VISIBLE_DEVICES='' python scripts/gate_rpe.py
 ```

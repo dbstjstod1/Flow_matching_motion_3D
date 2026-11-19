@@ -31,12 +31,13 @@ same 360-view scans and nominal test sampling widths 10 mm / 10 degrees. These
 acquisition and amplitude settings define our comparison, rather than the
 original paper's own benchmark cohort.
 
-Use `FM3D_THIES_VENDOR_BP=1` and `scripts/bench_thies_original.py` for the authors'
-original CUDA kernels and the manuscript's runtime convention. The default
-`bench_thies_estimate.py` path uses the accelerated kernels; floating-point
-reduction order can differ, and its elapsed time must be identified separately.
-`backend.json` records which implementation was selected. `gate_bench_thies.py`
-includes a numerical comparison between the two kernel paths.
+The submitted paper's 1.9-minute comparison uses the accelerated
+`bench_thies_estimate.py` path (`FM3D_THIES_VENDOR_BP=0`). This is complete process
+time, including setup, evaluation and output. Use `FM3D_THIES_VENDOR_BP=1` and
+`scripts/bench_thies_original.py` for a diagnostic with the authors' original CUDA
+kernels; the wrapper records `backend.json`. Floating-point reduction order can
+differ, and timings for the two paths must be identified separately.
+`gate_bench_thies.py` includes a numerical comparison between the two kernel paths.
 
 The native benchmark reports several reference/ROI conventions. For the manuscript,
 rescore `out_vol` against the ground-truth CT with the common measured-FOV mask and

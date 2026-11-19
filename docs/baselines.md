@@ -25,14 +25,14 @@ python scripts/bench_thies_train_qm.py --root data/CQ500 \
 patients with fixed motion draws. The archived best checkpoint is iteration
 19,500. The separate validation RPE probe does not select the checkpoint.
 
-Run from the repository root using the authors' original kernels for the
-manuscript's runtime convention:
+Run from the repository root using the accelerated backprojector used for the
+submitted paper's 1.9-minute full-process comparison:
 
 ```bash
 set -e
 for i in $(seq 0 29); do
     tag=$(printf 'p%02d' "$i")
-    FM3D_THIES_VENDOR_BP=1 CUDA_VISIBLE_DEVICES=0 python scripts/bench_thies_original.py \
+    FM3D_THIES_VENDOR_BP=0 CUDA_VISIBLE_DEVICES=0 python scripts/bench_thies_estimate.py \
         --qm logs/bench_thies_qm2/qmnet_best.pth \
         --ckpt logs/fm3d_databridge/ckpt_iter500000.pth --root data/CQ500 \
         --split test --run "$i" --seed "$((1000+i))" --trans_mm 10 --rot_deg 10 \
@@ -41,10 +41,11 @@ for i in $(seq 0 29); do
 done
 ```
 
-Use a fresh output directory for each run. `backend.json` records the selected
-implementation. `bench_thies_estimate.py` uses the local accelerated backprojector
-unless `FM3D_THIES_VENDOR_BP=1`; its runtime must be labeled accordingly.
-`est_seconds` covers pose estimation only, not full-process elapsed time.
+Use a fresh output directory for each run. For an original-kernel diagnostic,
+set `FM3D_THIES_VENDOR_BP=1` and use `scripts/bench_thies_original.py`; that wrapper
+records `backend.json`. Keep its timing separate from the paper's accelerated
+implementation. `est_seconds` covers pose estimation only; the paper's runtime
+covers the complete per-patient process, including simulation, evaluation and output.
 
 Rescore the reconstructed `out_vol` with the paper's common measured-FOV image
 metrics, since the native benchmark also reports its own reference conventions:

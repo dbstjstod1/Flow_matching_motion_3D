@@ -46,6 +46,9 @@ def commands(args, config):
         return [(args.out, [sys.executable, "-u", str(ROOT / "scripts/train_fm3d.py"),
                             *flags(settings)])]
     settings = dict(config["inference"])
+    if args.estimator is not None:
+        settings.update(estimator=args.estimator,
+                        lr=config["validation"]["selected_lr"][args.estimator])
     patients = config["cohort"]["patients"] if args.mode == "cohort" else [args.patient]
     jobs = []
     for patient in patients:
@@ -61,6 +64,7 @@ def commands(args, config):
 def source_hashes():
     files = [*sorted((ROOT / "configs").glob("*.json")),
              *sorted((ROOT / "fm3d").glob("*.py")),
+             *sorted((ROOT / "fm3d/assets").glob("*")),
              *sorted((ROOT / "bench").rglob("*.py")),
              *sorted((ROOT / "scripts").glob("*.py"))]
     return {str(p.relative_to(ROOT)): digest(p) for p in files if p.is_file()}
@@ -100,6 +104,8 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--ckpt", type=Path)
     parser.add_argument("--bridge", choices=["data", "linear"], default="data")
+    parser.add_argument("--estimator", choices=["akima_gd", "bspline_rmsprop"], default=None,
+                        help="default: paper main Akima+GD; bspline_rmsprop selects the ablation")
     parser.add_argument("--patient", type=int, choices=range(30), default=0)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
