@@ -1,36 +1,46 @@
 # Geometry-Bridge Flow Matching for Blind Rigid-Motion Correction in Head Cone-Beam CT
 
-CQ500 reproduction code for the manuscript by Sungho Yun and Seungryong Cho (KAIST),
-aligned with the **17 November 2026 manuscript**. This release contains the CQ500
-simulation study: a geometry-bridge image prior, **16-level Hash-INR pose estimation**,
-the image-linear training ablation, and the learned-autofocus / JRM-ADM comparisons.
-Acquired clinical CBCT code, data and manuscript editing files are excluded.
+**Sungho Yun and Seungryong Cho**  
+Korea Advanced Institute of Science and Technology (KAIST)
 
-```text
-CQ500 CT → simulated moving projections → uncorrected FDK
-repeat 50 times:
-    predict image velocity with the frozen flow-matching prior
-    fit rigid poses with Hash-INR + Adam (200 steps, 24 sampled views)
-    refine the volume with CG (5 iterations) and relaxed TV
-return refined volume, poses, and FDK at the estimated poses
-```
+**[Paper](https://arxiv.org/abs/2611.23788)** · [Installation](#installation) · [Training and reconstruction](#training-and-reconstruction) · [Evaluation](#evaluation) · [Citation](#citation)
 
-## Install and prepare CQ500
+This is the authors' code repository for the paper linked above. It provides the
+3D geometry-bridge flow-matching prior and a CQ500 experiment workflow for training,
+motion correction, and evaluation.
+
+The method learns how a reconstructed volume changes as acquisition motion is
+reduced. During reconstruction, learned image updates alternate with motion
+estimation and projection-data consistency to recover the image and head motion
+jointly.
+
+The repository includes:
+
+- CQ500 preparation, patient splits, and simulated motion-corrupted projections.
+- Training and reconstruction with geometry-bridge and image-linear priors.
+- Image-quality and motion evaluation, with learned-autofocus and JRM-ADM comparisons.
+
+## Installation
 
 Tested with Linux, Python 3.11, PyTorch 2.8 / CUDA 12.8, Triton 3.4 and an
 RTX A6000 (48 GB). Training and reconstruction require an NVIDIA GPU.
 
 ```bash
+git clone https://github.com/dbstjstod1/Flow_matching_motion_3D.git
+cd Flow_matching_motion_3D
+
 pip install -r requirements.txt
 pip install --no-build-isolation \
     'git+https://github.com/NVlabs/tiny-cuda-nn.git@v2.0#subdirectory=bindings/torch'
 ```
 
 Build the pinned, patched **LEAP** projector using
-[the build instructions](third_party/leap/FM3D_PATCH.md). The reported Hash-INR
-uses tiny-cuda-nn; the development fallback does not reproduce its numerical behavior.
+[the build instructions](third_party/leap/FM3D_PATCH.md). The Hash-INR
+pose estimator requires tiny-cuda-nn. The pure-PyTorch fallback is intended for development.
 
-Unpack [CQ500](http://headctstudy.qure.ai/dataset) under `data/CQ500`, then index it:
+## Prepare the data
+
+Download and unpack [CQ500](http://headctstudy.qure.ai/dataset) under `data/CQ500`, then index it:
 
 ```bash
 python scripts/prep_cq500.py --root data/CQ500
@@ -38,10 +48,15 @@ python scripts/prep_cq500.py --root data/CQ500
 
 The launcher verifies the public patient IDs and series sizes against
 [the split manifest](configs/cq500_split.json): **150 training, 50 validation, and
-the first 30 held-out patients**. Each test patient uses seed `1000 + patient_index`.
+30 held-out test patients**. Each test patient uses seed `1000 + patient_index`.
 All methods share the same patient, motion and projection data.
 
-## Train and reconstruct
+## Training and reconstruction
+
+**Implementation scope:** The commands below run the Hash-INR pose-fitting
+variant. The spline pose estimators used for the paper's main results and
+motion-estimator ablation are not currently included. The reference results below
+correspond to the available Hash-INR configuration.
 
 Run from the repository root. [configs/paper.json](configs/paper.json) contains the
 fixed settings. Add `--dry-run` to inspect a command without loading data or CUDA.
@@ -69,12 +84,15 @@ Training uses 32³ patches, global context, batch 64, AdamW, learning rate
 `x_t = FDK(A_{(1-t)theta}(CT), P_nominal)`, with analytic velocity targets.
 Pose fitting uses a 16-level hash encoding, a 4×64 ReLU MLP, Adam at 0.003,
 tanh bounds of ±15 mm / ±8°, and the mean squared projection residual.
+Each of the 50 reconstruction updates includes 200 pose-fitting steps
+(24 sampled views per step), 5 CG iterations, and relaxed TV.
 
-Checkpoints and patient images are not bundled. Train the priors with the commands
-above; [checkpoint hashes](configs/checkpoints.json) identify the archived weights
-used for the reported results. New training runs can vary numerically across hardware
-and software versions. Each inference case saves `launch.json`, `run.log` and
-`result.pt`; the launcher reuses only completed cases with an identical launch record.
+Pretrained checkpoints are not distributed with this repository. Train the priors
+using the commands above; [checkpoint hashes](configs/checkpoints.json) identify
+the weights used for the reference results below. New training runs can vary
+numerically across hardware and software versions.
+
+Each inference case saves `launch.json`, `run.log` and `result.pt`; the launcher reuses only completed cases with an identical launch record.
 An interrupted or changed run requires a fresh output directory.
 
 ## Image-linear ablation and comparisons
@@ -103,7 +121,7 @@ attenuation units without display-window clipping. RPE is in detector mm after
 ground-truth-independent mean-pose removal. Report the stored image scores:
 saved volumes are fp16, while the scores were evaluated before that conversion.
 
-Archived results on 30 patients (mean ± population SD):
+Reference results for the Hash-INR configuration on 30 patients (mean ± population SD):
 
 | Training bridge / output | PSNR (dB) | SSIM | RPE (mm) |
 |---|---:|---:|---:|
@@ -112,11 +130,12 @@ Archived results on 30 patients (mean ± population SD):
 | Image-linear / refined volume | 35.29 ± 2.28 | 0.966 ± 0.015 | 0.415 ± 0.167 |
 
 [Reference results](configs/reference_results.json) retain full precision. The original
-geometry cohort averaged about **9.0 minutes per patient**; GPU isolation was not recorded.
+geometry cohort averaged about **9.0 minutes per patient**. Timing conditions and
+validation details are documented in the [reproducibility notes](docs/release_validation.md).
 Test motion widths of 10 mm / 10° mean control points sampled in ±5 mm / ±5°
 before zero-centering, rather than realized trajectory extrema.
 
-## Checks and code
+## Verification
 
 ```bash
 CUDA_VISIBLE_DEVICES='' python -m unittest discover -s tests -v
@@ -127,9 +146,26 @@ CUDA_VISIBLE_DEVICES='' python scripts/gate_rpe.py
 CUDA / patched-LEAP checks: `scripts/gate_geometry.py` and
 `scripts/gate_leap_forward_tangent.py`. With CQ500 installed, also run
 `scripts/gate_bridge_data.py` and `scripts/gate_bridge_linear.py`.
-[Validation scope](docs/release_validation.md) records what was checked for this release.
+[Reproducibility notes](docs/release_validation.md) describe the recorded checks,
+checkpoint availability, and execution details.
+
+## Repository structure
 
 `fm3d/` contains geometry, motion fitting, projectors, the image network and metrics;
 `scripts/` contains preparation, training, reconstruction and evaluation;
-`configs/` fixes the paper protocol; `bench/` and `baselines/` contain the comparison
-adapters. Third-party source retains its license and provenance notices.
+`configs/` contains the experiment settings, patient split, and reference results;
+`bench/` and `baselines/` contain the comparison adapters. Third-party source retains its license and provenance notices.
+
+## Citation
+
+If you use this code in your research, please cite:
+
+```bibtex
+@article{yun2026geometrybridge,
+  title   = {Geometry-Bridge Flow Matching for Blind Rigid-Motion Correction in Head Cone-Beam CT},
+  author  = {Yun, Sungho and Cho, Seungryong},
+  journal = {arXiv preprint arXiv:2611.23788},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2611.23788}
+}
+```
