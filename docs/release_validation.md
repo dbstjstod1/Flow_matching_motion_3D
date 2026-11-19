@@ -1,37 +1,64 @@
-# CQ500 release validation — 17 November 2026
+# Reproducibility notes
 
-The public protocol follows the current manuscript's 16-level Hash-INR experiment.
-Clinical data/adaptation, superseded pose-estimator ablations, duplicate launchers
-and unrelated scanner presets are excluded. Existing research data and manuscript
-files were not modified.
+This document describes the configuration, reference results, and recorded
+validation for the code in this repository.
 
-Verified for this release:
+## Implementation and reference results
 
-- Eight CPU tests cover all 30 paired launch commands, both training bridges,
-  checkpoint bridge/iteration checks, output preservation, zero pose initialization
+The reconstruction scripts use a 16-level Hash-INR pose estimator with Adam.
+The [linked paper](https://arxiv.org/abs/2611.23788) uses spline-based pose fitting
+for its main results and motion-estimator ablation. Those spline estimators are
+not included in the current reconstruction scripts.
+
+[Reference results](../configs/reference_results.json) record the existing
+30-patient geometry-bridge and image-linear Hash-INR runs. They describe this
+configuration, rather than the paper's spline-based results.
+
+## Data and checkpoints
+
+Download CQ500 separately and use the preparation instructions in the
+[README](../README.md#prepare-the-data). The selected patient IDs and series sizes
+are listed in the [split manifest](../configs/cq500_split.json).
+
+Pretrained checkpoints are not distributed with the repository. The
+[checkpoint manifest](../configs/checkpoints.json) contains hashes for the weights
+used in the reference runs; it is not a download manifest. The README provides
+commands for training new geometry-bridge and image-linear priors.
+
+## Recorded validation
+
+The validation record includes:
+
+- Eight CPU tests covering all 30 paired launch commands, both training bridges,
+  checkpoint bridge/iteration checks, output preservation, zero pose initialization,
   and persistent Adam state.
-- The released Hash-INR and original research implementation produce identical
-  parameters after synthetic CPU optimization with the same initial seed and views.
-- Every inference config field matches the archived metadata for all 60 cases
-  (geometry and image-linear), with implicit `lr=None` resolved to Adam 0.003.
-- Both original 500k prior checkpoints pass architecture/bridge/iteration checks;
-  the complete dataset's selected 150/50/30 public IDs match the split manifest.
-- Independent CPU aggregation of all 60 archived results matches all eleven metric
-  means and population standard deviations in `configs/reference_results.json`
-  (maximum absolute difference 1.11e-16).
-- Global-context/patch aggregation and RPE geometry/gauge checks pass.
-- The supplied LEAP patch matches the six locally patched source files.
-- Python compilation, shell syntax, local documentation links and Git whitespace
-  checks pass. Removed modules have no remaining Python import dependencies.
+- Matching parameters between the released Hash-INR implementation and the
+  reference research implementation after synthetic CPU optimization with the
+  same initial seed and sampled views.
+- Agreement between every inference configuration field and the archived
+  metadata for all 60 cases, with implicit `lr=None` resolved to Adam 0.003.
+- Architecture, bridge, and iteration checks for both original 500k prior
+  checkpoints; agreement between the selected 150/50/30 patient IDs and the
+  split manifest.
+- Independent CPU aggregation of all 60 archived results, matching all eleven
+  metric means and population standard deviations in the reference-results
+  file (maximum absolute difference 1.11e-16).
+- Global-context/patch aggregation and RPE geometry/gauge checks.
+- Agreement between the supplied LEAP patch and the six locally patched source files.
+- Python compilation, shell syntax, local documentation links, Git whitespace
+  checks, and Python import consistency.
 
-No new prior training, full reconstruction cohort, or CUDA operator gate was run
-for this cleanup: CUDA was unavailable in the execution environment. Archived
-results are reference outcomes, not results of a new end-to-end run. Checkpoints
-and CQ500 images are not bundled; training instructions provide the route to new
-weights. CUDA reductions and software versions can cause numerical variation.
+These checks did not include a new prior-training run, full reconstruction cohort,
+or CUDA operator checks. The reference metrics come from the existing experiment
+outputs. CUDA reductions, hardware, and software versions can affect new runs.
 
-The original JRM inference initialization seed was not recorded. The adapter now
-records an explicit seed for future runs; this does not establish bitwise equality
-with its archived volumes. The installed tiny-cuda-nn package reports version 2.0,
-but its original source commit was not recorded; the installation command pins the
-upstream v2.0 tag. Original proposed-method timing did not record GPU exclusivity.
+## Execution details
+
+- **JRM-ADM initialization:** The original inference initialization seed was not
+  recorded. The adapter records an explicit seed for new runs, but this does not
+  establish bitwise equality with the reference volumes.
+- **tiny-cuda-nn:** The original installed package reported version 2.0; its source
+  commit was not recorded. The installation command pins the upstream v2.0 tag.
+- **Timing:** The original geometry-bridge cohort averaged about 9.0 minutes per
+  patient. Exclusive use of the GPU was not recorded, so compare runtimes with the
+  hardware and concurrent GPU workload documented.
